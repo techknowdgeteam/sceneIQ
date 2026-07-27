@@ -20,6 +20,11 @@ import keyboard
 import tkinter as tk
 import threading
 import zipfile
+import csv
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
+import os
 
 # Configure Paths
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -314,7 +319,7 @@ def ocr():
         traceback.print_exc()
         return None
 
-def operate_google_flow():
+def operate_google_flow_browser():
     """
     Launches Microsoft Edge, maximizes it.
     Features: Live HUD tracking, click-through overlay, 
@@ -1715,22 +1720,6 @@ def operate_google_flow():
                 pass
             return False
        
-    def normalize_project_title(name):
-        """
-        Normalize project name by removing special characters but keeping underscores.
-        """
-        if not name:
-            return "unnamed_project"
-        # Remove special characters but keep alphanumeric, spaces, and underscores
-        normalized = re.sub(r'[^a-zA-Z0-9\s_]', '', name)
-        # Replace spaces with underscores
-        normalized = re.sub(r'\s+', '_', normalized)
-        # Remove multiple underscores
-        normalized = re.sub(r'_+', '_', normalized)
-        # Remove leading/trailing underscores
-        normalized = normalized.strip('_')
-        return normalized if normalized else "unnamed_project"
-
     def find_and_click_vertical_dot(hwnd, specific_url, project_title, depth=0):
         """Searches for vertical dot menu and initiates download with context analysis."""
         try:
@@ -1971,9 +1960,16 @@ def operate_google_flow():
             if not os.path.exists(PANEL_PATH):
                 print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
                 return
-            
+        
             with open(PANEL_PATH, 'r', encoding='utf-8') as file:
                 panel_data = json.load(file)
+            
+            # Check if Google Flow operation is enabled
+            operate_google_flow = panel_data.get('operate_google_flow', False)
+            if not operate_google_flow:
+                print("ℹ️ Google Flow operation is disabled in config")
+                hud.print("ℹ️ Google Flow operation disabled", "info")
+                return
             
             all_project_url = panel_data.get('google_flow_url')
             project_title = panel_data.get('project_title')
@@ -2312,7 +2308,7 @@ def operate_google_flow():
     
     main()
 
-def operate_grok():
+def operate_grok_browser():
     """
     Launches/uses Microsoft Edge for video operations.
     Features: Live HUD tracking, click-through overlay, 
@@ -2357,6 +2353,61 @@ def operate_grok():
         t = text.lower()
         t = re.sub(r'[^a-z0-9]', '', t)
         return t
+    
+    def extract_id_from_url(url):
+        """Extract ID from URL by getting everything after the last '/'"""
+        if not url:
+            return None
+        # Get everything after the last '/'
+        parts = url.rstrip('/').split('/')
+        if parts:
+            last_part = parts[-1]
+            # Remove .mp4 extension if present
+            if last_part.endswith('.mp4'):
+                last_part = last_part[:-4]
+            return last_part
+        return None
+    
+    def check_for_timevalue(text_elements):
+        """
+        Check if any time value in format {anytimevalue}:{anytimevalue} exists.
+        Returns: (found, first_time_element)
+        """
+        if not text_elements:
+            return False, None
+        
+        time_pattern = re.compile(r'\d+:\d{2}')
+        
+        for element in text_elements:
+            element_text = element['text'].strip()
+            if time_pattern.search(element_text):
+                print(f"✅ [TIMEVALUE] Found time value: '{element_text}'")
+                return True, element
+        
+        return False, None
+
+    def check_for_page_load_indicators(text_elements):
+        """
+        Check for various page load indicators (excluding time values).
+        Returns: (is_loaded, indicator_found)
+        """
+        if not text_elements:
+            return False, None
+        
+        # Load indicators (excluding time values)
+        load_indicators = [
+            "grok", "imagine", "type to imagine", "history",
+            "makevideo", "extend", "regenerate"
+        ]
+        
+        for element in text_elements:
+            element_text = element['text'].strip().lower()
+            for indicator in load_indicators:
+                if indicator in element_text:
+                    print(f"✅ [PAGE_LOAD] Page loaded - found indicator: '{indicator}'")
+                    return True, indicator
+        
+        return False, None
     
     # ============================================
     # SECTION 1: WINDOW MANAGEMENT HELPERS
@@ -2523,11 +2574,45 @@ def operate_grok():
         pyautogui.hotkey('ctrl', 'v')
         pyautogui.press('enter')
 
+    def check_current_url_contains_target(hwnd, target_url):
+        """
+        Check if the current page contains the target URL in its text.
+        Returns: (found, current_texts)
+        """
+        print(f"🔍 [URL_CHECK] Checking if current page contains target URL: {target_url}")
+        
+        current_texts = safe_ocr()
+        if not current_texts:
+            return False, None
+        
+        # Clean the target URL for comparison
+        clean_target = clean_string_completely(target_url)
+        
+        for element in current_texts:
+            element_text = element['text'].strip().lower()
+            clean_element = clean_string_completely(element_text)
+            
+            # Check if the clean target is in the element text
+            if clean_target in clean_element:
+                print(f"✅ [URL_CHECK] Found target URL in page: '{element_text}'")
+                return True, current_texts
+            
+            # Also check if the URL is partially present
+            # Sometimes the URL appears with extra characters
+            target_parts = clean_target.split('/')
+            for part in target_parts:
+                if len(part) > 5 and part in clean_element:
+                    print(f"✅ [URL_CHECK] Found URL part '{part}' in page")
+                    return True, current_texts
+        
+        print(f"❌ [URL_CHECK] Target URL not found in current page")
+        return False, current_texts
+
     # ============================================
     # SECTION 2: VIDEO-SPECIFIC HELPERS
     # ============================================
     
-    def check_for_text_on_screen(hwnd, target_text, timeout_seconds=10, check_interval=0.5):
+    def check_for_text_on_screen(hwnd, target_text, timeout_seconds=10, check_interval=0.1):
         """Check if specific text appears on screen within timeout period."""
         print(f"🔍 [CHECK_TEXT] Looking for target text: '{target_text}'")
         
@@ -2548,7 +2633,6 @@ def operate_grok():
                     
                     if normalized_target in normalized_element:
                         print(f"✅ [CHECK_TEXT] Found target text: '{element_text}'")
-                        hud.print("✅ Page Loaded", "success")
                         return True, current_texts
             
             time.sleep(check_interval)
@@ -2580,16 +2664,16 @@ def operate_grok():
             time.sleep(check_interval)
         
         print(f"❌ [HISTORY_CHECK] History not found")
-        hud.print("❌ Option not found", "error")
         return False, None
 
     def activate_ctrl_b_and_check_history(hwnd, max_attempts=5):
-        """First checks if 'history' is already visible. If not, activates Ctrl+B."""
+        """
+        Checks if 'history' is already visible. If not, activates Ctrl+B and looks for history.
+        """
         print("🎮 [CTRL+B] Starting Ctrl+B activation sequence...")
-        hud.print("🎮 Activating menu...", "typing")
         
-        # Step 0: First check if history is already visible
-        print(f"🔍 [CTRL+B] Step 0: Checking if history is already visible...")
+        # Step 1: Check if history is already visible
+        print(f"🔍 [CTRL+B] Step 1: Checking if history is already visible...")
         history_already_visible, _ = check_for_history(hwnd, timeout_seconds=3, check_interval=0.3)
         
         if history_already_visible:
@@ -2603,13 +2687,10 @@ def operate_grok():
             
             print(f"🔄 [CTRL+B] Attempt {attempt + 1}/{max_attempts}")
             
-            # Step 1: Verify page is still loaded by checking for "type to imagine"
+            # Step 2: Verify page is still loaded by checking for indicators
             print(f"🔍 [CTRL+B] Verifying page is still loaded...")
-            hud.print("🔍 Verifying page...", "searching")
             
-            page_loaded, _ = check_for_text_on_screen(
-                hwnd, "type to imagine", timeout_seconds=5, check_interval=0.3
-            )
+            page_loaded, indicator = check_for_page_load_indicators(safe_ocr())
             
             if not page_loaded:
                 print(f"⚠️ [CTRL+B] Page not loaded (attempt {attempt + 1}) - reloading...")
@@ -2619,14 +2700,14 @@ def operate_grok():
                 time.sleep(3)
                 continue
             
-            # Step 2: Activate Ctrl+B
+            # Step 3: Activate Ctrl+B
             print(f"⌨️ [CTRL+B] Pressing Ctrl+B (attempt {attempt + 1})...")
             
             enforce_window_focus(hwnd)
             pyautogui.hotkey('ctrl', 'b')
             time.sleep(1.5)
             
-            # Step 3: Check for "history" text
+            # Step 4: Check for "history" text
             print(f"🔍 [CTRL+B] Checking for history option...")
             
             history_found, text_elements = check_for_text_on_screen(
@@ -2642,7 +2723,6 @@ def operate_grok():
                 time.sleep(0.5)
         
         print(f"❌ [CTRL+B] Failed to find 'history' after {max_attempts} attempts")
-        hud.print("❌ Option not found after max attempts", "error")
         return False, hwnd
 
     def click_history_button(hwnd, depth=0):
@@ -2675,7 +2755,6 @@ def operate_grok():
         
         if not history_elements:
             print("❌ [HISTORY] No history option found on screen")
-            hud.print("❌ Option not found", "error")
             return False, hwnd
         
         element = history_elements[0]
@@ -2683,11 +2762,9 @@ def operate_grok():
         click_y = int(element['top'] + (element['height'] / 2))
         
         print(f"🎯 [HISTORY] Clicking history at position ({click_x}, {click_y})")
-        hud.print("📋 Navigating videos...", "selecting")
         
         enforce_window_focus(hwnd)
         pyautogui.moveTo(click_x, click_y, duration=0.2)
-        time.sleep(0.2)
         pyautogui.click()
         time.sleep(0.5)
         
@@ -2695,7 +2772,7 @@ def operate_grok():
         
         return True, hwnd
 
-    def find_and_click_video_duration(hwnd, timeout_seconds=10, check_interval=0.5):
+    def find_and_click_video_duration(hwnd, timeout_seconds=10, check_interval=0.1):
         """Find and click the FIRST time value in format 0:XX."""
         print("⏱️ [TIME] Looking for first time value to click...")
         
@@ -2716,7 +2793,7 @@ def operate_grok():
         start_time = time.time()
         attempts = 0
         
-        time_pattern = re.compile(r'0:\d{1,2}')
+        time_pattern = re.compile(r'\d+:\d{2}')
         all_time_elements = []
         
         while time.time() - start_time < timeout_seconds:
@@ -2751,11 +2828,11 @@ def operate_grok():
                 
                 enforce_window_focus(hwnd)
                 pyautogui.moveTo(click_x, click_y, duration=0.2)
-                time.sleep(0.2)
                 pyautogui.click()
                 time.sleep(0.5)
                 
                 print("✅ [TIME] Successfully clicked first time value")
+                hud.print("🎦")
                 return True, hwnd
             
             if attempts % 3 == 0:
@@ -2771,7 +2848,7 @@ def operate_grok():
         return False, hwnd
 
     # ============================================
-    # SECTION 3: VIDEO NAVIGATION AND RECORDING HELPERS (FIXED)
+    # SECTION 3: VIDEO NAVIGATION AND DOWNLOAD HELPERS
     # ============================================
     
     def extract_video_id_from_text(text_elements):
@@ -2784,12 +2861,12 @@ def operate_grok():
             return None
         
         # Pattern to match video ID in URLs
-        # Looking for: /post/ followed by UUID or /imagine/ followed by number
         patterns = [
             r'/post/([a-f0-9-]+)',  # UUID format
             r'/imagine/(\d+)',       # Number format
             r'grok\.com/imagine/(\d+)',  # Full URL with number
             r'grok\.com/imagine/post/([a-f0-9-]+)',  # Full URL with UUID
+            r'post/([a-f0-9-]+)',    # Just post/UUID
         ]
         
         for element in text_elements:
@@ -2810,7 +2887,7 @@ def operate_grok():
         Returns the video ID string or None.
         """
         print(f"🔍 [CURRENT_ID] Getting current video ID...")
-        hud.print("🔍 Getting current video...", "searching")
+        hud.print("🔍 Checking video...", "searching")
         
         start_time = time.time()
         
@@ -2825,6 +2902,8 @@ def operate_grok():
                     print(f"✅ [CURRENT_ID] Found video ID: {video_id}")
                     return video_id
             
+            time.sleep(0.3)
+        
         print(f"❌ [CURRENT_ID] Could not extract video ID")
         hud.print("❌ Could not get current video", "error")
         return None
@@ -2857,7 +2936,7 @@ def operate_grok():
         Returns: (found, text_elements)
         """
         print(f"🔍 [PROMPT_ID] Looking for prompt ID: '{prompt_id}'")
-        hud.print("🔍 Checking video prompt ID...", "searching")
+        hud.print("🔍 Getting Video ID...", "searching")
         
         normalized_prompt = normalize_text_for_comparison(prompt_id)
         
@@ -2882,32 +2961,314 @@ def operate_grok():
         hud.print("❌ Prompt ID not found", "error")
         return False, None
 
-    def cleanup_old_records(project_title):
+    def click_download_button(hwnd, timeout_seconds=5, check_interval=0.1):
         """
-        Delete old video records before starting new recording.
+        Find and click the download button using image recognition.
+        Looks for download_btn1.png first, then falls back to download_btn2.png.
+        Searches specifically in the bottom-right quadrant of the screen.
+        
+        Returns:
+            tuple: (success, hwnd)
         """
-        try:
-            project_folder = os.path.join(IMAGES_PATH, normalize_project_title(project_title))
-            if not os.path.exists(project_folder):
-                print(f"📁 [CLEANUP] Project folder doesn't exist yet: {project_folder}")
-                return True
+        print("📥 [DOWNLOAD_BTN] Looking for Download button using image recognition...")
+        
+        # Define paths to download button images
+        download_btn1_path = os.path.join(GUI_IMAGE_PATH, "download_btn1.png")
+        download_btn2_path = os.path.join(GUI_IMAGE_PATH, "download_btn2.png")
+        
+        # Check if image files exist
+        if not os.path.exists(download_btn1_path) and not os.path.exists(download_btn2_path):
+            print("❌ [DOWNLOAD_BTN] No download button images found in GUI_IMAGE_PATH")
+            hud.print("❌ Download images missing", "error")
+            return False, hwnd
+        
+        start_time = time.time()
+        attempts = 0
+        
+        # Get current monitor bounds for region restriction
+        current_monitor = get_current_monitor()
+        monitor_left, monitor_top, monitor_right, monitor_bottom = current_monitor
+        monitor_width = monitor_right - monitor_left
+        monitor_height = monitor_bottom - monitor_top
+        
+        # Divide screen into 8 grids (2 columns x 4 rows)
+        # Grid 8 is bottom-right: column 2 (right half), row 4 (bottom quarter)
+        grid_width = monitor_width // 2
+        grid_height = monitor_height // 4
+        
+        # Bottom-right grid: column 2 (index 1), row 4 (index 3)
+        # This is the bottom-right quadrant of the screen
+        region_left = monitor_left + grid_width  # Start of right half
+        region_top = monitor_top + (grid_height * 3)  # Start of bottom quarter
+        region_width = grid_width
+        region_height = grid_height
+        
+        # Add some padding to ensure we catch buttons near the edges
+        padding = 50
+        region_left = max(monitor_left, region_left - padding)
+        region_top = max(monitor_top, region_top - padding)
+        region_width = min(monitor_width, region_width + (padding * 2))
+        region_height = min(monitor_height, region_height + (padding * 2))
+        
+        # Define search region
+        region = (region_left, region_top, region_width, region_height)
+        
+        print(f"📐 [DOWNLOAD_BTN] Screen: {monitor_width}x{monitor_height}")
+        print(f"📐 [DOWNLOAD_BTN] Grid size: {grid_width}x{grid_height}")
+        print(f"📐 [DOWNLOAD_BTN] Search region (bottom-right): {region}")
+        
+        while time.time() - start_time < timeout_seconds:
+            check_for_termination()
+            enforce_window_focus(hwnd)
+            attempts += 1
             
-            video_urls_file = os.path.join(project_folder, "video_urls.txt")
+            print(f"🔍 [DOWNLOAD_BTN] Attempt {attempts} - Searching in bottom-right region...")
             
-            if os.path.exists(video_urls_file):
-                os.remove(video_urls_file)
-                print(f"🗑️ [CLEANUP] Deleted old records file: {video_urls_file}")
-            else:
-                print(f"ℹ️ [CLEANUP] No existing records file found")
+            # Try download_btn1.png first
+            if os.path.exists(download_btn1_path):
+                try:
+                    found_location = pyautogui.locateCenterOnScreen(
+                        download_btn1_path,
+                        region=region,
+                        confidence=0.8,
+                        grayscale=False
+                    )
+                    
+                    if found_location:
+                        x, y = found_location
+                        print(f"✅ [DOWNLOAD_BTN] Found download_btn1.png at position ({x}, {y}) in bottom-right region")
+                        
+                        # Click the download button
+                        enforce_window_focus(hwnd)
+                        pyautogui.moveTo(x, y, duration=0.2)
+                        pyautogui.click()
+                        time.sleep(0.5)
+                        
+                        print(f"✅ [DOWNLOAD_BTN] Successfully clicked download button using download_btn1.png")
+                        return True, hwnd
+                except Exception as e:
+                    print(f"⚠️ [DOWNLOAD_BTN] Error searching for download_btn1.png: {e}")
             
-            return True
-        except Exception as e:
-            print(f"❌ [CLEANUP] Error cleaning old records: {e}")
-            return False
+            # If download_btn1.png not found or failed, try download_btn2.png
+            if os.path.exists(download_btn2_path):
+                try:
+                    found_location = pyautogui.locateCenterOnScreen(
+                        download_btn2_path,
+                        region=region,
+                        confidence=0.8,
+                        grayscale=False
+                    )
+                    
+                    if found_location:
+                        x, y = found_location
+                        print(f"✅ [DOWNLOAD_BTN] Found download_btn2.png at position ({x}, {y}) in bottom-right region")
+                        
+                        # Click the download button
+                        enforce_window_focus(hwnd)
+                        pyautogui.moveTo(x, y, duration=0.2)
+                        pyautogui.click()
+                        time.sleep(0.5)
+                        
+                        print(f"✅ [DOWNLOAD_BTN] Successfully clicked download button using download_btn2.png")
+                        return True, hwnd
+                except Exception as e:
+                    print(f"⚠️ [DOWNLOAD_BTN] Error searching for download_btn2.png: {e}")
+            
+            # If we get here, no download button found yet
+            print(f"⏳ [DOWNLOAD_BTN] Download button not found in bottom-right region (attempt {attempts})")
+            
+            # Small delay before next attempt
+            time.sleep(check_interval)
+        
+        print(f"❌ [DOWNLOAD_BTN] No Download button found in bottom-right region within {timeout_seconds}s")
+        hud.print("❌ Download button not found", "error")
+        return False, hwnd
+    
+    def check_download_in_progress(hwnd, timeout_seconds=60, check_interval=0.5):
+        """
+        Check if a download is in progress and wait for it to complete.
+        Monitors for "downloading" text or checks the downloads folder for new files.
+        
+        Returns:
+            tuple: (download_started, download_completed, hwnd)
+        """
+        print(f"📊 [DOWNLOAD_PROGRESS] Starting download progress monitor...")
+        hud.print("📊 Monitoring download...", "waiting")
+        
+        start_time = time.time()
+        downloads_folder = os.path.expanduser("~/Downloads")
+        
+        # Get initial list of files in downloads folder
+        initial_files = set()
+        if os.path.exists(downloads_folder):
+            try:
+                with os.scandir(downloads_folder) as entries:
+                    for entry in entries:
+                        if entry.is_file():
+                            initial_files.add((entry.name, entry.stat().st_size))
+                print(f"📁 [DOWNLOAD_PROGRESS] Found {len(initial_files)} initial files in Downloads")
+            except Exception as e:
+                print(f"⚠️ [DOWNLOAD_PROGRESS] Could not scan Downloads folder: {e}")
+        
+        download_started = False
+        download_completed = False
+        downloading_text_seen = False
+        
+        while time.time() - start_time < timeout_seconds:
+            check_for_termination()
+            enforce_window_focus(hwnd)
+            
+            # Check for "downloading" text on screen
+            current_texts = safe_ocr()
+            downloading_found = False
+            
+            if current_texts:
+                for element in current_texts:
+                    element_text = element['text'].strip().lower()
+                    if "downloading" in element_text:
+                        downloading_found = True
+                        if not download_started:
+                            print(f"✅ [DOWNLOAD_PROGRESS] Download started! (text detected: '{element_text}')")
+                            hud.print("📥 Download started...", "downloading")
+                            download_started = True
+                            downloading_text_seen = True
+                        break
+            
+            # Check downloads folder for new files
+            if os.path.exists(downloads_folder):
+                try:
+                    current_files = set()
+                    with os.scandir(downloads_folder) as entries:
+                        for entry in entries:
+                            if entry.is_file():
+                                current_files.add((entry.name, entry.stat().st_size))
+                    
+                    # Check if there are new files not in initial list
+                    new_files = current_files - initial_files
+                    
+                    if new_files and not download_started:
+                        print(f"✅ [DOWNLOAD_PROGRESS] New file detected in Downloads! ({len(new_files)} new files)")
+                        download_started = True
+                        hud.print("📥 Download started...", "downloading")
+                    
+                    # Check if files are still growing (download in progress)
+                    if download_started and not download_completed:
+                        # Check if any file is currently being written (size changing)
+                        files_changing = False
+                        for file_name, size in current_files:
+                            if (file_name, size) not in initial_files:
+                                # Check if file size is stable (not changing)
+                                try:
+                                    file_path = os.path.join(downloads_folder, file_name)
+                                    if os.path.exists(file_path):
+                                        current_size = os.path.getsize(file_path)
+                                        # Wait a moment and check again
+                                        time.sleep(0.1)
+                                        new_size = os.path.getsize(file_path)
+                                        if current_size != new_size:
+                                            files_changing = True
+                                            break
+                                except Exception:
+                                    pass
+                        
+                        if not files_changing and not downloading_found:
+                            # No downloading text and no files changing - download likely complete
+                            # But wait a bit to make sure
+                            if downloading_text_seen and not download_completed:
+                                print(f"✅ [DOWNLOAD_PROGRESS] Download appears complete (no activity detected)")
+                                hud.print("✅ Download completed", "success")
+                                download_completed = True
+                                return True, True, hwnd
+                
+                except Exception as e:
+                    print(f"⚠️ [DOWNLOAD_PROGRESS] Error scanning Downloads: {e}")
+            
+            # If we haven't seen downloading text but download started via file detection
+            if download_started and not download_completed and not downloading_found:
+                # Check if enough time has passed since download started
+                elapsed = time.time() - start_time
+                if elapsed > 10 and downloading_text_seen:
+                    print(f"⏳ [DOWNLOAD_PROGRESS] Download in progress... ({elapsed:.1f}s)")
+                    hud.print(f"📥 Downloading... ({elapsed:.1f}s)", "downloading")
+            
+            time.sleep(check_interval)
+        
+        # Timeout reached
+        if download_started and not download_completed:
+            print(f"⏰ [DOWNLOAD_PROGRESS] Timeout reached, but download may still be in progress")
+            hud.print("⏰ Download monitor timed out", "warning")
+            return True, False, hwnd
+        elif not download_started:
+            print(f"⏰ [DOWNLOAD_PROGRESS] No download detected within timeout")
+            hud.print("⏰ No download detected", "warning")
+            return False, False, hwnd
+        
+        return download_started, download_completed, hwnd
 
-    def record_video_info_to_file(video_id, video_url, prompt_id, project_title):
+    # ============================================
+    # SECTION 4: GET TO LATEST VIDEO OPERATION
+    # ============================================
+    
+    def get_to_latest_video(hwnd, base_url, max_attempts=30):
         """
-        Record the video info to a permanent file in the project folder.
+        Operation 1: Navigate left until reaching the latest video.
+        Stops when pressing left doesn't change the video ID (we're at the latest).
+        """
+        print("⬅️ [LATEST_VIDEO] Starting 'Get to Latest Video' operation...")
+        hud.print("⬅️ Finding latest video...", "navigating")
+        
+        current_id = get_current_video_id(hwnd)
+        if not current_id:
+            print("❌ [LATEST_VIDEO] Could not get current video ID")
+            return False, hwnd
+        
+        print(f"📋 [LATEST_VIDEO] Starting video ID: {current_id}")
+        
+        visited_ids = set()
+        visited_ids.add(current_id)
+        
+        attempt = 0
+        latest_reached = False
+        
+        while attempt < max_attempts and not latest_reached:
+            check_for_termination()
+            
+            hwnd = navigate_to_previous_video(hwnd)
+            attempt += 1
+            
+            new_id = get_current_video_id(hwnd, timeout_seconds=3)
+            
+            if not new_id:
+                print(f"⚠️ [LATEST_VIDEO] Could not get ID after left navigation (attempt {attempt})")
+                continue
+            
+            if new_id == current_id:
+                latest_reached = True
+                print(f"✅ [LATEST_VIDEO] Reached latest video! ID: {new_id}")
+                print(f"✅ [LATEST_VIDEO] Pressed left {attempt} times to reach it")
+                hud.print("✅ Gotten to the latest video", "success")
+                return True, hwnd
+            
+            if new_id in visited_ids:
+                print(f"⚠️ [LATEST_VIDEO] Cycle detected at ID: {new_id}")
+                print(f"✅ [LATEST_VIDEO] Latest video is: {current_id}")
+                hud.print("✅ Gotten to the latest video", "success")
+                return True, hwnd
+            
+            visited_ids.add(new_id)
+            print(f"⬅️ [LATEST_VIDEO] Navigated to video ID: {new_id}")
+            hud.print("⬅️ Not latest video", "navigating")
+            current_id = new_id
+        
+        if not latest_reached:
+            print(f"❌ [LATEST_VIDEO] Failed to reach latest video after {max_attempts} attempts")
+            return False, hwnd
+        
+        return True, hwnd
+
+    def record_video_id_to_file(video_id, prompt_id, project_title):
+        """
+        Record only the video ID to a permanent file in the project folder.
         """
         try:
             # Create project folder if it doesn't exist
@@ -2916,8 +3277,8 @@ def operate_grok():
                 os.makedirs(project_folder)
                 print(f"📁 [RECORD] Created project folder: {project_folder}")
             
-            # Create video_urls.txt file in project folder
-            video_urls_file = os.path.join(project_folder, "video_urls.txt")
+            # Create video_urls.csv file in project folder
+            video_urls_file = os.path.join(project_folder, "video_urls.csv")
             
             # Read existing recordings if any
             existing_recordings = []
@@ -2932,19 +3293,17 @@ def operate_grok():
                     return False
             
             # Record the new video info
-            video_number = len(existing_recordings) // 5 + 1
+            video_number = len(existing_recordings) // 2 + 1
             with open(video_urls_file, 'a', encoding='utf-8') as f:
                 f.write(f"video {video_number} identified:\n")
                 f.write(f"video prompt id: {prompt_id}\n")
-                f.write(f"video url: {video_url}\n")
                 f.write(f"video id: {video_id}\n")
                 f.write("-" * 50 + "\n")
             
             print(f"📝 [RECORD] Recorded video {video_number}:")
             print(f"   Prompt ID: {prompt_id}")
-            print(f"   URL: {video_url}")
             print(f"   ID: {video_id}")
-            hud.print(f"✅ Video target identified ({video_number})", "success")
+            hud.print(f"✅ Video identified ({video_number})", "success")
             return True
                 
         except Exception as e:
@@ -2962,89 +3321,18 @@ def operate_grok():
         return normalized if normalized else "unnamed_project"
 
     # ============================================
-    # SECTION 4: GET TO LATEST VIDEO OPERATION (SEPARATE)
+    # SECTION 5: GET VIDEO PROMPT IDS OPERATION WITH DOWNLOAD
     # ============================================
     
-    def get_to_latest_video(hwnd, base_url, max_attempts=30):
-        """
-        Operation 1: Navigate left until reaching the latest video.
-        Stops when pressing left doesn't change the video ID (we're at the latest).
-        """
-        print("⬅️ [LATEST_VIDEO] Starting 'Get to Latest Video' operation...")
-        hud.print("⬅️ Finding latest video...", "navigating")
-        
-        # Get current video ID
-        current_id = get_current_video_id(hwnd)
-        if not current_id:
-            print("❌ [LATEST_VIDEO] Could not get current video ID")
-            return False, hwnd
-        
-        print(f"📋 [LATEST_VIDEO] Starting video ID: {current_id}")
-        
-        
-        # Track visited IDs to detect cycles
-        visited_ids = set()
-        visited_ids.add(current_id)
-        
-        attempt = 0
-        latest_reached = False
-        
-        while attempt < max_attempts and not latest_reached:
-            check_for_termination()
-            
-            # Press left arrow
-            hwnd = navigate_to_previous_video(hwnd)
-            attempt += 1
-            
-            # Get new video ID
-            new_id = get_current_video_id(hwnd, timeout_seconds=3)
-            
-            if not new_id:
-                print(f"⚠️ [LATEST_VIDEO] Could not get ID after left navigation (attempt {attempt})")
-                continue
-            
-            # Check if ID is the same (we've reached the latest video)
-            if new_id == current_id:
-                latest_reached = True
-                print(f"✅ [LATEST_VIDEO] Reached latest video! ID: {new_id}")
-                print(f"✅ [LATEST_VIDEO] Pressed left {attempt} times to reach it")
-                hud.print("✅ Gotten to the latest video", "success")
-                return True, hwnd
-            
-            # Check for cycle (returned to a previously visited ID)
-            if new_id in visited_ids:
-                print(f"⚠️ [LATEST_VIDEO] Cycle detected at ID: {new_id}")
-                print(f"✅ [LATEST_VIDEO] Latest video is: {current_id}")
-                hud.print("✅ Gotten to the latest video", "success")
-                return True, hwnd
-            
-            # Add to visited and continue
-            visited_ids.add(new_id)
-            print(f"⬅️ [LATEST_VIDEO] Navigated to video ID: {new_id}")
-            hud.print("⬅️ Not latest video", "navigating")
-            current_id = new_id
-        
-        if not latest_reached:
-            print(f"❌ [LATEST_VIDEO] Failed to reach latest video after {max_attempts} attempts")
-            return False, hwnd
-        
-        return True, hwnd
-
-    # ============================================
-    # SECTION 5: GET VIDEO PROMPT IDS OPERATION (PROJECT OPERATION)
-    # ============================================
-    
-    def get_video_prompt_ids(hwnd, base_url, prompt_id, project_title):
+    def get_video_prompt_ids_with_download(hwnd, base_url, prompt_id, project_title):
         """
         Operation 2: Navigate right and record videos with matching prompt ID.
-        Starts from the latest video and moves right.
-        Stops when 3 consecutive videos don't have the prompt ID.
+        For each matching video, clicks the download button and waits for download to complete.
         """
         print("➡️ [PROMPT_IDS] Starting 'Get Video Prompt IDs' operation...")
         print(f"🔍 [PROMPT_IDS] Looking for prompt ID: '{prompt_id}'")
         hud.print("🔍 Searching for matching videos...", "searching")
         
-        # Get starting video ID
         current_id = get_current_video_id(hwnd)
         if not current_id:
             print("❌ [PROMPT_IDS] Could not get current video ID")
@@ -3052,40 +3340,52 @@ def operate_grok():
         
         print(f"📋 [PROMPT_IDS] Starting from video ID: {current_id}")
         
-        # Track visited IDs
         visited_ids = set()
         visited_ids.add(current_id)
         
-        # Track consecutive misses
         consecutive_misses = 0
         max_misses = 3
-        
-        # Track videos found
         videos_found = 0
         
-        # Store current info
-        current_url = f"{base_url.rstrip('/')}/{current_id}"
-        
-        # First, check if the starting video has the prompt ID
+        # Check starting video
         prompt_found, _ = check_for_prompt_id(hwnd, prompt_id, timeout_seconds=3)
         
         if prompt_found:
             print(f"✅ [PROMPT_IDS] Starting video has the prompt ID!")
-            record_success = record_video_info_to_file(
-                current_id, current_url, prompt_id, project_title
+            
+            # Record the video ID
+            record_success = record_video_id_to_file(
+                current_id, prompt_id, project_title
             )
             if record_success:
                 videos_found += 1
-                hud.print(f"✅  ({videos_found}) Video(s) target identified", "success")
+                hud.print(f"✅ Video identified ({videos_found})", "success")
+            
+            # Click download button and wait for completion
+            print(f"📥 [PROMPT_IDS] Downloading video {current_id}...")
+            download_success, hwnd = click_download_button(hwnd, timeout_seconds=5)
+            
+            if download_success:
+                # Wait for download to complete
+                started, completed, hwnd = check_download_in_progress(
+                    hwnd, timeout_seconds=120, check_interval=0.5
+                )
+                if completed:
+                    print(f"✅ [PROMPT_IDS] Video {current_id} downloaded successfully!")
+                    hud.print("✅ Download complete", "success")
+                else:
+                    print(f"⚠️ [PROMPT_IDS] Download for video {current_id} may not have completed")
+                    hud.print("⚠️ Download may be incomplete", "warning")
+            else:
+                print(f"⚠️ [PROMPT_IDS] Failed to click download button for video {current_id}")
+                hud.print("⚠️ Download button not found", "warning")
         
-        # Now navigate right and continue checking
+        # Navigate right and continue
         while consecutive_misses < max_misses:
             check_for_termination()
             
-            # Press right arrow
             hwnd = navigate_to_next_video(hwnd)
             
-            # Get new video ID
             new_id = get_current_video_id(hwnd, timeout_seconds=3)
             
             if not new_id:
@@ -3094,7 +3394,6 @@ def operate_grok():
                 print(f"❌ [PROMPT_IDS] Miss {consecutive_misses}/{max_misses}")
                 continue
             
-            # Check if we've cycled back
             if new_id in visited_ids:
                 print(f"⚠️ [PROMPT_IDS] Cycle detected at ID: {new_id}")
                 print(f"📊 [PROMPT_IDS] Found {videos_found} matching videos")
@@ -3102,31 +3401,47 @@ def operate_grok():
                 break
             
             visited_ids.add(new_id)
-            current_url = f"{base_url.rstrip('/')}/{new_id}"
             print(f"➡️ [PROMPT_IDS] Navigated to video ID: {new_id}")
             
-            # Check for prompt ID
             prompt_found, _ = check_for_prompt_id(hwnd, prompt_id, timeout_seconds=3)
             
             if prompt_found:
                 print(f"✅ [PROMPT_IDS] Found matching video at ID: {new_id}")
                 
-                # Record the video info
-                record_success = record_video_info_to_file(
-                    new_id, current_url, prompt_id, project_title
+                # Record the video ID
+                record_success = record_video_id_to_file(
+                    new_id, prompt_id, project_title
                 )
                 
                 if record_success:
                     videos_found += 1
-                    hud.print(f"✅ Video target identified ({videos_found})", "success")
+                    hud.print(f"✅ Video identified ({videos_found})", "success")
                 
-                consecutive_misses = 0  # Reset miss counter
+                # Click download button and wait for completion
+                print(f"📥 [PROMPT_IDS] Downloading video {new_id}...")
+                download_success, hwnd = click_download_button(hwnd, timeout_seconds=5)
+                
+                if download_success:
+                    # Wait for download to complete
+                    started, completed, hwnd = check_download_in_progress(
+                        hwnd, timeout_seconds=120, check_interval=0.5
+                    )
+                    if completed:
+                        print(f"✅ [PROMPT_IDS] Video {new_id} downloaded successfully!")
+                        hud.print("✅ Download complete", "success")
+                    else:
+                        print(f"⚠️ [PROMPT_IDS] Download for video {new_id} may not have completed")
+                        hud.print("⚠️ Download may be incomplete", "warning")
+                else:
+                    print(f"⚠️ [PROMPT_IDS] Failed to click download button for video {new_id}")
+                    hud.print("⚠️ Download button not found", "warning")
+                
+                consecutive_misses = 0
             else:
                 consecutive_misses += 1
                 print(f"❌ [PROMPT_IDS] Prompt ID not found (miss {consecutive_misses}/{max_misses})")
                 hud.print(f"❌ No match ({consecutive_misses}/{max_misses})", "warning")
         
-        # Summary
         if videos_found > 0:
             print(f"✅ [PROMPT_IDS] Completed! Found {videos_found} videos with prompt ID")
             hud.print(f"✅ Found {videos_found} matching videos", "success")
@@ -3136,185 +3451,14 @@ def operate_grok():
             hud.print("❌ No matching videos found", "error")
             return False, hwnd
 
-    def download_videos_from_urls(project_title):
-        """
-        Download videos from the recorded URLs in the project's video_urls.txt file.
-        Automatically downloads to: {IMAGES_PATH}/{project_title}/videos/
-        No user interaction required.
-        
-        Args:
-            project_title: Name of the project
-        
-        Returns:
-            tuple: (success_count, total_count, failed_urls)
-        """
-        print("📥 [DOWNLOADER] Starting video download process...")
-        hud.print("📥 Downloading videos...", "downloading")
-        
-        try:
-            # Determine project folder
-            project_folder = os.path.join(IMAGES_PATH, normalize_project_title(project_title))
-            video_urls_file = os.path.join(project_folder, "video_urls.txt")
-            videos_folder = os.path.join(project_folder, "videos")
-            
-            # Check if video_urls.txt exists
-            if not os.path.exists(video_urls_file):
-                print(f"❌ [DOWNLOADER] No video_urls.txt found at: {video_urls_file}")
-                hud.print("❌ No video records found", "error")
-                return 0, 0, []
-            
-            # Read all video URLs from the file
-            video_urls = []
-            with open(video_urls_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-                # Extract URLs using regex
-                url_pattern = re.compile(r'video url: (https?://[^\s\n]+)')
-                urls = url_pattern.findall(content)
-                video_urls = list(set(urls))  # Remove duplicates
-            
-            if not video_urls:
-                print(f"❌ [DOWNLOADER] No video URLs found in: {video_urls_file}")
-                hud.print("❌ No video URLs found", "error")
-                return 0, 0, []
-            
-            print(f"📊 [DOWNLOADER] Found {len(video_urls)} video URLs to download")
-            hud.print(f"📊 Found {len(video_urls)} videos to download", "info")
-            
-            # Create videos folder if it doesn't exist
-            if not os.path.exists(videos_folder):
-                os.makedirs(videos_folder)
-                print(f"📁 [DOWNLOADER] Created videos folder: {videos_folder}")
-            
-            # Import required modules for downloading
-            import requests
-            from urllib.parse import urlparse
-            
-            # Track download statistics
-            success_count = 0
-            failed_urls = []
-            total_count = len(video_urls)
-            
-            # Setup session with headers to mimic a browser
-            session = requests.Session()
-            session.headers.update({
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'video/webm,video/ogg,video/*;q=0.9,application/ogg;q=0.7,audio/*;q=0.6,*/*;q=0.5',
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-            })
-            
-            for idx, url in enumerate(video_urls, 1):
-                try:
-                    check_for_termination()
-                    
-                    print(f"\n📥 [DOWNLOADER] Downloading video {idx}/{total_count}: {url}")
-                    hud.print(f"📥 Downloading video {idx}/{total_count}...", "downloading")
-                    
-                    # Extract video ID from URL
-                    video_id = url.split('/')[-1] if '/' in url else f"video_{idx}"
-                    
-                    # Get the response
-                    response = session.get(url, stream=True, timeout=30)
-                    response.raise_for_status()
-                    
-                    # Check content type to determine extension
-                    content_type = response.headers.get('Content-Type', '')
-                    ext = '.mp4'  # default
-                    
-                    if 'video' in content_type:
-                        # Extract extension from content type
-                        ext_map = {
-                            'video/mp4': '.mp4',
-                            'video/webm': '.webm',
-                            'video/ogg': '.ogv',
-                            'video/quicktime': '.mov',
-                            'video/x-msvideo': '.avi',
-                        }
-                        ext = ext_map.get(content_type.split(';')[0].strip(), '.mp4')
-                    
-                    # Determine filename
-                    content_disposition = response.headers.get('Content-Disposition', '')
-                    filename = None
-                    if 'filename=' in content_disposition:
-                        filename = content_disposition.split('filename=')[-1].strip('"\'')
-                    
-                    if not filename:
-                        base_name = video_id[:50]
-                        base_name = re.sub(r'[<>:"/\\|?*]', '_', base_name)
-                        filename = f"{base_name}{ext}"
-                    
-                    # Ensure unique filename
-                    save_path = os.path.join(videos_folder, filename)
-                    counter = 1
-                    while os.path.exists(save_path):
-                        name, ext_orig = os.path.splitext(filename)
-                        save_path = os.path.join(videos_folder, f"{name}_{counter}{ext_orig}")
-                        counter += 1
-                    
-                    # Download the file
-                    print(f"💾 [DOWNLOADER] Saving to: {save_path}")
-                    
-                    total_size = int(response.headers.get('content-length', 0))
-                    downloaded_size = 0
-                    chunk_size = 8192
-                    
-                    with open(save_path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=chunk_size):
-                            if chunk:
-                                f.write(chunk)
-                                downloaded_size += len(chunk)
-                                if total_size > 0:
-                                    progress = (downloaded_size / total_size) * 100
-                                    if progress % 10 < 0.1:
-                                        print(f"   Progress: {progress:.1f}%")
-                    
-                    print(f"✅ [DOWNLOADER] Successfully downloaded: {filename}")
-                    success_count += 1
-                    hud.print(f"✅ Downloaded {idx}/{total_count}", "success")
-                    
-                    # Small delay between downloads
-                    time.sleep(0.5)
-                    
-                except Exception as e:
-                    print(f"❌ [DOWNLOADER] Failed to download {url}: {str(e)}")
-                    failed_urls.append(url)
-                    hud.print(f"❌ Failed to download {idx}", "error")
-                    continue
-            
-            # Summary
-            print("\n" + "=" * 60)
-            print("📊 [DOWNLOADER] Download Summary:")
-            print(f"   ✅ Successfully downloaded: {success_count}/{total_count}")
-            if failed_urls:
-                print(f"   ❌ Failed: {len(failed_urls)}")
-                for url in failed_urls:
-                    print(f"      - {url}")
-            print("=" * 60)
-            
-            if success_count > 0:
-                hud.print(f"✅ Downloaded {success_count} videos", "success")
-            if failed_urls:
-                hud.print(f"⚠️ {len(failed_urls)} downloads failed", "warning")
-            
-            return success_count, total_count, failed_urls
-            
-        except Exception as e:
-            print(f"❌ [DOWNLOADER] Error in download process: {e}")
-            hud.print("❌ Download process failed", "error")
-            return 0, 0, []
-        
     # ============================================
     # SECTION 6: MAIN VIDEO WORKFLOW
     # ============================================
-    
     def main_video_workflow_with_restart(hwnd=None, video_project_url=None, depth=0):
         """
         Main video workflow execution with restart capability.
         """
         try:
-            # Load configuration if not provided
             if video_project_url is None:
                 if not os.path.exists(PANEL_PATH):
                     print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
@@ -3342,13 +3486,11 @@ def operate_grok():
                     print("⚠️ Warning: 'video_prompt_id' not configured, using default 'no music'")
                     prompt_id = "no music"
             else:
-                # Get config values
                 with open(PANEL_PATH, 'r', encoding='utf-8') as file:
                     panel_data = json.load(file)
                 prompt_id = panel_data.get('video_prompt_id', 'no music')
                 project_title = panel_data.get('project_title', 'video_project')
             
-            # Ensure browser is ready
             if hwnd is None:
                 hwnd = ensure_window_ready_and_focused()
                 print(f"🪟 [VIDEO] Browser ready (HWND: {hwnd})")
@@ -3357,89 +3499,132 @@ def operate_grok():
             print(f"🌐 [VIDEO] URL: {video_project_url}")
             print(f"🔍 [VIDEO] Prompt ID: '{prompt_id}'")
             print(f"📁 [VIDEO] Project: '{project_title}'")
-            hud.print("🎬 Starting video workflow...", "info")
             
-            # STEP 0: Clean up old records before starting
-            print("=" * 60)
-            print("🗑️ [VIDEO] Cleaning up old records...")
-            print("=" * 60)
-            cleanup_success = cleanup_old_records(project_title)
-            if not cleanup_success:
-                print("⚠️ [VIDEO] Could not clean old records, but continuing...")
+            # Step 1: Check if URL is already loaded - DON'T launch immediately
+            print(f"🔍 [VIDEO] Step 1: Checking if target URL is already loaded...")
+            url_found, current_texts = check_current_url_contains_target(hwnd, video_project_url)
             
-            # Step 1: Navigate to video URL
-            fast_paste_url(hwnd, video_project_url)
-            time.sleep(3)
-            hwnd = ensure_window_ready_and_focused()
+            if url_found:
+                print(f"✅ [VIDEO] Target URL already loaded - proceeding without navigation")
+                hud.print("✅ URL already loaded", "success")
+            else:
+                print(f"🔄 [VIDEO] Target URL not found - navigating to it")
+                hud.print("📋 Navigating to URL...", "navigating")
+                # Clean up old records before navigation
+                project_folder = os.path.join(IMAGES_PATH, normalize_project_title(project_title))
+                video_urls_file = os.path.join(project_folder, "video_urls.csv")
+                if os.path.exists(video_urls_file):
+                    try:
+                        os.remove(video_urls_file)
+                        print(f"🗑️ [VIDEO] Deleted old records file: {video_urls_file}")
+                    except Exception as e:
+                        print(f"⚠️ [VIDEO] Could not delete old records: {e}")
+                
+                fast_paste_url(hwnd, video_project_url)
+                time.sleep(3)
+                hwnd = ensure_window_ready_and_focused()
             
-            # Step 2: Wait for page to load
-            print(f"🔍 [VIDEO] Waiting for page to load...")
-            hud.print("⏳ Loading page...", "waiting")
+            # Step 2: Wait for page to load with multi-indicator check (EXCLUDING time values)
+            print(f"🔍 [VIDEO] Step 2: Waiting for page to load...")
+            hud.print("⏳ Checking page...", "waiting")
             
-            page_loaded, _ = check_for_text_on_screen(
-                hwnd, "type to imagine", timeout_seconds=30, check_interval=0.5
-            )
+            reload_attempts = 0
+            max_reloads = 3
+            page_loaded = False
+            load_indicator = None
+            
+            while reload_attempts < max_reloads and not page_loaded:
+                # Check for page load indicators (excluding time values)
+                current_texts = safe_ocr()
+                if current_texts:
+                    page_loaded, load_indicator = check_for_page_load_indicators(current_texts)
+                    
+                    if page_loaded:
+                        print(f"✅ [VIDEO] Page loaded - indicator: {load_indicator}")
+                        hud.print(f"✅ Page loaded", "success")
+                        break
+                
+                if not page_loaded:
+                    reload_attempts += 1
+                    if reload_attempts < max_reloads:
+                        print(f"🔄 [VIDEO] Page not loaded, reloading (attempt {reload_attempts}/{max_reloads})...")
+                        hud.print(f"🔄 Reloading page ({reload_attempts}/{max_reloads})...", "warning")
+                        enforce_window_focus(hwnd)
+                        pyautogui.hotkey('ctrl', 'r')
+                        time.sleep(3)
+                        hwnd = ensure_window_ready_and_focused()
+                    else:
+                        print(f"❌ [VIDEO] Page failed to load after {max_reloads} reload attempts")
+                        hud.print("❌ Page load failed", "error")
+                        return False
             
             if not page_loaded:
-                print("❌ [VIDEO] Failed to load video page")
-                hud.print("❌ Page load failed", "error")
+                print("❌ [VIDEO] Page not loaded - aborting")
                 return False
             
             print("✅ [VIDEO] Page loaded successfully")
-            hud.print("✅ Page loaded", "success")
             
-            # Step 3: Check for history and activate if needed
-            print(f"🔍 [VIDEO] Looking for history option...")
-            hud.print("🔍 Looking for option...", "searching")
+            # Step 3: Check for time value - THIS IS THE MAIN CHARACTER NOW
+            print(f"🔍 [VIDEO] Step 3: Checking for time value...")
             
-            history_found, hwnd = activate_ctrl_b_and_check_history(hwnd, max_attempts=5)
+            current_texts = safe_ocr()
+            has_timevalue, time_element = check_for_timevalue(current_texts)
             
-            if not history_found:
-                print("❌ [VIDEO] Failed to find history option")
-                hud.print("❌ Option not found", "error")
-                return False
+            if has_timevalue and time_element:
+                print(f"✅ [VIDEO] Time value found! Skipping history and Ctrl+B entirely.")
+                # Click the time value directly
+                click_x = int(time_element['left'] + (time_element['width'] / 2))
+                click_y = int(time_element['top'] + (time_element['height'] / 2))
+                print(f"🎯 [VIDEO] Clicking time value at ({click_x}, {click_y})")
+                enforce_window_focus(hwnd)
+                pyautogui.moveTo(click_x, click_y, duration=0.2)
+                pyautogui.click()
+                time.sleep(0.5)
+                print("✅ [VIDEO] Time value clicked - proceeding directly to video player")
+            else:
+                # No time value found - check history and activate Ctrl+B if needed
+                print(f"ℹ️ [VIDEO] No time value found - checking history...")
+                history_found, hwnd = activate_ctrl_b_and_check_history(hwnd, max_attempts=5)
+                
+                if not history_found:
+                    print("❌ [VIDEO] Failed to find history option")
+                    return False
+                
+                print("✅ [VIDEO] History option found - proceeding to click")
+                
+                # Click the history button
+                print(f"🎯 [VIDEO] Clicking history option...")
+                
+                clicked_successfully, hwnd = click_history_button(hwnd)
+                
+                if not clicked_successfully:
+                    print("❌ [VIDEO] Failed to click history option")
+                    return False
+                
+                print("✅ [VIDEO] History option clicked successfully!")
+                
+                # Wait for history panel to load
+                print("⏳ [VIDEO] Waiting for history panel to load...")
+                hud.print("⏳ Checking history...", "waiting")
+                
+                # Find and click the first time value
+                print(f"🔍 [VIDEO] Looking for first time value...")
+                
+                time_found, hwnd = find_and_click_video_duration(hwnd, timeout_seconds=10, check_interval=0.1)
+                
+                if not time_found:
+                    print("❌ [VIDEO] Failed to find and click time value")
+                    hud.print("❌ Couldn't find a video", "error")
+                    return False
+                
+                print(" [VIDEO] First time value clicked successfully!")
+                hud.print("🎦", "waiting")
             
-            print("✅ [VIDEO] History option found - proceeding to click")
-            hud.print("✅ Option found - proceeding", "success")
-            
-            # Step 4: Click the history button
-            print(f"🎯 [VIDEO] Clicking history option...")
-            hud.print("🎯 Selecting option...", "selecting")
-            
-            clicked_successfully, hwnd = click_history_button(hwnd)
-            
-            if not clicked_successfully:
-                print("❌ [VIDEO] Failed to click history option")
-                hud.print("❌ Could not click option", "error")
-                return False
-            
-            print("✅ [VIDEO] History option clicked successfully!")
-            hud.print("✅ Option clicked!", "success")
-            
-            # Step 5: Wait for history panel to load
-            print("⏳ [VIDEO] Waiting for history panel to load...")
-            hud.print("⏳ Loading history...", "waiting")
-            time.sleep(2)
-            
-            # Step 6: Find and click the first time value
-            print(f"🔍 [VIDEO] Looking for first time value...")
-            hud.print("🔍 Looking for time value...", "searching")
-            
-            time_found, hwnd = find_and_click_video_duration(hwnd, timeout_seconds=10, check_interval=0.5)
-            
-            if not time_found:
-                print("❌ [VIDEO] Failed to find and click time value")
-                hud.print("❌ No time value found", "error")
-                return False
-            
-            print("✅ [VIDEO] First time value clicked successfully!")
-            hud.print("✅ Time value clicked!", "success")
-            
-            # Step 7: Give the video player a moment to load
+            # Give the video player a moment to load
             time.sleep(2)
             hwnd = ensure_window_ready_and_focused()
             
-            # Step 8: OPERATION 1 - Get to Latest Video
+            # OPERATION 1: Get to Latest Video
             print("=" * 60)
             print("🎬 [VIDEO] Starting Operation 1: Get to Latest Video")
             print("=" * 60)
@@ -3455,14 +3640,13 @@ def operate_grok():
                 return False
             
             print("✅ [VIDEO] Operation 1 completed - At latest video")
-            hud.print("✅ At latest video - starting search", "success")
             
-            # Step 9: OPERATION 2 - Get Video Prompt IDs
+            # OPERATION 2: Get Video Prompt IDs with Download
             print("=" * 60)
-            print("🎬 [VIDEO] Starting Operation 2: Get Video Prompt IDs")
+            print("🎬 [VIDEO] Starting Operation 2: Get Video Prompt IDs with Download")
             print("=" * 60)
             
-            prompt_success, hwnd = get_video_prompt_ids(
+            prompt_success, hwnd = get_video_prompt_ids_with_download(
                 hwnd,
                 video_project_url.rstrip('/'),
                 prompt_id,
@@ -3473,30 +3657,6 @@ def operate_grok():
                 print("❌ [VIDEO] Video navigation and recording failed")
                 hud.print("❌ Video recording failed", "error")
                 return False
-            
-            print("✅ [VIDEO] Operation 2 completed - Found matching videos")
-            
-            # ============================================
-            # STEP 10: AUTOMATICALLY DOWNLOAD THE VIDEOS
-            # ============================================
-            print("=" * 60)
-            print("📥 [VIDEO] Automatically downloading recorded videos")
-            print("=" * 60)
-            hud.print("📥 Downloading videos...", "downloading")
-            
-            # Call the download function - no user interaction
-            download_success, total_downloads, failed_downloads = download_videos_from_urls(project_title)
-            
-            if download_success > 0:
-                print(f"🎉 [VIDEO] Successfully downloaded {download_success} videos to the project folder!")
-                hud.print(f"🎉 Downloaded {download_success} videos", "success")
-            else:
-                print("⚠️ [VIDEO] No videos were downloaded")
-                hud.print("⚠️ No videos downloaded", "warning")
-                
-            if failed_downloads:
-                print(f"⚠️ [VIDEO] Failed to download {len(failed_downloads)} videos")
-                print(f"   Failed URLs: {failed_downloads}")
             
             print("🎉 [VIDEO] Video workflow completed successfully!")
             hud.print("🎉 Video workflow complete!", "success")
@@ -3516,11 +3676,10 @@ def operate_grok():
                 print("🧹 Cleaned up hotkey")
             except Exception:
                 pass
-            
+                
     def main_video_workflow():
         """Wrapper for main video workflow with restart capability."""
         try:
-            # Load configuration
             if not os.path.exists(PANEL_PATH):
                 print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
                 return
@@ -3540,7 +3699,6 @@ def operate_grok():
                 hud.print("❌ No video URL configured", "error")
                 return
             
-            # Start the workflow
             success = main_video_workflow_with_restart(
                 hwnd=None, 
                 video_project_url=video_project_url, 
@@ -3564,10 +3722,207 @@ def operate_grok():
                 print("🧹 Cleaned up hotkey")
             except Exception:
                 pass
+    
     main_video_workflow()
+    
+def run_operations():
+    """
+    Main orchestrator function that runs Google Flow and Grok operations
+    based on operation status tracking.
+    
+    Features:
+    - Reads/writes operation status from panel.json
+    - Prevents re-running completed operations
+    - Sets status at each step
+    - Runs operations in sequence
+    """
+    
+    # --- Load or create panel.json ---
+    if not os.path.exists(PANEL_PATH):
+        print(f"📝 [RUN_OPS] Creating new panel.json at: {PANEL_PATH}")
+        default_config = {
+            "operate_google_flow": False,
+            "operate_grok": False,
+            "google_flow_project_link": "",
+            "google_flow_url": "https://labs.google/fx/tools/flow",
+            "grok_imagine_url": "https://grok.com/imagine",
+            "project_title": "",
+            "video_prompt_id": "no music",
+            "operation_status": ""
+        }
+        try:
+            with open(PANEL_PATH, 'w', encoding='utf-8') as f:
+                json.dump(default_config, f, indent=4)
+            print("✅ [RUN_OPS] Created default panel.json")
+        except Exception as e:
+            print(f"❌ [RUN_OPS] Failed to create panel.json: {e}")
+            hud.print("❌ Failed to create config file", "error")
+            return
+    
+    # --- Read panel.json ---
+    try:
+        with open(PANEL_PATH, 'r', encoding='utf-8') as file:
+            panel_data = json.load(file)
+    except Exception as e:
+        print(f"❌ [RUN_OPS] Failed to read panel.json: {e}")
+        hud.print("❌ Failed to read config", "error")
+        return
+    
+    # --- Get operation status ---
+    operation_status = panel_data.get('operation_status', '')
+    print(f"📊 [RUN_OPS] Current operation status: '{operation_status}'")
+    
+    # --- Check if operations are enabled ---
+    operate_google_flow = panel_data.get('operate_google_flow', False)
+    operate_grok = panel_data.get('operate_grok', False)
+    
+    if not operate_google_flow and not operate_grok:
+        print("ℹ️ [RUN_OPS] No operations enabled in config")
+        hud.print("ℹ️ No operations enabled", "info")
+        return
+    
+    # --- Determine which operations need to run ---
+    run_google_flow = False
+    run_grok = False
+    
+    # Google Flow conditions:
+    # Run if: status is empty, or status is "starting_google_flow", 
+    # or status is "all_operations_completed", or status != "completed_google_flow_operation"
+    if operate_google_flow:
+        if (operation_status == "" or 
+            operation_status == "starting_google_flow" or 
+            operation_status == "all_operations_completed" or
+            operation_status != "completed_google_flow_operation"):
+            run_google_flow = True
+            print("✅ [RUN_OPS] Google Flow operation will run")
+        else:
+            print(f"ℹ️ [RUN_OPS] Google Flow already completed (status: '{operation_status}') - skipping")
+    else:
+        print("ℹ️ [RUN_OPS] Google Flow is disabled in config")
+    
+    # Grok conditions:
+    # Run if: status is empty, or status is "starting_grok_operation", 
+    # or status is "all_operations_completed", or status != "completed_grok_operation"
+    if operate_grok:
+        if (operation_status == "" or 
+            operation_status == "starting_grok_operation" or 
+            operation_status == "all_operations_completed" or
+            operation_status != "completed_grok_operation"):
+            run_grok = True
+            print("✅ [RUN_OPS] Grok operation will run")
+        else:
+            print(f"ℹ️ [RUN_OPS] Grok already completed (status: '{operation_status}') - skipping")
+    else:
+        print("ℹ️ [RUN_OPS] Grok is disabled in config")
+    
+    # --- If nothing to run, exit ---
+    if not run_google_flow and not run_grok:
+        print("ℹ️ [RUN_OPS] All operations already completed or disabled")
+        hud.print("✅ All operations completed", "success")
+        return
+    
+    # --- Execute Google Flow first ---
+    if run_google_flow:
+        print("=" * 60)
+        print("🚀 [RUN_OPS] Starting Google Flow operation...")
+        print("=" * 60)
+        hud.print("🚀 Starting Google Flow...", "info")
+        
+        # Update status to "starting_google_flow"
+        try:
+            panel_data['operation_status'] = "starting_google_flow"
+            with open(PANEL_PATH, 'w', encoding='utf-8') as f:
+                json.dump(panel_data, f, indent=4)
+            print("📝 [RUN_OPS] Updated status to: starting_google_flow")
+        except Exception as e:
+            print(f"⚠️ [RUN_OPS] Failed to update status: {e}")
+        
+        # Execute Google Flow
+        try:
+            operate_google_flow_browser()
+            print("✅ [RUN_OPS] Google Flow operation completed successfully")
+            
+            # Update status to "completed_google_flow_operation"
+            try:
+                with open(PANEL_PATH, 'r', encoding='utf-8') as f:
+                    panel_data = json.load(f)
+                panel_data['operation_status'] = "completed_google_flow_operation"
+                with open(PANEL_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(panel_data, f, indent=4)
+                print("📝 [RUN_OPS] Updated status to: completed_google_flow_operation")
+            except Exception as e:
+                print(f"⚠️ [RUN_OPS] Failed to update status: {e}")
+                
+        except KeyboardInterrupt:
+            print("🛑 [RUN_OPS] Google Flow interrupted by user")
+            raise
+        except Exception as e:
+            print(f"❌ [RUN_OPS] Google Flow failed: {e}")
+            hud.print("❌ Google Flow failed", "error")
+            # Don't update status on failure - allow retry
+            return
+    
+    # --- Execute Grok operation ---
+    if run_grok:
+        print("=" * 60)
+        print("🚀 [RUN_OPS] Starting Grok operation...")
+        print("=" * 60)
+        hud.print("🚀 Starting Grok...", "info")
+        
+        # Update status to "starting_grok_operation"
+        try:
+            with open(PANEL_PATH, 'r', encoding='utf-8') as f:
+                panel_data = json.load(f)
+            panel_data['operation_status'] = "starting_grok_operation"
+            with open(PANEL_PATH, 'w', encoding='utf-8') as f:
+                json.dump(panel_data, f, indent=4)
+            print("📝 [RUN_OPS] Updated status to: starting_grok_operation")
+        except Exception as e:
+            print(f"⚠️ [RUN_OPS] Failed to update status: {e}")
+        
+        # Execute Grok
+        try:
+            operate_grok_browser()
+            print("✅ [RUN_OPS] Grok operation completed successfully")
+            
+            # Update status to "completed_grok_operation"
+            try:
+                with open(PANEL_PATH, 'r', encoding='utf-8') as f:
+                    panel_data = json.load(f)
+                panel_data['operation_status'] = "completed_grok_operation"
+                with open(PANEL_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(panel_data, f, indent=4)
+                print("📝 [RUN_OPS] Updated status to: completed_grok_operation")
+            except Exception as e:
+                print(f"⚠️ [RUN_OPS] Failed to update status: {e}")
+                
+        except KeyboardInterrupt:
+            print("🛑 [RUN_OPS] Grok interrupted by user")
+            raise
+        except Exception as e:
+            print(f"❌ [RUN_OPS] Grok failed: {e}")
+            hud.print("❌ Grok failed", "error")
+            # Don't update status on failure - allow retry
+            return
+    
+    # --- All operations completed successfully ---
+    print("=" * 60)
+    print("🎉 [RUN_OPS] All operations completed successfully!")
+    print("=" * 60)
+    hud.print("🎉 All operations complete!", "success")
+    
+    # Update status to "all_operations_completed"
+    try:
+        with open(PANEL_PATH, 'r', encoding='utf-8') as f:
+            panel_data = json.load(f)
+        panel_data['operation_status'] = "all_operations_completed"
+        with open(PANEL_PATH, 'w', encoding='utf-8') as f:
+            json.dump(panel_data, f, indent=4)
+        print("📝 [RUN_OPS] Updated status to: all_operations_completed")
+    except Exception as e:
+        print(f"⚠️ [RUN_OPS] Failed to update status: {e}")  
 
 
-
-if __name__ == "__main__":  
-    operate_grok()
+if __name__ == "__main__":
+   operate_grok_browser()
     

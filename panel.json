@@ -5,5 +5,7 @@
     "google_flow_url": "https://labs.google/fx/tools/flow",
     "grok_imagine_url": "https://grok.com/imagine",
     "project_title": "iamkennyking's project_1",
-    "video_prompt_id": "no music"
+    "video_prompt_id": "no music",
+    "last_operation": "completed_googleflow_operation",
+    "operation_status": "all_operations_completed"
 }
