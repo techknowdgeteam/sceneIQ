@@ -1,11 +1,32 @@
 {
-    "operate_google_flow": true,
-    "operate_grok": true,
-    "google_flow_project_link": "",
-    "google_flow_url": "https://labs.google/fx/tools/flow",
-    "grok_imagine_url": "https://grok.com/imagine",
     "project_title": "iamkennyking's project_1",
-    "video_prompt_id": "no music",
-    "last_operation": "completed_googleflow_operation",
-    "operation_status": "all_operations_completed"
+    "google_flow_config": {
+        "operate_google_flow": true,
+        "google_flow_url": "https://labs.google/fx/tools/flow",
+        "google_flow_project_link": "https://labs.google/fx/tools/flow/project/c9f1b294-857e-4892-917e-81d825f4fa5f",
+        "expected_projectlink_images": 155
+    },
+    "grok_config": {
+        "operate_grok": true,
+        "grok_imagine_url": "https://grok.com/imagine",
+        "video_prompt_id": "no music",
+        "grok_invidual_videos_url": [
+            {
+                "title": "worried",
+                "url": "https://grok.com/imagine/post/6f0b2d9f-0305-4b68-944f-07abfac5eb10?conversation=019f80d0-8aec-7060-8a59-44437dae2c26"
+            },
+            {
+                "title": "pity",
+                "url": "https://grok.com/imagine/post/2fb5415c-0c06-4988-889b-c210efcb3449?conversation=019fa8ac-8bd4-7e22-868c-b5353402916d"
+            },
+            {
+                "title": "sobbing",
+                "url": "https://grok.com/imagine/post/197a972f-db9f-49e9-8c07-ea55492d8fe7?conversation=019fa8ac-8c0e-7f13-b94e-0df6f334950d"
+            }
+        ]
+    },
+    "capcut_config": {
+        "operate_capcut": true
+    },
+    "operation_status": "❌ ABORTED: Operation status invalid - aborting CapCut operation"
 }
