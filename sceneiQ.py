@@ -42,7 +42,7 @@ edge_path = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 SCREEN_IMAGE = r"C:\xampp\htdocs\AI automation\scenIQ\input_images\screen.png"
 TEXT_TARGET = r"C:\xampp\htdocs\AI automation\scenIQ\text_target.json"
 PANEL_PATH = r"C:\xampp\htdocs\AI automation\scenIQ\panel.json"
-SCREEN_TEXT_CONTENT = r"C:\xampp\htdocs\AI automation\scenIQ\screen_content.text"
+SCREEN_TEXT_CONTENT = r"C:\xampp\htdocs\AI automation\scenIQ\screen_content.json"
 INPUT_IMAGES = r"C:\xampp\htdocs\AI automation\scenIQ\input_images"
 GUI_IMAGES = r"C:\xampp\htdocs\AI automation\scenIQ\gui_images"
 IMAGES_PATH = r"C:\xampp\htdocs\AI automation\scenIQ\project"
@@ -308,6 +308,7 @@ def vision():
     def prepare_file():
         """
         Captures the screen, saves it to SCREEN_IMAGE, and creates/empties the output text file.
+        Ensures the screen_content.text file is completely emptied before writing new data.
         """
         
         if not os.path.exists(pytesseract.pytesseract.tesseract_cmd):
@@ -322,10 +323,34 @@ def vision():
             os.makedirs(os.path.dirname(SCREEN_TEXT_CONTENT), exist_ok=True)
             os.makedirs(os.path.dirname(SCREEN_IMAGE), exist_ok=True)
             
-            # Create/empty the output text file
+            # ===== COMPLETELY CLEAR THE OUTPUT TEXT FILE =====
+            # Method 1: Open in write mode and truncate (clears all content)
             with open(SCREEN_TEXT_CONTENT, 'w', encoding='utf-8') as f:
-                pass  # Just create or empty the file
-            print(f"📝 Created/emptied output file: {SCREEN_TEXT_CONTENT}")
+                f.write('')  # Write empty string to clear file
+                f.flush()    # Force write to disk
+                os.fsync(f.fileno())  # Ensure it's written to disk
+            print(f"🗑️ Cleared output file: {SCREEN_TEXT_CONTENT}")
+            
+            # Verify the file is empty
+            if os.path.exists(SCREEN_TEXT_CONTENT):
+                file_size = os.path.getsize(SCREEN_TEXT_CONTENT)
+                if file_size == 0:
+                    print(f"✅ Output file successfully emptied (0 bytes)")
+                else:
+                    print(f"⚠️ Warning: File still has {file_size} bytes after clearing")
+                    # Try an alternative method
+                    with open(SCREEN_TEXT_CONTENT, 'w', encoding='utf-8') as f:
+                        f.truncate(0)
+                    print(f"✅ Used truncate to empty file")
+            
+            # Also clear the preprocessed image if it exists
+            preprocessed_path = os.path.join(os.path.dirname(SCREEN_IMAGE), "preprocessed.png")
+            if os.path.exists(preprocessed_path):
+                try:
+                    os.remove(preprocessed_path)
+                    print(f"🗑️ Removed old preprocessed image: {preprocessed_path}")
+                except Exception as e:
+                    print(f"⚠️ Could not remove old preprocessed image: {e}")
             
             # Capture screen
             print("📸 Capturing screen...")
@@ -340,7 +365,7 @@ def vision():
             
             print("="*80)
             print(f"✅ Ready for processing. Image saved to: {SCREEN_IMAGE}")
-            print(f"✅ Output file ready at: {SCREEN_TEXT_CONTENT}")
+            print(f"✅ Output file cleared and ready at: {SCREEN_TEXT_CONTENT}")
             print("="*80)
             
             return True
@@ -350,229 +375,6 @@ def vision():
             import traceback
             traceback.print_exc()
             return None
-        
-    def preprocess_image():
-        """
-        Loads the image from global SCREEN_IMAGE, applies CLAHE for contrast enhancement,
-        and uses adaptive thresholding to robustly handle varied text colors, uneven lighting,
-        and shadows (preventing broken characters), then saves the result.
-        Also detects text regions and records their positions to a text file.
-        Takes no parameters.
-        """
-        import numpy as np
-        
-        # Ensure SCREEN_IMAGE is available
-        if 'SCREEN_IMAGE' not in globals() and 'SCREEN_IMAGE' not in locals():
-            print("❌ Error: 'SCREEN_IMAGE' variable is not defined.")
-            return None
-
-        if not os.path.exists(SCREEN_IMAGE):
-            print(f"❌ Error: Image not found at: {SCREEN_IMAGE}")
-            return None
-
-        # Load image
-        img = cv2.imread(SCREEN_IMAGE)
-        if img is None:
-            print(f"❌ Error: Failed to load image at {SCREEN_IMAGE}")
-            return None
-
-        # Convert to grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) 
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(gray)
-
-        # Apply Adaptive Thresholding
-        preprocessed_img = cv2.adaptiveThreshold(
-            enhanced, 
-            255, 
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 
-            blockSize=11, 
-            C=2
-        )
-
-        # Load original color image
-        original_color = cv2.imread(SCREEN_IMAGE)
-        if original_color is None:
-            print("❌ Error: Failed to load original image for visualization")
-            return None
-        
-        # Find all black regions
-        black_mask = (preprocessed_img == 0).astype(np.uint8) * 255
-        
-        # Find connected components
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            black_mask, 
-            connectivity=8
-        )
-        
-        # Define size threshold
-        LARGE_REGION_THRESHOLD = 500
-        
-        # Store detected boxes
-        detected_boxes = []
-        
-        # Process each connected component
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            x = stats[i, cv2.CC_STAT_LEFT]
-            y = stats[i, cv2.CC_STAT_TOP]
-            w = stats[i, cv2.CC_STAT_WIDTH]
-            h = stats[i, cv2.CC_STAT_HEIGHT]
-            
-            if area >= LARGE_REGION_THRESHOLD:
-                # Draw green border
-                cv2.rectangle(original_color, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                
-                # Store box coordinates (left, top, right, bottom)
-                detected_boxes.append({
-                    'left': x,
-                    'top': y,
-                    'right': x + w,
-                    'bottom': y + h,
-                    'width': w,
-                    'height': h,
-                    'area': area
-                })
-        
-        # ===== TEXT REGION DETECTION (Sub-boxing) =====
-        print("🔍 Detecting text regions and sub-boxing...")
-        
-        # 1. Adaptive Thresholding for text detection
-        thresh = cv2.adaptiveThreshold(
-            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY_INV, 15, 8
-        )
-
-        # 2. Pass 1: Macro-level grouping (find lines/paragraphs)
-        macro_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (18, 3))
-        macro_dilated = cv2.dilate(thresh, macro_kernel, iterations=1)
-        macro_closing = cv2.morphologyEx(macro_dilated, cv2.MORPH_CLOSE, macro_kernel)
-        
-        contours, _ = cv2.findContours(macro_closing, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        padding = 3  # 3px padding around text chunks
-        text_boxes = []
-
-        # 3. Pass 2: Sub-boxing wide regions into individual word chunks
-        micro_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 1))
-
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            
-            # Filter layout noise
-            if w > 12 and h > 8 and w < img.shape[1] * 0.95 and h < img.shape[0] * 0.4:
-                # If the block is wide (multiple words or sentence), sub-segment it
-                if w > 75:  
-                    roi_thresh = thresh[y:y+h, x:x+w]
-                    roi_dilated = cv2.dilate(roi_thresh, micro_kernel, iterations=1)
-                    sub_contours, _ = cv2.findContours(roi_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    
-                    sub_found = False
-                    for sub_cnt in sub_contours:
-                        sx, sy, sw, sh = cv2.boundingRect(sub_cnt)
-                        if sw > 4 and sh > 4:  # Valid sub-box dimensions
-                            global_x = x + sx
-                            global_y = y + sy
-                            
-                            x_pad = max(0, global_x - padding)
-                            y_pad = max(0, global_y - padding)
-                            w_pad = min(img.shape[1] - x_pad, sw + (2 * padding))
-                            h_pad = min(img.shape[0] - y_pad, sh + (2 * padding))
-                            
-                            text_boxes.append({
-                                'left': x_pad,
-                                'top': y_pad,
-                                'right': x_pad + w_pad,
-                                'bottom': y_pad + h_pad,
-                                'width': w_pad,
-                                'height': h_pad
-                            })
-                            # Draw inner sub-boxes in Orange (BGR: 0, 140, 255)
-                            cv2.rectangle(original_color, (x_pad, y_pad), (x_pad + w_pad, y_pad + h_pad), (0, 140, 255), 1)
-                            sub_found = True
-                    
-                    # Fallback if sub-segmentation didn't split it cleanly
-                    if not sub_found:
-                        x_pad = max(0, x - padding)
-                        y_pad = max(0, y - padding)
-                        w_pad = min(img.shape[1] - x_pad, w + (2 * padding))
-                        h_pad = min(img.shape[0] - y_pad, h + (2 * padding))
-                        text_boxes.append({
-                            'left': x_pad,
-                            'top': y_pad,
-                            'right': x_pad + w_pad,
-                            'bottom': y_pad + h_pad,
-                            'width': w_pad,
-                            'height': h_pad
-                        })
-                        cv2.rectangle(original_color, (x_pad, y_pad), (x_pad + w_pad, y_pad + h_pad), (0, 255, 0), 2)
-                else:
-                    # Small box, keep as a single chunk
-                    x_pad = max(0, x - padding)
-                    y_pad = max(0, y - padding)
-                    w_pad = min(img.shape[1] - x_pad, w + (2 * padding))
-                    h_pad = min(img.shape[0] - y_pad, h + (2 * padding))
-                    text_boxes.append({
-                        'left': x_pad,
-                        'top': y_pad,
-                        'right': x_pad + w_pad,
-                        'bottom': y_pad + h_pad,
-                        'width': w_pad,
-                        'height': h_pad
-                    })
-                    cv2.rectangle(original_color, (x_pad, y_pad), (x_pad + w_pad, y_pad + h_pad), (0, 255, 0), 2)
-
-        # ===== RECORD BOX POSITIONS TO TEXT FILE =====
-        print(f"📝 Recording box positions to: {SCREEN_TEXT_CONTENT}")
-        
-        with open(SCREEN_TEXT_CONTENT, 'w') as f:
-            f.write("=" * 60 + "\n")
-            f.write("DETECTED LARGE REGIONS (Green Boxes)\n")
-            f.write("=" * 60 + "\n\n")
-            
-            for idx, box in enumerate(detected_boxes, 1):
-                f.write(f"Large Region #{idx}:\n")
-                f.write(f"  Left: {box['left']}\n")
-                f.write(f"  Top: {box['top']}\n")
-                f.write(f"  Right: {box['right']}\n")
-                f.write(f"  Bottom: {box['bottom']}\n")
-                f.write(f"  Width: {box['width']}\n")
-                f.write(f"  Height: {box['height']}\n")
-                f.write(f"  Area: {box['area']} pixels\n")
-                f.write("-" * 40 + "\n")
-            
-            f.write("\n" + "=" * 60 + "\n")
-            f.write("DETECTED TEXT REGIONS (Orange/Green Sub-boxes)\n")
-            f.write("=" * 60 + "\n\n")
-            
-            for idx, box in enumerate(text_boxes, 1):
-                f.write(f"Text Region #{idx}:\n")
-                f.write(f"  Left: {box['left']}\n")
-                f.write(f"  Top: {box['top']}\n")
-                f.write(f"  Right: {box['right']}\n")
-                f.write(f"  Bottom: {box['bottom']}\n")
-                f.write(f"  Width: {box['width']}\n")
-                f.write(f"  Height: {box['height']}\n")
-                f.write("-" * 40 + "\n")
-            
-            f.write("\n" + "=" * 60 + "\n")
-            f.write(f"SUMMARY:\n")
-            f.write(f"  Total Large Regions: {len(detected_boxes)}\n")
-            f.write(f"  Total Text Regions: {len(text_boxes)}\n")
-            f.write("=" * 60 + "\n")
-        
-        # Save the image as preprocessed.png
-        base = os.path.dirname(SCREEN_IMAGE)
-        marked_original_path = os.path.join(base, "preprocessed.png")
-        cv2.imwrite(marked_original_path, original_color)
-        
-        print(f"✅ Saved: {marked_original_path}")
-        print(f"✅ Detected {len(detected_boxes)} large regions and {len(text_boxes)} text regions")
-        
-        return marked_original_path
 
     def full_image_vision():
         """
@@ -596,18 +398,17 @@ def vision():
             print(f"❌ Error: English language data not found at: {tessdata_path}")
             return None
         
-        # Check if preprocessed image exists
-        preprocessed_SCREEN_IMAGE = os.path.join(os.path.dirname(SCREEN_IMAGE), "preprocessed.png")
-        if not os.path.exists(preprocessed_SCREEN_IMAGE):
-            print(f"❌ Error: Preprocessed image not found at: {preprocessed_SCREEN_IMAGE}")
+        # Check if screen image exists - SCREEN_IMAGE is already the full file path
+        if not os.path.exists(SCREEN_IMAGE):
+            print(f"❌ Error: screen image not found at: {SCREEN_IMAGE}")
             return None
         
         try:
-            # Load the preprocessed image
-            print(f"📂 Loading preprocessed image from: {preprocessed_SCREEN_IMAGE}")
-            image = cv2.imread(preprocessed_SCREEN_IMAGE)
+            # Load the screen image - use SCREEN_IMAGE directly
+            print(f"📂 Loading screen image from: {SCREEN_IMAGE}")
+            image = cv2.imread(SCREEN_IMAGE)
             if image is None:
-                print(f"❌ Error: Failed to load image at {preprocessed_SCREEN_IMAGE}")
+                print(f"❌ Error: Failed to load image at {SCREEN_IMAGE}")
                 return None
             
             screen_height, screen_width = image.shape[:2]
@@ -698,55 +499,81 @@ def vision():
                     
                     merged_texts.append(current)
                 
-                # Prepare JSON data
-                json_data = []
+                # Read existing JSON data if file exists
+                existing_data = {}
+                if os.path.exists(SCREEN_TEXT_CONTENT):
+                    try:
+                        with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as f:
+                            existing_data = json.load(f)
+                    except:
+                        existing_data = {}
+                
+                # Prepare OCR results in the same format as preprocess_image
+                ocr_results = {}
                 for idx, result in enumerate(merged_texts, 1):
-                    json_data.append({
-                        f"text_{idx}": result['text'],
-                        "coordinates": {
-                            "top": result['top'],
-                            "right": result['right'],
-                            "left": result['left'],
-                            "bottom": result['bottom']
-                        }
-                    })
+                    ocr_results[f"region_{idx}"] = {
+                        "search_engine": "full-image-vision",
+                        "text_value_found": [result['text']],
+                        "Left": int(result['left']),
+                        "Top": int(result['top']),
+                        "Right": int(result['right']),
+                        "Bottom": int(result['bottom']),
+                        "Width": int(result['width']),
+                        "Height": int(result['height']),
+                        "Area": int(result['width'] * result['height']),
+                        "Confidence": int(result['confidence']),
+                        "Region_ID": idx
+                    }
                 
-                # Append vision results to the text file
-                print(f"\n📝 Appending FULL IMAGE vision results to: {SCREEN_TEXT_CONTENT}")
+                # Prepare metadata
+                metadata = {
+                    "processed_on": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    "total_text_regions": len(merged_texts),
+                    "total_ocr_results": len(merged_texts),
+                    "failed_regions": 0,
+                    "empty_results": 0,
+                    "vision_method": "full-image-vision",
+                    "image_dimensions": f"{screen_width} x {screen_height}"
+                }
                 
-                with open(SCREEN_TEXT_CONTENT, 'a', encoding='utf-8') as f:
-                    # Existing text format
-                    f.write("\n\n" + "="*80 + "\n")
-                    f.write("FULL IMAGE vision RESULTS (Primary Attempt - No Regions)\n")
-                    f.write("="*80 + "\n")
-                    f.write(f"Processed on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                    f.write(f"Total Text Blocks Found: {len(merged_texts)}\n")
-                    f.write(f"Image Dimensions: {screen_width} x {screen_height} pixels\n")
-                    f.write("="*80 + "\n\n")
+                # Build the data structure
+                new_data = {
+                    "metadata": metadata,
+                    "text_regions": [],  # Empty for full image vision
+                    "ocr_results": ocr_results
+                }
+                
+                # Merge with existing data
+                final_data = {}
+                if existing_data:
+                    final_data = existing_data.copy()
                     
-                    for idx, result in enumerate(merged_texts, 1):
-                        f.write(f"TEXT BLOCK #{idx}:\n")
-                        f.write(f"  • {result['text']}\n")
-                        f.write(f"    Left: {result['left']:>6}  Top: {result['top']:>6}\n")
-                        f.write(f"    Right: {result['right']:>6}  Bottom: {result['bottom']:>6}\n")
-                        f.write(f"    Width: {result['width']:>6}  Height: {result['height']:>6}\n")
-                        f.write(f"    Confidence: {result['confidence']}%\n")
-                        f.write(f"    Distance from Top: {result['distance_from_top']:>6}px ({result['screen_percentage']:.1f}%)\n")
-                        f.write("-" * 30 + "\n")
+                    # Update metadata
+                    final_data['metadata'] = new_data['metadata']
                     
-                    # Write compact format
-                    f.write("\n" + "="*80 + "\n")
-                    f.write("COMPACT FORMAT (left, top, right, bottom, text):\n")
-                    f.write("="*80 + "\n")
-                    for result in merged_texts:
-                        f.write(f"{result['left']:>6}, {result['top']:>6}, {result['right']:>6}, {result['bottom']:>6}, '{result['text']}'\n")
+                    # Ensure text_regions exists (empty for full image)
+                    final_data['text_regions'] = []
                     
-                    # JSON format
-                    f.write("\n\n" + "="*80 + "\n")
-                    f.write("JSON FORMAT:\n")
-                    f.write("="*80 + "\n")
-                    json.dump(json_data, f, indent=2, ensure_ascii=False)
-                    f.write("\n")
+                    # Merge ocr_results (add new regions, don't overwrite existing)
+                    if 'ocr_results' in final_data:
+                        existing_keys = set(final_data['ocr_results'].keys())
+                        for key, value in new_data['ocr_results'].items():
+                            if key not in existing_keys:
+                                final_data['ocr_results'][key] = value
+                            else:
+                                base_key = key
+                                counter = 1
+                                while f"{base_key}_{counter}" in final_data['ocr_results']:
+                                    counter += 1
+                                final_data['ocr_results'][f"{base_key}_{counter}"] = value
+                    else:
+                        final_data['ocr_results'] = new_data['ocr_results']
+                else:
+                    final_data = new_data
+                
+                # Write back to file
+                with open(SCREEN_TEXT_CONTENT, 'w', encoding='utf-8') as f:
+                    json.dump(final_data, f, indent=2, ensure_ascii=False)
                 
                 # Summary
                 print("\n" + "="*80)
@@ -764,241 +591,606 @@ def vision():
             import traceback
             traceback.print_exc()
             return None
-
-    def region_based_vision():
+ 
+    def preprocess_image():
         """
-        Reads region coordinates from SCREEN_TEXT_CONTENT, processes each region individually
-        using ThreadPoolExecutor for parallel processing, and appends vision results back to the text file.
+        Loads the image from global SCREEN_IMAGE, applies CLAHE for contrast enhancement,
+        and uses adaptive thresholding to robustly handle varied text colors, uneven lighting,
+        and shadows (preventing broken characters), then saves the result.
+        
+        FULLY INTEGRATED: Detects ALL regions (both large and text regions) and immediately
+        processes each with OCR before moving to the next region. Records both region coordinates
+        and extracted text to a text file in JSON-like format with text as a list.
+        
+        APPENDS TO EXISTING DATA: Reads existing JSON data from SCREEN_TEXT_CONTENT and
+        merges the new region results, preserving any existing sections like full_image_vision.
+        
+        Takes no parameters.
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        import json
+        import numpy as np
         from datetime import datetime
+        import json
+        import re
         
-        # Path to the specific image file requested
-        if not os.path.exists(pytesseract.pytesseract.tesseract_cmd):
-            print(f"❌ Error: Tesseract executable not found at: {pytesseract.pytesseract.tesseract_cmd}")
-            return None
-        if not os.path.exists(tessdata_path):
-            print(f"❌ Error: English language data not found at: {tessdata_path}")
-            return None
-            
-        # Check if preprocessed image exists
-        preprocessed_SCREEN_IMAGE = os.path.join(os.path.dirname(SCREEN_IMAGE), "preprocessed.png")
-        if not os.path.exists(preprocessed_SCREEN_IMAGE):
-            print(f"❌ Error: Preprocessed image not found at: {preprocessed_SCREEN_IMAGE}")
-            return None
-        
-        # Check if output text file exists with region data
-        if not os.path.exists(SCREEN_TEXT_CONTENT):
-            print(f"❌ Error: Output text file not found at: {SCREEN_TEXT_CONTENT}")
+        # Ensure SCREEN_IMAGE is available
+        if 'SCREEN_IMAGE' not in globals() and 'SCREEN_IMAGE' not in locals():
+            print("❌ Error: 'SCREEN_IMAGE' variable is not defined.")
             return None
 
-        try:
-            # Load the preprocessed image
-            print(f"📂 Loading preprocessed image from: {preprocessed_SCREEN_IMAGE}")
-            image = cv2.imread(preprocessed_SCREEN_IMAGE)
-            if image is None:
-                print(f"❌ Error: Failed to load image at {preprocessed_SCREEN_IMAGE}")
-                return None
+        if not os.path.exists(SCREEN_IMAGE):
+            print(f"❌ Error: Image not found at: {SCREEN_IMAGE}")
+            return None
+
+        # Load image
+        img = cv2.imread(SCREEN_IMAGE)
+        if img is None:
+            print(f"❌ Error: Failed to load image at {SCREEN_IMAGE}")
+            return None
+
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) 
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        # Apply Adaptive Thresholding
+        preprocessed_img = cv2.adaptiveThreshold(
+            enhanced, 
+            255, 
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 
+            blockSize=11, 
+            C=2
+        )
+
+        # Load original color image
+        original_color = cv2.imread(SCREEN_IMAGE)
+        if original_color is None:
+            print("❌ Error: Failed to load original image for visualization")
+            return None
+        
+        # ===== READ EXISTING DATA FIRST =====
+        existing_data = {}
+        if os.path.exists(SCREEN_TEXT_CONTENT):
+            try:
+                # Check if file is empty first
+                if os.path.getsize(SCREEN_TEXT_CONTENT) == 0:
+                    print(f"📂 Existing file is empty, starting fresh: {SCREEN_TEXT_CONTENT}")
+                    existing_data = {}
+                else:
+                    with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as f:
+                        content = f.read().strip()
+                        if content:  # Only parse if there's content
+                            existing_data = json.loads(content)
+                            print(f"📂 Loaded existing data from: {SCREEN_TEXT_CONTENT}")
+                        else:
+                            print(f"📂 Existing file is empty, starting fresh: {SCREEN_TEXT_CONTENT}")
+                            existing_data = {}
+            except json.JSONDecodeError as e:
+                print(f"⚠️ Could not parse existing data (invalid JSON): {e}")
+                print(f"📂 Starting with fresh data")
+                existing_data = {}
+            except Exception as e:
+                print(f"⚠️ Could not read existing data: {e}")
+                existing_data = {}
+        
+        # ===== INITIALIZE VARIABLES =====
+        text_boxes = []  # Initialize empty list to avoid UnboundLocalError
+        
+        # ===== HELPER FUNCTION: Convert numpy types to Python native types =====
+        def convert_to_native(obj):
+            """Convert numpy types to Python native types for JSON serialization"""
+            if isinstance(obj, np.integer):
+                return int(obj)
+            elif isinstance(obj, np.floating):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {key: convert_to_native(value) for key, value in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_native(item) for item in obj]
+            else:
+                return obj
+
+        # ===== HELPER FUNCTION: Split text into individual items =====
+        def split_text_into_items(text):
+            """
+            Split extracted text into individual items based on common delimiters
+            and clean up each item.
+            """
+            if not text:
+                return []
+            
+            # Split by common delimiters: newlines, spaces, tabs, multiple spaces
+            # First split by newlines and tabs
+            parts = re.split(r'[\n\t]+', text)
+            
+            # Further split each part by spaces if it's not too long
+            items = []
+            for part in parts:
+                if part.strip():
+                    # Split by spaces and filter out empty strings
+                    sub_parts = [p.strip() for p in part.split(' ') if p.strip()]
+                    items.extend(sub_parts)
+            
+            # Clean up each item - remove unwanted characters
+            cleaned_items = []
+            for item in items:
+                # Remove leading/trailing whitespace
+                item = item.strip()
+                # Remove common noise characters if they're isolated
+                if len(item) > 0:
+                    cleaned_items.append(item)
+            
+            return cleaned_items
+
+        # ===== HELPER FUNCTION: Process a single region with Tesseract =====
+        def process_single_region(region_data, region_index, image):
+            """
+            Process a single region: extract text using Tesseract OCR.
+            Returns dict with region data and extracted text as a list.
+            """
+            try:
+                # Check if Tesseract is available
+                if not os.path.exists(pytesseract.pytesseract.tesseract_cmd):
+                    return {
+                        'region_id': region_index,
+                        'error': 'Tesseract not found',
+                        'text_list': [],
+                        'text_combined': '',
+                        'region_data': region_data
+                    }
                 
-            screen_height, screen_width = image.shape[:2]
-            print(f"🖥️ Image Dimensions: {screen_width} x {screen_height} pixels")
-            
-            # Parse the text file to extract region coordinates
-            print(f"📝 Reading regions from: {SCREEN_TEXT_CONTENT}")
-            
-            regions = []
-            current_region = {}
-            reading_large_regions = False
-            reading_text_regions = False
-            
-            with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+                # Extract the region from the image
+                left = int(region_data['left'])
+                top = int(region_data['top'])
+                right = int(region_data['right'])
+                bottom = int(region_data['bottom'])
                 
-            for line in lines:
-                line = line.strip()
+                # Ensure coordinates are within bounds
+                left = max(0, left)
+                top = max(0, top)
+                right = min(image.shape[1], right)
+                bottom = min(image.shape[0], bottom)
                 
-                # Detect which section we're in
-                if "DETECTED LARGE REGIONS" in line:
-                    reading_large_regions = True
-                    reading_text_regions = False
-                    continue
-                elif "DETECTED TEXT REGIONS" in line:
-                    reading_large_regions = False
-                    reading_text_regions = True
-                    continue
-                elif "SUMMARY" in line:
-                    break
-                    
-                # Parse region data
-                if "Large Region #" in line or "Text Region #" in line:
-                    if current_region and 'left' in current_region:
-                        regions.append(current_region)
-                    current_region = {}
-                    continue
-                    
-                # Parse coordinate lines
-                if "Left:" in line:
-                    current_region['left'] = int(line.split("Left:")[1].strip())
-                elif "Top:" in line:
-                    current_region['top'] = int(line.split("Top:")[1].strip())
-                elif "Right:" in line:
-                    current_region['right'] = int(line.split("Right:")[1].strip())
-                elif "Bottom:" in line:
-                    current_region['bottom'] = int(line.split("Bottom:")[1].strip())
-                elif "Width:" in line:
-                    current_region['width'] = int(line.split("Width:")[1].strip())
-                elif "Height:" in line:
-                    current_region['height'] = int(line.split("Height:")[1].strip())
-                elif "Area:" in line and reading_large_regions:
-                    current_region['area'] = int(line.split("Area:")[1].strip().split()[0])
-            
-            # Add the last region
-            if current_region and 'left' in current_region:
-                regions.append(current_region)
-            
-            print(f"✅ Found {len(regions)} regions to process")
-            
-            if len(regions) == 0:
-                print("⚠️ No regions found to process")
-                return None
-            
-            # Prepare arguments for parallel processing
-            args_list = [(region, preprocessed_SCREEN_IMAGE, idx) for idx, region in enumerate(regions, 1)]
-            
-            # Determine number of workers (threads)
-            # Use more threads than CPU cores for I/O bound operations
-            max_workers = min(len(regions), 100)  # Max 100 threads
-            print(f"🚀 Starting parallel processing with {max_workers} threads...")
-            
-            # Process regions in parallel using ThreadPoolExecutor
-            vision_results = []
-            region_count = 0
-            failed_regions = 0
-            
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all tasks
-                future_to_result = {
-                    executor.submit(process_single_region, args): idx 
-                    for idx, args in enumerate(args_list, 1)
+                # Crop the region
+                roi = image[top:bottom, left:right]
+                
+                if roi.size == 0:
+                    return {
+                        'region_id': region_index,
+                        'error': 'Empty region',
+                        'text_list': [],
+                        'text_combined': '',
+                        'region_data': region_data
+                    }
+                
+                # Convert to grayscale if needed
+                if len(roi.shape) == 3:
+                    roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                else:
+                    roi_gray = roi
+                
+                # Apply CLAHE to the ROI
+                roi_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                roi_enhanced = roi_clahe.apply(roi_gray)
+                
+                # Apply thresholding
+                _, roi_thresh = cv2.threshold(roi_enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                
+                # Use Tesseract to extract text
+                custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,!?@#$%^&*()_+-=[]{};:\'"<>/\\|`~ '
+                
+                # Try both preprocessed and original ROI
+                text = pytesseract.image_to_string(roi_thresh, config=custom_config)
+                
+                # If no text found, try with the original ROI
+                if not text.strip():
+                    text = pytesseract.image_to_string(roi_gray, config=custom_config)
+                
+                # Clean up the text
+                text = text.strip()
+                
+                # Split text into individual items
+                text_list = split_text_into_items(text)
+                
+                # Calculate confidence (approximate based on text length and quality)
+                confidence = min(100, len(text) * 2) if text else 0
+                
+                # Get screen dimensions for percentage calculation
+                screen_height, screen_width = image.shape[:2]
+                distance_from_top = top
+                screen_percentage = (top / screen_height) * 100 if screen_height > 0 else 0
+                
+                return {
+                    'region_id': int(region_index),
+                    'error': None,
+                    'text_list': text_list,
+                    'text_combined': text,
+                    'region_data': {
+                        'left': int(left),
+                        'top': int(top),
+                        'right': int(right),
+                        'bottom': int(bottom),
+                        'width': int(region_data.get('width', right - left)),
+                        'height': int(region_data.get('height', bottom - top)),
+                        'area': int(region_data.get('area', (right - left) * (bottom - top)))
+                    },
+                    'confidence': int(confidence),
+                    'distance_from_top': int(distance_from_top),
+                    'screen_percentage': float(screen_percentage),
+                    'left': int(left),
+                    'top': int(top),
+                    'right': int(right),
+                    'bottom': int(bottom),
+                    'width': int(region_data.get('width', right - left)),
+                    'height': int(region_data.get('height', bottom - top))
                 }
                 
-                # Process results as they complete
-                for future in as_completed(future_to_result):
-                    region_id = future_to_result[future]
-                    try:
-                        result = future.result(timeout=60)  # 60 second timeout per region
-                        region_count += 1
-                        
-                        if result['error']:
-                            failed_regions += 1
-                            print(f"  ⚠️ Region #{result['region_id']}: {result['error']}")
-                        else:
-                            texts_found = len(result.get('texts', []))
-                            print(f"  ✅ Region #{result['region_id']}: Found {texts_found} text blocks")
-                        
-                        vision_results.append(result)
-                        
-                        # Show progress
-                        progress = (region_count / len(regions)) * 100
-                        
-                    except Exception as e:
-                        failed_regions += 1
-                        region_count += 1
-                        print(f"  ❌ Region #{region_id} failed with exception: {e}")
-                        vision_results.append({
-                            'region_id': region_id,
-                            'error': str(e),
-                            'texts': []
-                        })
-            
-            # Combine results
-            all_vision_results = []
-            for result in vision_results:
-                if not result.get('error') and result.get('texts'):
-                    all_vision_results.extend(result['texts'])
-            
-            # Sort results by region_id then by position
-            all_vision_results.sort(key=lambda x: (x['region_id'], x['top'], x['left']))
-            
-            print(f"\n✅ Processed {region_count} regions, found {len(all_vision_results)} text blocks")
-            
-            # Prepare JSON data
-            json_data = []
-            for idx, result in enumerate(all_vision_results, 1):
-                json_data.append({
-                    f"text_{idx}": result['text'],
-                    "coordinates": {
-                        "top": result['top'],
-                        "right": result['right'],
-                        "left": result['left'],
-                        "bottom": result['bottom']
-                    }
-                })
-            
-            # Append vision results to the text file
-            print(f"\n📝 Appending vision results to: {SCREEN_TEXT_CONTENT}")
-            
-            with open(SCREEN_TEXT_CONTENT, 'a', encoding='utf-8') as f:
-                # Existing text format
-                f.write("\n\n" + "="*80 + "\n")
-                f.write("vision EXTRACTION RESULTS (Per Region - Parallel Processing with Threads)\n")
-                f.write("="*80 + "\n")
-                f.write(f"Processed on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Total Regions Processed: {region_count}\n")
-                f.write(f"Total Text Blocks Found: {len(all_vision_results)}\n")
-                f.write(f"Failed Regions: {failed_regions}\n")
-                f.write(f"Parallel Workers: {max_workers} threads\n")
-                f.write("="*80 + "\n\n")
-                
-                # Group results by region
-                current_region = 0
-                for result in all_vision_results:
-                    if result['region_id'] != current_region:
-                        current_region = result['region_id']
-                        f.write(f"\n{'─'*40}\n")
-                        f.write(f"REGION #{current_region} RESULTS:\n")
-                        f.write(f"{'─'*40}\n")
-                    
-                    f.write(f"  • {result['text']}\n")
-                    f.write(f"    Left: {result['left']:>6}  Top: {result['top']:>6}\n")
-                    f.write(f"    Right: {result['right']:>6}  Bottom: {result['bottom']:>6}\n")
-                    f.write(f"    Width: {result['width']:>6}  Height: {result['height']:>6}\n")
-                    f.write(f"    Confidence: {result['confidence']}%\n")
-                    f.write(f"    Distance from Top: {result['distance_from_top']:>6}px ({result['screen_percentage']:.1f}%)\n")
-                    f.write("-" * 30 + "\n")
-                
-                # Write compact format
-                f.write("\n" + "="*80 + "\n")
-                f.write("COMPACT FORMAT (left, top, right, bottom, text):\n")
-                f.write("="*80 + "\n")
-                for result in all_vision_results:
-                    f.write(f"{result['left']:>6}, {result['top']:>6}, {result['right']:>6}, {result['bottom']:>6}, '{result['text']}'\n")
-                
-                # JSON format
-                f.write("\n\n" + "="*80 + "\n")
-                f.write("JSON FORMAT:\n")
-                f.write("="*80 + "\n")
-                json.dump(json_data, f, indent=2, ensure_ascii=False)
-                f.write("\n")
-            
-            # Summary
-            print("\n" + "="*80)
-            print(f"✅ vision COMPLETE!")
-            print(f"  • Regions Processed: {region_count}")
-            print(f"  • Total Text Blocks Found: {len(all_vision_results)}")
-            print(f"  • Failed Regions: {failed_regions}")
-            print(f"  • Results Appended to: {SCREEN_TEXT_CONTENT}")
-            print("="*80)
-            
-            return all_vision_results
+            except Exception as e:
+                return {
+                    'region_id': int(region_index),
+                    'error': str(e),
+                    'text_list': [],
+                    'text_combined': '',
+                    'region_data': region_data
+                }
 
-        except Exception as e:
-            print(f"❌ Error during execution: {e}")
-            import traceback
-            traceback.print_exc()
-            return None
-    
+        # ===== PART 1: FIND LARGE REGIONS (Green Boxes) =====
+        print("🔍 Finding large regions...")
+        
+        # Find all black regions
+        black_mask = (preprocessed_img == 0).astype(np.uint8) * 255
+        
+        # Find connected components
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            black_mask, 
+            connectivity=8
+        )
+        
+        # Define size threshold
+        LARGE_REGION_THRESHOLD = 500
+        
+        # Store detected boxes and OCR results
+        detected_boxes = []
+        all_ocr_results = []
+        region_counter = 0
+        
+        # Check existing OCR results to determine starting region counter
+        if existing_data and 'ocr_results' in existing_data:
+            existing_regions = existing_data['ocr_results']
+            # Find the highest region number
+            max_region = 0
+            for key in existing_regions.keys():
+                if key.startswith('region_'):
+                    try:
+                        num = int(key.split('_')[1])
+                        if num > max_region:
+                            max_region = num
+                    except:
+                        pass
+            region_counter = max_region
+            print(f"📊 Continuing from existing region count: {region_counter}")
+        
+        # Process each connected component (large region)
+        for i in range(1, num_labels):
+            area = int(stats[i, cv2.CC_STAT_AREA])
+            x = int(stats[i, cv2.CC_STAT_LEFT])
+            y = int(stats[i, cv2.CC_STAT_TOP])
+            w = int(stats[i, cv2.CC_STAT_WIDTH])
+            h = int(stats[i, cv2.CC_STAT_HEIGHT])
+            
+            if area >= LARGE_REGION_THRESHOLD:
+                # Draw green border
+                cv2.rectangle(original_color, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                
+                region_data = {
+                    'left': x,
+                    'top': y,
+                    'right': x + w,
+                    'bottom': y + h,
+                    'width': w,
+                    'height': h,
+                    'area': area
+                }
+                
+                # Store box coordinates
+                detected_boxes.append(region_data)
+                
+                # ===== IMMEDIATE OCR EXTRACTION FOR THIS LARGE REGION =====
+                region_counter += 1
+                print(f"  📍 Processing Large Region #{region_counter} at ({x}, {y})...")
+                
+                ocr_result = process_single_region(region_data, region_counter, img)
+                all_ocr_results.append(ocr_result)
+                
+                text_list = ocr_result.get('text_list', [])
+                if text_list:
+                    print(f"    ✅ Extracted {len(text_list)} items: {', '.join(text_list[:3])}{'...' if len(text_list) > 3 else ''}")
+                elif ocr_result.get('error'):
+                    print(f"    ⚠️ OCR Error: {ocr_result['error']}")
+                else:
+                    print(f"    ⚠️ No text found in region")
+        
+        # ===== PART 2: FIND TEXT REGIONS (Sub-boxes) =====
+        print("\n🔍 Detecting text regions and sub-boxing...")
+        
+        # 1. Adaptive Thresholding for text detection
+        thresh = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY_INV, 15, 8
+        )
+
+        # 2. Pass 1: Macro-level grouping (find lines/paragraphs)
+        macro_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (18, 3))
+        macro_dilated = cv2.dilate(thresh, macro_kernel, iterations=1)
+        macro_closing = cv2.morphologyEx(macro_dilated, cv2.MORPH_CLOSE, macro_kernel)
+        
+        contours, _ = cv2.findContours(macro_closing, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        padding = 3  # 3px padding around text chunks
+
+        # 3. Pass 2: Sub-boxing wide regions into individual word chunks
+        micro_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 1))
+
+        print(f"🔍 Processing {len(contours)} text regions with integrated OCR...")
+        
+        # Process each text region and immediately extract text
+        text_region_counter = 0
+        
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            x = int(x)
+            y = int(y)
+            w = int(w)
+            h = int(h)
+            
+            # Filter layout noise
+            if w > 12 and h > 8 and w < img.shape[1] * 0.95 and h < img.shape[0] * 0.4:
+                # If the block is wide (multiple words or sentence), sub-segment it
+                if w > 75:  
+                    roi_thresh = thresh[y:y+h, x:x+w]
+                    roi_dilated = cv2.dilate(roi_thresh, micro_kernel, iterations=1)
+                    sub_contours, _ = cv2.findContours(roi_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    
+                    sub_found = False
+                    for sub_cnt in sub_contours:
+                        sx, sy, sw, sh = cv2.boundingRect(sub_cnt)
+                        sx = int(sx)
+                        sy = int(sy)
+                        sw = int(sw)
+                        sh = int(sh)
+                        
+                        if sw > 4 and sh > 4:  # Valid sub-box dimensions
+                            global_x = x + sx
+                            global_y = y + sy
+                            
+                            x_pad = max(0, global_x - padding)
+                            y_pad = max(0, global_y - padding)
+                            w_pad = min(img.shape[1] - x_pad, sw + (2 * padding))
+                            h_pad = min(img.shape[0] - y_pad, sh + (2 * padding))
+                            
+                            region_data = {
+                                'left': int(x_pad),
+                                'top': int(y_pad),
+                                'right': int(x_pad + w_pad),
+                                'bottom': int(y_pad + h_pad),
+                                'width': int(w_pad),
+                                'height': int(h_pad),
+                                'area': int(w_pad * h_pad)
+                            }
+                            
+                            text_boxes.append(region_data)
+                            
+                            # ===== IMMEDIATE OCR EXTRACTION FOR THIS TEXT REGION =====
+                            text_region_counter += 1
+                            region_counter += 1
+                            print(f"  📍 Processing Text Region #{region_counter} at ({x_pad}, {y_pad})...")
+                            
+                            ocr_result = process_single_region(region_data, region_counter, img)
+                            all_ocr_results.append(ocr_result)
+                            
+                            text_list = ocr_result.get('text_list', [])
+                            if text_list:
+                                print(f"    ✅ Extracted {len(text_list)} items: {', '.join(text_list[:3])}{'...' if len(text_list) > 3 else ''}")
+                            elif ocr_result.get('error'):
+                                print(f"    ⚠️ OCR Error: {ocr_result['error']}")
+                            else:
+                                print(f"    ⚠️ No text found in region")
+                            
+                            # Draw inner sub-boxes in Orange (BGR: 0, 140, 255)
+                            cv2.rectangle(original_color, (x_pad, y_pad), (x_pad + w_pad, y_pad + h_pad), (0, 140, 255), 1)
+                            sub_found = True
+                    
+                    # Fallback if sub-segmentation didn't split it cleanly
+                    if not sub_found:
+                        x_pad = max(0, x - padding)
+                        y_pad = max(0, y - padding)
+                        w_pad = min(img.shape[1] - x_pad, w + (2 * padding))
+                        h_pad = min(img.shape[0] - y_pad, h + (2 * padding))
+                        
+                        region_data = {
+                            'left': int(x_pad),
+                            'top': int(y_pad),
+                            'right': int(x_pad + w_pad),
+                            'bottom': int(y_pad + h_pad),
+                            'width': int(w_pad),
+                            'height': int(h_pad),
+                            'area': int(w_pad * h_pad)
+                        }
+                        
+                        text_boxes.append(region_data)
+                        
+                        # ===== IMMEDIATE OCR EXTRACTION FOR THIS TEXT REGION =====
+                        text_region_counter += 1
+                        region_counter += 1
+                        print(f"  📍 Processing Text Region #{region_counter} at ({x_pad}, {y_pad})...")
+                        
+                        ocr_result = process_single_region(region_data, region_counter, img)
+                        all_ocr_results.append(ocr_result)
+                        
+                        text_list = ocr_result.get('text_list', [])
+                        if text_list:
+                            print(f"    ✅ Extracted {len(text_list)} items: {', '.join(text_list[:3])}{'...' if len(text_list) > 3 else ''}")
+                        elif ocr_result.get('error'):
+                            print(f"    ⚠️ OCR Error: {ocr_result['error']}")
+                        else:
+                            print(f"    ⚠️ No text found in region")
+                        
+                        cv2.rectangle(original_color, (x_pad, y_pad), (x_pad + w_pad, y_pad + h_pad), (0, 255, 0), 2)
+                else:
+                    # Small box, keep as a single chunk
+                    x_pad = max(0, x - padding)
+                    y_pad = max(0, y - padding)
+                    w_pad = min(img.shape[1] - x_pad, w + (2 * padding))
+                    h_pad = min(img.shape[0] - y_pad, h + (2 * padding))
+                    
+                    region_data = {
+                        'left': int(x_pad),
+                        'top': int(y_pad),
+                        'right': int(x_pad + w_pad),
+                        'bottom': int(y_pad + h_pad),
+                        'width': int(w_pad),
+                        'height': int(h_pad),
+                        'area': int(w_pad * h_pad)
+                    }
+                    
+                    text_boxes.append(region_data)
+                    
+                    # ===== IMMEDIATE OCR EXTRACTION FOR THIS TEXT REGION =====
+                    text_region_counter += 1
+                    region_counter += 1
+                    print(f"  📍 Processing Text Region #{region_counter} at ({x_pad}, {y_pad})...")
+                    
+                    ocr_result = process_single_region(region_data, region_counter, img)
+                    all_ocr_results.append(ocr_result)
+                    
+                    text_list = ocr_result.get('text_list', [])
+                    if text_list:
+                        print(f"    ✅ Extracted {len(text_list)} items: {', '.join(text_list[:3])}{'...' if len(text_list) > 3 else ''}")
+                    elif ocr_result.get('error'):
+                        print(f"    ⚠️ OCR Error: {ocr_result['error']}")
+                    else:
+                        print(f"    ⚠️ No text found in region")
+                    
+                    cv2.rectangle(original_color, (x_pad, y_pad), (x_pad + w_pad, y_pad + h_pad), (0, 255, 0), 2)
+
+        # ===== RECORD ALL DATA TO TEXT FILE IN JSON-LIKE FORMAT (APPEND MODE) =====
+        print(f"\n📝 Recording all data to: {SCREEN_TEXT_CONTENT}")
+        
+        # Prepare OCR results in the new format with search_engine field
+        ocr_results = {}
+        region_counter_for_json = 0
+        
+        # Process valid OCR results
+        valid_results = [r for r in all_ocr_results if not r.get('error') and r.get('text_list')]
+        
+        for idx, result in enumerate(valid_results, 1):
+            region_data = result.get('region_data', {})
+            region_counter_for_json += 1
+            
+            # Get the text list
+            text_list = result.get('text_list', [])
+            
+            # Determine key name based on number of items
+            if len(text_list) > 1:
+                text_key = "group_of_text_value"
+            else:
+                text_key = "text_value_found"
+            
+            ocr_results[f"region_{region_counter_for_json}"] = {
+                "search_engine": "region-based-vision",
+                text_key: text_list,
+                "Left": int(region_data.get('left', 0)),
+                "Top": int(region_data.get('top', 0)),
+                "Right": int(region_data.get('right', 0)),
+                "Bottom": int(region_data.get('bottom', 0)),
+                "Width": int(region_data.get('width', 0)),
+                "Height": int(region_data.get('height', 0)),
+                "Area": int(region_data.get('area', 0)),
+                "Confidence": int(result.get('confidence', 0)),
+                "Region_ID": int(result.get('region_id', 0))
+            }
+        
+        # Add metadata
+        metadata = {
+            "processed_on": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "total_large_regions": len(detected_boxes),
+            "total_text_regions": len(text_boxes),
+            "total_ocr_results": len(valid_results),
+            "failed_regions": sum(1 for r in all_ocr_results if r.get('error')),
+            "empty_results": sum(1 for r in all_ocr_results if not r.get('error') and not r.get('text_list'))
+        }
+        
+        # Combine into new data structure
+        new_data = {
+            "metadata": metadata,
+            "text_regions": text_boxes,
+            "ocr_results": ocr_results
+        }
+        
+        # Convert any remaining numpy types
+        new_data_clean = convert_to_native(new_data)
+        
+        # ===== MERGE WITH EXISTING DATA =====
+        final_data = {}
+        
+        if existing_data:
+            # Start with existing data
+            final_data = existing_data.copy()
+            
+            # Update metadata
+            final_data['metadata'] = new_data_clean['metadata']
+            
+            # Merge text_regions (append new ones)
+            if 'text_regions' in final_data:
+                final_data['text_regions'].extend(new_data_clean['text_regions'])
+            else:
+                final_data['text_regions'] = new_data_clean['text_regions']
+            
+            # Merge ocr_results (add new regions, don't overwrite existing)
+            if 'ocr_results' in final_data:
+                existing_keys = set(final_data['ocr_results'].keys())
+                for key, value in new_data_clean['ocr_results'].items():
+                    if key not in existing_keys:
+                        final_data['ocr_results'][key] = value
+                    else:
+                        base_key = key
+                        counter = 1
+                        while f"{base_key}_{counter}" in final_data['ocr_results']:
+                            counter += 1
+                        final_data['ocr_results'][f"{base_key}_{counter}"] = value
+            else:
+                final_data['ocr_results'] = new_data_clean['ocr_results']
+            
+            print(f"✅ Merged new data with existing {len(existing_data)} records")
+        else:
+            # No existing data, use new data as-is
+            final_data = new_data_clean
+            print(f"✅ Created new data file with {len(new_data_clean)} sections")
+        
+        # ===== WRITE TO FILE =====
+        with open(SCREEN_TEXT_CONTENT, 'w', encoding='utf-8') as f:
+            json.dump(final_data, f, indent=2, ensure_ascii=False)
+        
+        # Save the image as preprocessed.png
+        base = os.path.dirname(SCREEN_IMAGE)
+        marked_original_path = os.path.join(base, "preprocessed.png")
+        cv2.imwrite(marked_original_path, original_color)
+        
+        print("\n" + "=" * 60)
+        print("✅ PROCESSING COMPLETE!")
+        print(f"  • Preprocessed image saved: {marked_original_path}")
+        print(f"  • Data saved to: {SCREEN_TEXT_CONTENT}")
+        print(f"  • Total Large Regions: {len(detected_boxes)}")
+        print(f"  • Total Text Regions: {len(text_boxes)}")
+        print(f"  • Total OCR Results: {len(valid_results)}")
+        print("=" * 60)
+        
+        return marked_original_path
+
     def normalize_text_for_comparison(text):
         """
         Normalize text for comparison by removing all non-alphanumeric characters
@@ -1019,93 +1211,95 @@ def vision():
             print("❌ Failed to prepare file. Exiting.")
             return
         
-        # Step 2: Preprocess image and detect regions
-        result2 = preprocess_image()
-        if result2 is None:
-            print("❌ Failed to preprocess image. Exiting.")
-            return
-        
-        # Step 3: Run FULL IMAGE vision FIRST
+        # Step 2: Run FULL IMAGE vision FIRST (primary approach)
         print("=" * 80)
         print("🔍 Running FULL IMAGE vision (First Attempt)...")
         print("=" * 80)
         
         full_image_vision()
         
-        # Step 4: Check if the text target value was found in the screen content
-        # Read the text target file to get the value we're looking for
+        # Step 3: Check if the text target value was found
         target_value = None
+        target_exists = False
+        
         try:
             if os.path.exists(TEXT_TARGET):
                 with open(TEXT_TARGET, 'r', encoding='utf-8') as file:
                     text_target_data = json.load(file)
                     target_value = text_target_data.get('value', '')
-                    print(f"🔍 [MAIN] Looking for target value: '{target_value}'")
+                    if target_value:
+                        target_exists = True
+                        print(f"🔍 [MAIN] Looking for target value: '{target_value}'")
+                    else:
+                        print(f"⚠️ [MAIN] TEXT_TARGET exists but 'value' is empty")
+            else:
+                print(f"⚠️ [MAIN] TEXT_TARGET file not found at: {TEXT_TARGET}")
         except Exception as e:
             print(f"⚠️ [MAIN] Error reading text target: {e}")
         
-        # Normalize the target value for comparison
+        # If target doesn't exist or is empty, we still ran full image vision
+        # Just exit with a message
+        if not target_exists:
+            print("=" * 80)
+            print(f"⚠️ [MAIN] No target specified. Full image vision ran but skipping region-based fallback.")
+            print("=" * 80)
+            print("✅ vision COMPLETE!")
+            print("=" * 80)
+            return
+        
+        # Check if target was found in full image vision
         target_found_in_full_image = False
         
-        if target_value:
-            # Read the screen content file to check if target value was found
-            try:
-                if os.path.exists(SCREEN_TEXT_CONTENT):
-                    with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
-                        screen_content = file.read()
-                    
-                    # Normalize both the target and the screen content for comparison
-                    normalized_target = normalize_text_for_comparison(target_value)
-                    
-                    # Check if the normalized target is in the screen content
-                    # Also check for common variations
-                    target_variations = [
-                        target_value,
-                        target_value.lower(),
-                        target_value.upper(),
-                        target_value.replace(' ', ''),
-                        target_value.replace(' ', '').lower(),
-                        target_value.replace(' ', '').upper(),
-                        target_value.replace(' ', '|'),
-                        target_value.replace(' ', ':'),
-                        target_value.replace(' ', ''),
-                        target_value.replace(' ', '') + '|',
-                        target_value.replace(' ', '') + ':',
-                    ]
-                    
-                    # Remove duplicates
-                    target_variations = list(set(target_variations))
-                    
-                    print(f"🔍 [MAIN] Checking for target variations: {target_variations[:5]}...")
-                    
-                    for variation in target_variations:
-                        if variation in screen_content:
-                            print(f"✅ [MAIN] Found target value variation in FULL IMAGE vision: '{variation}'")
-                            target_found_in_full_image = True
-                            break
-                    
-                    # Also check using regex for case-insensitive matching
-                    if not target_found_in_full_image:
-                        # Use regex with re.IGNORECASE
-                        pattern = re.compile(re.escape(target_value), re.IGNORECASE)
-                        if pattern.search(screen_content):
-                            print(f"✅ [MAIN] Found target value (case-insensitive) in FULL IMAGE vision: '{target_value}'")
-                            target_found_in_full_image = True
-                    
-                    # Also check normalized form (remove all non-alphanumeric)
-                    if not target_found_in_full_image:
-                        normalized_screen = re.sub(r'[^a-zA-Z0-9]', '', screen_content).lower()
-                        if normalized_target in normalized_screen:
-                            print(f"✅ [MAIN] Found normalized target in FULL IMAGE vision: '{normalized_target}'")
-                            target_found_in_full_image = True
-                            
-                else:
-                    print(f"⚠️ [MAIN] screen_content.text not found at: {SCREEN_TEXT_CONTENT}")
-                    
-            except Exception as e:
-                print(f"⚠️ [MAIN] Error checking screen content: {e}")
+        try:
+            if os.path.exists(SCREEN_TEXT_CONTENT):
+                with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
+                    screen_content = file.read()
+                
+                # Normalize target
+                normalized_target = normalize_text_for_comparison(target_value)
+                
+                # Check variations
+                target_variations = [
+                    target_value,
+                    target_value.lower(),
+                    target_value.upper(),
+                    target_value.replace(' ', ''),
+                    target_value.replace(' ', '').lower(),
+                    target_value.replace(' ', '').upper(),
+                    normalized_target,
+                ]
+                
+                target_variations = list(set(target_variations))
+                
+                print(f"🔍 [MAIN] Checking for target variations in FULL IMAGE vision...")
+                
+                found_match = False
+                for variation in target_variations:
+                    if not variation:
+                        continue
+                    if variation in screen_content:
+                        print(f"✅ [MAIN] Found target value variation in FULL IMAGE vision: '{variation}'")
+                        found_match = True
+                        break
+                
+                if found_match:
+                    target_found_in_full_image = True
+                
+                # Also check normalized form
+                if not target_found_in_full_image:
+                    normalized_screen = re.sub(r'[^a-zA-Z0-9]', '', screen_content).lower()
+                    target_no_alnum = re.sub(r'[^a-zA-Z0-9]', '', target_value).lower()
+                    if target_no_alnum and target_no_alnum in normalized_screen:
+                        print(f"✅ [MAIN] Found normalized target in FULL IMAGE vision: '{target_no_alnum}'")
+                        target_found_in_full_image = True
+                        
+            else:
+                print(f"⚠️ [MAIN] screen_content.text not found at: {SCREEN_TEXT_CONTENT}")
+                
+        except Exception as e:
+            print(f"⚠️ [MAIN] Error checking screen content: {e}")
         
-        # Step 5: Decide whether to run region-based vision
+        # Step 4: Decide whether to run region-based vision as fallback
         if target_found_in_full_image:
             print("=" * 80)
             print(f"✅ [MAIN] Target value '{target_value}' found in FULL IMAGE vision!")
@@ -1117,7 +1311,9 @@ def vision():
             print(f"❌ [MAIN] Target value '{target_value}' NOT found in FULL IMAGE vision.")
             print("🔄 [MAIN] Running region-based vision as fallback...")
             print("=" * 80)
-            region_based_vision()
+            
+            # NOW run preprocess_image as fallback
+            preprocess_image()
             
             # After region-based vision, check again if target was found
             try:
@@ -1125,14 +1321,31 @@ def vision():
                     with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
                         screen_content = file.read()
                     
-                    if target_value and target_value in screen_content:
-                        print(f"✅ [MAIN] Target value found in region-based vision results!")
+                    if target_value:
+                        normalized_target = normalize_text_for_comparison(target_value)
+                        target_no_alnum = re.sub(r'[^a-zA-Z0-9]', '', target_value).lower()
+                        normalized_screen = re.sub(r'[^a-zA-Z0-9]', '', screen_content).lower()
+                        
+                        if target_value in screen_content or normalized_target in screen_content or target_no_alnum in normalized_screen:
+                            print(f"✅ [MAIN] Target value found in region-based vision results!")
+                        else:
+                            print(f"❌ [MAIN] Target value still NOT found after region-based vision.")
             except Exception as e:
                 print(f"⚠️ [MAIN] Error checking screen content after region-based vision: {e}")
         
         # Final summary
         print("=" * 80)
-
+        print("✅ vision PROCESS COMPLETE!")
+        if target_exists:
+            if target_found_in_full_image:
+                print(f"✅ Target '{target_value}' was found via FULL IMAGE vision")
+            else:
+                print(f"⚠️ Target '{target_value}' was found via REGION-BASED vision (fallback)")
+        else:
+            print(f"ℹ️ No target specified - ran full image vision only")
+        print("=" * 80)
+        return    
+ 
     # Execute main
     main()
     
@@ -1165,7 +1378,7 @@ def operate_google_flow_project():
     Launches/uses Microsoft Edge for Google Flow operations.
     Features: Live HUD tracking, click-through overlay, 
     global hotkey interception, and simple URL launch with "all media" detection.
-    Uses JSON format for text extraction and case-insensitive/normalized text matching.
+    Uses case-insensitive and normalized text matching.
     Includes full download mechanism with modal dismissal, zip extraction, and image validation.
     """
     # --- SPEED TUNING PARAMETERS ---
@@ -1265,7 +1478,7 @@ def operate_google_flow_project():
         """
         Capture screen without hiding the HUD (HUD is click-through)
         AND properly parse the screen_content.text file to return text elements.
-        Now uses JSON format for parsing.
+        Now uses the new JSON structure with 'ocr_results' key.
         """
         check_for_termination()
         
@@ -1277,104 +1490,81 @@ def operate_google_flow_project():
         
         try:
             if os.path.exists(SCREEN_TEXT_CONTENT):
+                # Read the JSON file
                 with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
-                    content = file.read()
+                    data = json.load(file)
                 
-                # ============================================
-                # FIRST: Parse JSON format from FULL IMAGE vision RESULTS
-                # ============================================
-                # Look for JSON array in the FULL IMAGE section
-                full_image_json_match = re.search(
-                    r'FULL IMAGE vision RESULTS.*?JSON FORMAT:\s*=\s*\n(\[.*?\])\s*(?=\n\n|$|\s*vision EXTRACTION RESULTS)',
-                    content,
-                    re.DOTALL | re.IGNORECASE
-                )
-                
-                if full_image_json_match:
-                    try:
-                        json_text = full_image_json_match.group(1)
-                        # Clean up any extraneous text that might be in the JSON
-                        json_text = re.sub(r'^[^{[]*', '', json_text)
-                        json_text = re.sub(r'[^}\]]*$', '', json_text)
-                        json_data = json.loads(json_text)
+                # Check if we have ocr_results in the new structure
+                if 'ocr_results' in data:
+                    ocr_results = data['ocr_results']
+                    print(f"✅ [VISION] Found {len(ocr_results)} OCR result entries")
+                    
+                    # Iterate through each region in ocr_results
+                    for region_key, region_data in ocr_results.items():
+                        # Extract text_value_found (list of text items)
+                        text_list = region_data.get('text_value_found', [])
                         
-                        for item in json_data:
-                            # Extract text from the dynamic key (text_1, text_2, etc.)
-                            text_value = None
-                            for key, value in item.items():
-                                if key.startswith('text_'):
-                                    text_value = value
-                                    break
-                            
-                            if text_value and 'coordinates' in item:
-                                coords = item['coordinates']
+                        # Get coordinates
+                        left = region_data.get('Left', 0)
+                        top = region_data.get('Top', 0)
+                        right = region_data.get('Right', 0)
+                        bottom = region_data.get('Bottom', 0)
+                        width = region_data.get('Width', 0)
+                        height = region_data.get('Height', 0)
+                        
+                        # If text_list is empty but we have text_combined in the old format, try that
+                        if not text_list:
+                            # Check if there's a combined text field (for backward compatibility)
+                            if 'text_combined' in region_data and region_data['text_combined']:
+                                text_list = [region_data['text_combined']]
+                            elif 'text' in region_data and region_data['text']:
+                                text_list = [region_data['text']]
+                        
+                        # Add each text item as a separate element
+                        for text_item in text_list:
+                            if text_item and text_item.strip():
                                 text_elements.append({
-                                    'text': text_value.strip(),
-                                    'left': coords.get('left', 0),
-                                    'top': coords.get('top', 0),
-                                    'right': coords.get('right', 0),
-                                    'bottom': coords.get('bottom', 0),
-                                    'width': coords.get('right', 0) - coords.get('left', 0),
-                                    'height': coords.get('bottom', 0) - coords.get('top', 0)
+                                    'text': text_item.strip(),
+                                    'left': left,
+                                    'top': top,
+                                    'right': right,
+                                    'bottom': bottom,
+                                    'width': width,
+                                    'height': height,
+                                    'region_id': region_key
                                 })
-                        
-                        if text_elements:
-                            print(f"✅ [VISION] Parsed {len(text_elements)} text elements from FULL IMAGE JSON section")
-                    except json.JSONDecodeError as e:
-                        print(f"⚠️ [VISION] Failed to parse FULL IMAGE JSON: {e}")
-                        # Continue to next parsing method if JSON fails
-                
-                # ============================================
-                # SECOND: Parse JSON format from REGION-BASED vision RESULTS
-                # ============================================
-                if not text_elements:
-                    # Find all JSON sections from region-based results
-                    region_json_matches = re.findall(
-                        r'vision EXTRACTION RESULTS.*?JSON FORMAT:\s*=\s*\n(\[.*?\])\s*(?=\n\n|$|\s*FULL IMAGE vision RESULTS)',
-                        content,
-                        re.DOTALL | re.IGNORECASE
-                    )
                     
-                    for json_match in region_json_matches:
-                        try:
-                            json_text = json_match
-                            json_text = re.sub(r'^[^{[]*', '', json_text)
-                            json_text = re.sub(r'[^}\]]*$', '', json_text)
-                            json_data = json.loads(json_text)
-                            
-                            for item in json_data:
-                                text_value = None
-                                for key, value in item.items():
-                                    if key.startswith('text_'):
-                                        text_value = value
-                                        break
-                                
-                                if text_value and 'coordinates' in item:
-                                    coords = item['coordinates']
-                                    text_elements.append({
-                                        'text': text_value.strip(),
-                                        'left': coords.get('left', 0),
-                                        'top': coords.get('top', 0),
-                                        'right': coords.get('right', 0),
-                                        'bottom': coords.get('bottom', 0),
-                                        'width': coords.get('right', 0) - coords.get('left', 0),
-                                        'height': coords.get('bottom', 0) - coords.get('top', 0)
-                                    })
-                            
-                            if text_elements:
-                                print(f"✅ [VISION] Parsed {len(text_elements)} text elements from REGION-BASED JSON section")
-                                break
-                        except json.JSONDecodeError as e:
-                            print(f"⚠️ [VISION] Failed to parse REGION-BASED JSON: {e}")
-                            continue
+                    if text_elements:
+                        print(f"✅ [VISION] Parsed {len(text_elements)} text elements from ocr_results structure")
+                    else:
+                        print(f"⚠️ [VISION] No text elements found in ocr_results")
                 
-                # ============================================
-                # THIRD: Fallback - Try parsing TEXT format if JSON parsing failed
-                # ============================================
-                if not text_elements:
-                    print("ℹ️ [VISION] No JSON data found, falling back to text format parsing...")
+                # Fallback: Try old format if ocr_results doesn't exist
+                elif 'text_regions' in data and data['text_regions']:
+                    print(f"ℹ️ [VISION] Falling back to text_regions format")
+                    for region in data['text_regions']:
+                        # Try to find corresponding text in ocr_results if available
+                        region_text = region.get('text', '')
+                        if region_text:
+                            text_elements.append({
+                                'text': region_text.strip(),
+                                'left': region.get('left', 0),
+                                'top': region.get('top', 0),
+                                'right': region.get('right', 0),
+                                'bottom': region.get('bottom', 0),
+                                'width': region.get('width', 0),
+                                'height': region.get('height', 0)
+                            })
                     
-                    # Parse FULL IMAGE vision RESULTS (text format)
+                    if text_elements:
+                        print(f"✅ [VISION] Parsed {len(text_elements)} text elements from text_regions format")
+                
+                # Fallback: Try direct text blocks parsing (old format)
+                else:
+                    print(f"ℹ️ [VISION] Trying fallback: parsing raw text content")
+                    content = json.dumps(data, indent=2)
+                    
+                    # Parse TEXT BLOCK patterns
                     text_blocks = re.findall(
                         r'TEXT BLOCK #\d+:\s*•\s*(.+?)\s+Left:\s*(\d+)\s+Top:\s*(\d+)\s+Right:\s*(\d+)\s+Bottom:\s*(\d+)\s+Width:\s*(\d+)\s+Height:\s*(\d+)',
                         content,
@@ -1394,42 +1584,9 @@ def operate_google_flow_project():
                         })
                     
                     if text_elements:
-                        print(f"✅ [VISION] Parsed {len(text_elements)} text elements from FULL IMAGE text section")
-                    
-                    # Parse REGION-BASED vision RESULTS (text format)
-                    if not text_elements:
-                        region_sections = re.findall(
-                            r'────────────────────────────────────────\s*REGION #(\d+) RESULTS:\s*────────────────────────────────────────\s*(.*?)(?=(?:────────────────────────────────────────\s*REGION #\d+ RESULTS:|$))',
-                            content,
-                            re.DOTALL | re.IGNORECASE
-                        )
-                        
-                        region_count = 0
-                        for region_num, region_content in region_sections:
-                            region_texts = re.findall(
-                                r'•\s*(.+?)\s+Left:\s*(\d+)\s+Top:\s*(\d+)\s+Right:\s*(\d+)\s+Bottom:\s*(\d+)\s+Width:\s*(\d+)\s+Height:\s*(\d+)',
-                                region_content,
-                                re.DOTALL
-                            )
-                            
-                            for match in region_texts:
-                                text, left, top, right, bottom, width, height = match
-                                text_elements.append({
-                                    'text': text.strip(),
-                                    'left': int(left),
-                                    'top': int(top),
-                                    'right': int(right),
-                                    'bottom': int(bottom),
-                                    'width': int(width),
-                                    'height': int(height)
-                                })
-                                region_count += 1
-                        
-                        if region_count > 0:
-                            print(f"✅ [VISION] Parsed {region_count} text elements from REGION-BASED text sections")
-                    
-                    # Parse COMPACT FORMAT section as last resort
-                    if not text_elements:
+                        print(f"✅ [VISION] Parsed {len(text_elements)} text elements from text block format")
+                    else:
+                        # Try parsing COMPACT FORMAT section
                         compact_section = re.search(
                             r'COMPACT FORMAT.*?\n(.*?)(?:\n\n|\Z)',
                             content,
@@ -1440,6 +1597,7 @@ def operate_google_flow_project():
                             compact_lines = compact_section.group(1).strip().split('\n')
                             for line in compact_lines:
                                 if line.strip():
+                                    # Parse format: "left, top, right, bottom, 'text'"
                                     match = re.match(
                                         r'\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*[\'"](.+?)[\'"]\s*$',
                                         line.strip()
@@ -1457,24 +1615,46 @@ def operate_google_flow_project():
                                         })
                             
                             if text_elements:
-                                print(f"✅ [VISION] Parsed {len(text_elements)} text elements from COMPACT format")
+                                print(f"✅ [VISION] Parsed {len(text_elements)} text elements from compact format")
+            
+            if not text_elements:
+                print(f"⚠️ [VISION] Could not parse any text elements from screen_content.text")
                 
-                # ============================================
-                # FINAL: Log what we found
-                # ============================================
+        except json.JSONDecodeError as e:
+            print(f"⚠️ [VISION] JSON decode error: {e}")
+            # Try to read as text file if JSON fails
+            try:
+                with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
+                    content = file.read()
+                
+                # Parse TEXT BLOCK patterns from raw text
+                text_blocks = re.findall(
+                    r'TEXT BLOCK #\d+:\s*•\s*(.+?)\s+Left:\s*(\d+)\s+Top:\s*(\d+)\s+Right:\s*(\d+)\s+Bottom:\s*(\d+)\s+Width:\s*(\d+)\s+Height:\s*(\d+)',
+                    content,
+                    re.DOTALL
+                )
+                
+                for match in text_blocks:
+                    text, left, top, right, bottom, width, height = match
+                    text_elements.append({
+                        'text': text.strip(),
+                        'left': int(left),
+                        'top': int(top),
+                        'right': int(right),
+                        'bottom': int(bottom),
+                        'width': int(width),
+                        'height': int(height)
+                    })
+                
                 if text_elements:
-                    print(f"📊 [VISION] TOTAL: {len(text_elements)} text elements parsed")
-                    # Print first 5 for debugging
-                    for i, el in enumerate(text_elements[:5]):
-                        print(f"  [{i}] '{el.get('text', '')}'")
-                else:
-                    print(f"⚠️ [VISION] Could not parse any text elements from screen_content.text")
-                    
+                    print(f"✅ [VISION] Parsed {len(text_elements)} text elements from raw text fallback")
+            except Exception as e2:
+                print(f"⚠️ [VISION] Error in raw text fallback: {e2}")
         except Exception as e:
             print(f"⚠️ [VISION] Error reading screen_content.text: {e}")
         
         return text_elements
-    
+
     # ============================================
     # TEXT NORMALIZATION HELPERS
     # ============================================
@@ -1729,7 +1909,7 @@ def operate_google_flow_project():
         """
         Google Flow specific: Write "all media" to text_target.json and then call vision.
         Wait for "all media" to appear in the screen content using case-insensitive
-        and normalized text matching. Uses JSON format for text extraction.
+        and normalized text matching.
         
         Returns: (found, text_elements)
         """
@@ -1762,7 +1942,7 @@ def operate_google_flow_project():
             # Wait a moment for the system to process the text target
             time.sleep(0.3)
             
-            # Call vision to capture screen content (now uses JSON format)
+            # Call vision to capture screen content
             current_texts = safe_vision()
             
             if current_texts:
@@ -1797,14 +1977,18 @@ def operate_google_flow_project():
                     try:
                         with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as f:
                             content = f.read()
-                            # Check JSON format for "AllMedia"
-                            json_match = re.search(r'"text_\d+":\s*"([^"]*AllMedia[^"]*)"', content, re.IGNORECASE)
-                            if json_match:
-                                print(f"✅ [GOOGLE_FLOW] Found 'AllMedia' in JSON format: {json_match.group(1)}")
-                                # Manually add the text element
-                                current_texts = [{'text': json_match.group(1), 'left': 0, 'top': 0, 'right': 0, 'bottom': 0, 'width': 0, 'height': 0}]
-                                update_operation_status("'All media' found in Google Flow project (direct JSON match)")
-                                return True, current_texts
+                            if "AllMedia" in content or "AllMedi" in content:
+                                print(f"✅ [GOOGLE_FLOW] Found 'AllMedia' in screen_content.text file but parsing failed!")
+                                print(f"🔍 [GOOGLE_FLOW] Content snippet: {content[:500]}")
+                                # Try to directly extract from file
+                                import re
+                                match = re.search(r'AllMedia[|:]?', content, re.IGNORECASE)
+                                if match:
+                                    print(f"✅ [GOOGLE_FLOW] Found direct match: {match.group()}")
+                                    # Manually add the text element
+                                    current_texts = [{'text': 'AllMedia|', 'left': 108, 'top': 260, 'right': 198, 'bottom': 278, 'width': 90, 'height': 18}]
+                                    update_operation_status("'All media' found in Google Flow project (direct file match)")
+                                    return True, current_texts
                     except Exception as e:
                         print(f"⚠️ [GOOGLE_FLOW] Error checking screen_content.text: {e}")
             
@@ -1846,7 +2030,6 @@ def operate_google_flow_project():
         """
         Verify Google Flow page is loaded by writing "all media" to text_target.json
         and checking if it appears in vision results using normalized comparison.
-        Uses JSON format for text extraction.
         """
         print(f"🔍 [GOOGLE_FLOW] Verifying page is loaded with 'all media' detection (case-insensitive, normalized)...")
         hud.print("⏳ Checking Google Flow...", "waiting")
@@ -2133,44 +2316,44 @@ def operate_google_flow_project():
                                                             return True, new_zip_path, new_zip_name
                                                 except Exception:
                                                     pass
-                                    else:
-                                        # File exists in our tracking, check if it's updated (size changed)
-                                        if entry.name in existing_zips:
-                                            try:
-                                                stat = entry.stat()
-                                                current_size = stat.st_size
-                                                existing_size = existing_zips[entry.name]['size']
-                                                
-                                                # If size changed significantly, it might be a new version
-                                                if abs(current_size - existing_size) > 10000:  # More than 10KB difference
-                                                    if os.name == 'nt':
-                                                        current_time = stat.st_ctime
-                                                    else:
-                                                        current_time = stat.st_mtime
-                                                    
-                                                    print(f"🔄 [DOWNLOAD_STATUS] File {entry.name} updated! Size: {existing_size} → {current_size}")
-                                                    # Update tracking
-                                                    existing_zips[entry.name]['size'] = current_size
-                                                    existing_zips[entry.name]['time'] = current_time
-                                                    
-                                                    # Check if this update is different from latest known
-                                                    if latest_known_zip == entry.name:
-                                                        # Update latest known time
-                                                        latest_known_time = current_time
-                                                        print(f"📁 [DOWNLOAD_STATUS] Updated latest known timestamp for {entry.name}")
-                                            except Exception:
-                                                pass
+                                else:
+                                    # File exists in our tracking, check if it's updated (size changed)
+                                    if entry.name in existing_zips:
+                                        try:
+                                            stat = entry.stat()
+                                            current_size = stat.st_size
+                                            existing_size = existing_zips[entry.name]['size']
                                             
+                                            # If size changed significantly, it might be a new version
+                                            if abs(current_size - existing_size) > 10000:  # More than 10KB difference
+                                                if os.name == 'nt':
+                                                    current_time = stat.st_ctime
+                                                else:
+                                                    current_time = stat.st_mtime
+                                                
+                                                print(f"🔄 [DOWNLOAD_STATUS] File {entry.name} updated! Size: {existing_size} → {current_size}")
+                                                # Update tracking
+                                                existing_zips[entry.name]['size'] = current_size
+                                                existing_zips[entry.name]['time'] = current_time
+                                                
+                                                # Check if this update is different from latest known
+                                                if latest_known_zip == entry.name:
+                                                    # Update latest known time
+                                                    latest_known_time = current_time
+                                                    print(f"📁 [DOWNLOAD_STATUS] Updated latest known timestamp for {entry.name}")
+                                        except Exception:
+                                            pass
+                                        
                 except Exception as e:
                     print(f"⚠️ [DOWNLOAD_STATUS] Error checking for new zip: {e}")
                 
                 # ============================================
-                # PART 2: MONITOR SCREEN FOR DOWNLOADING TEXT (FAST vision using JSON)
+                # PART 2: MONITOR SCREEN FOR DOWNLOADING TEXT (FAST vision)
                 # ============================================
                 # Ensure window has focus for accurate vision
                 enforce_window_focus(hwnd)
                 
-                # Get current screen text with fast vision (now uses JSON format)
+                # Get current screen text with fast vision
                 current_texts = safe_vision()
                 downloading_found = False
                 
@@ -3021,7 +3204,7 @@ def operate_google_flow_project():
         Main Google Flow workflow execution with restart capability.
         Simple: Open Edge, launch URL, wait for "all media" to appear.
         Then initiate download, monitor, extract, and validate.
-        Uses case-insensitive and normalized text matching with JSON format parsing.
+        Uses case-insensitive and normalized text matching.
         """
         try:
             # Load panel data once at the beginning
@@ -3071,7 +3254,7 @@ def operate_google_flow_project():
             print(f"🎬 [GOOGLE_FLOW] Starting Google Flow workflow (depth {depth})...")
             print(f"🌐 [GOOGLE_FLOW] URL: {google_flow_url}")
             print(f"📁 [GOOGLE_FLOW] Project: '{project_title}'")
-            print(f"🔍 [GOOGLE_FLOW] Using case-insensitive, normalized text matching with JSON format")
+            print(f"🔍 [GOOGLE_FLOW] Using case-insensitive, normalized text matching for 'all media'")
             update_operation_status(f"Starting Google Flow workflow for {project_title}")
             
             # Step 1: Load the Google Flow URL
@@ -3497,10 +3680,15 @@ def operate_turboscribe():
         return normalized_target in normalized_search
 
     # ============================================
-    # VISION HELPER
+    # VISION HELPER - UPDATED FOR NEW JSON STRUCTURE
     # ============================================
     
     def safe_vision():
+        """
+        Capture screen without hiding the HUD (HUD is click-through)
+        AND properly parse the screen_content.text file to return text elements.
+        Now uses the new JSON structure with 'ocr_results' key.
+        """
         check_for_termination()
         vision()
         
@@ -3508,47 +3696,122 @@ def operate_turboscribe():
         
         try:
             if os.path.exists(SCREEN_TEXT_CONTENT):
+                # Read the JSON file
                 with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
-                    content = file.read()
+                    data = json.load(file)
                 
-                json_match = re.search(
-                    r'FULL IMAGE vision RESULTS.*?JSON FORMAT:\s*=\s*\n(\[.*?\])\s*(?=\n\n|$|\s*vision EXTRACTION RESULTS)',
-                    content,
-                    re.DOTALL | re.IGNORECASE
-                )
-                
-                if json_match:
-                    try:
-                        json_text = json_match.group(1)
-                        json_text = re.sub(r'^[^{[]*', '', json_text)
-                        json_text = re.sub(r'[^}\]]*$', '', json_text)
-                        json_data = json.loads(json_text)
+                # Check if we have ocr_results in the new structure
+                if 'ocr_results' in data:
+                    ocr_results = data['ocr_results']
+                    print(f"✅ [VISION] Found {len(ocr_results)} OCR result entries")
+                    
+                    # Iterate through each region in ocr_results
+                    for region_key, region_data in ocr_results.items():
+                        # Extract text_value_found (list of text items)
+                        text_list = region_data.get('text_value_found', [])
                         
-                        for item in json_data:
-                            text_value = None
-                            for key, value in item.items():
-                                if key.startswith('text_'):
-                                    text_value = value
-                                    break
-                            
-                            if text_value and 'coordinates' in item:
-                                coords = item['coordinates']
+                        # Get coordinates
+                        left = region_data.get('Left', 0)
+                        top = region_data.get('Top', 0)
+                        right = region_data.get('Right', 0)
+                        bottom = region_data.get('Bottom', 0)
+                        width = region_data.get('Width', 0)
+                        height = region_data.get('Height', 0)
+                        
+                        # If text_list is empty but we have text_combined in the old format, try that
+                        if not text_list:
+                            # Check if there's a combined text field (for backward compatibility)
+                            if 'text_combined' in region_data and region_data['text_combined']:
+                                text_list = [region_data['text_combined']]
+                            elif 'text' in region_data and region_data['text']:
+                                text_list = [region_data['text']]
+                        
+                        # Add each text item as a separate element
+                        for text_item in text_list:
+                            if text_item and text_item.strip():
                                 text_elements.append({
-                                    'text': text_value.strip(),
-                                    'left': coords.get('left', 0),
-                                    'top': coords.get('top', 0),
-                                    'right': coords.get('right', 0),
-                                    'bottom': coords.get('bottom', 0),
-                                    'width': coords.get('right', 0) - coords.get('left', 0),
-                                    'height': coords.get('bottom', 0) - coords.get('top', 0)
+                                    'text': text_item.strip(),
+                                    'left': left,
+                                    'top': top,
+                                    'right': right,
+                                    'bottom': bottom,
+                                    'width': width,
+                                    'height': height,
+                                    'region_id': region_key
                                 })
-                        
-                        if text_elements:
-                            print(f"✅ [VISION] Parsed {len(text_elements)} text elements from JSON")
-                    except json.JSONDecodeError:
-                        pass
+                    
+                    if text_elements:
+                        print(f"✅ [VISION] Parsed {len(text_elements)} text elements from ocr_results structure")
+                    else:
+                        print(f"⚠️ [VISION] No text elements found in ocr_results")
                 
+                # Fallback: Try text_regions format if ocr_results doesn't exist
+                elif 'text_regions' in data and data['text_regions']:
+                    print(f"ℹ️ [VISION] Falling back to text_regions format")
+                    for region in data['text_regions']:
+                        region_text = region.get('text', '')
+                        if region_text:
+                            text_elements.append({
+                                'text': region_text.strip(),
+                                'left': region.get('left', 0),
+                                'top': region.get('top', 0),
+                                'right': region.get('right', 0),
+                                'bottom': region.get('bottom', 0),
+                                'width': region.get('width', 0),
+                                'height': region.get('height', 0)
+                            })
+                    
+                    if text_elements:
+                        print(f"✅ [VISION] Parsed {len(text_elements)} text elements from text_regions format")
+                
+                # Fallback: Try legacy JSON array format (old Turboscribe format)
+                else:
+                    print(f"ℹ️ [VISION] Trying fallback: parsing legacy formats")
+                    content = json.dumps(data, indent=2)
+                    
+                    # Try to find JSON array in content
+                    json_match = re.search(
+                        r'FULL IMAGE vision RESULTS.*?JSON FORMAT:\s*=\s*\n(\[.*?\])\s*(?=\n\n|$|\s*vision EXTRACTION RESULTS)',
+                        content,
+                        re.DOTALL | re.IGNORECASE
+                    )
+                    
+                    if json_match:
+                        try:
+                            json_text = json_match.group(1)
+                            json_text = re.sub(r'^[^{[]*', '', json_text)
+                            json_text = re.sub(r'[^}\]]*$', '', json_text)
+                            json_data = json.loads(json_text)
+                            
+                            for item in json_data:
+                                text_value = None
+                                for key, value in item.items():
+                                    if key.startswith('text_'):
+                                        text_value = value
+                                        break
+                                
+                                if text_value and 'coordinates' in item:
+                                    coords = item['coordinates']
+                                    text_elements.append({
+                                        'text': text_value.strip(),
+                                        'left': coords.get('left', 0),
+                                        'top': coords.get('top', 0),
+                                        'right': coords.get('right', 0),
+                                        'bottom': coords.get('bottom', 0),
+                                        'width': coords.get('right', 0) - coords.get('left', 0),
+                                        'height': coords.get('bottom', 0) - coords.get('top', 0)
+                                    })
+                            
+                            if text_elements:
+                                print(f"✅ [VISION] Parsed {len(text_elements)} text elements from legacy JSON array")
+                        except json.JSONDecodeError:
+                            pass
+                
+                # Final fallback: Try parsing raw text blocks if still no elements
                 if not text_elements:
+                    print(f"ℹ️ [VISION] Trying final fallback: parsing raw text blocks")
+                    content = json.dumps(data, indent=2)
+                    
                     text_blocks = re.findall(
                         r'TEXT BLOCK #\d+:\s*•\s*(.+?)\s+Left:\s*(\d+)\s+Top:\s*(\d+)\s+Right:\s*(\d+)\s+Bottom:\s*(\d+)\s+Width:\s*(\d+)\s+Height:\s*(\d+)',
                         content,
@@ -3568,10 +3831,43 @@ def operate_turboscribe():
                         })
                     
                     if text_elements:
-                        print(f"✅ [VISION] Parsed {len(text_elements)} text elements from text format")
+                        print(f"✅ [VISION] Parsed {len(text_elements)} text elements from raw text blocks")
                 
                 if text_elements:
                     print(f"📊 [VISION] TOTAL: {len(text_elements)} text elements parsed")
+                else:
+                    print(f"⚠️ [VISION] Could not parse any text elements from screen_content.text")
+                    
+        except json.JSONDecodeError as e:
+            print(f"⚠️ [VISION] JSON decode error: {e}")
+            # Try to read as text file if JSON fails
+            try:
+                with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
+                    content = file.read()
+                
+                # Parse TEXT BLOCK patterns from raw text
+                text_blocks = re.findall(
+                    r'TEXT BLOCK #\d+:\s*•\s*(.+?)\s+Left:\s*(\d+)\s+Top:\s*(\d+)\s+Right:\s*(\d+)\s+Bottom:\s*(\d+)\s+Width:\s*(\d+)\s+Height:\s*(\d+)',
+                    content,
+                    re.DOTALL
+                )
+                
+                for match in text_blocks:
+                    text, left, top, right, bottom, width, height = match
+                    text_elements.append({
+                        'text': text.strip(),
+                        'left': int(left),
+                        'top': int(top),
+                        'right': int(right),
+                        'bottom': int(bottom),
+                        'width': int(width),
+                        'height': int(height)
+                    })
+                
+                if text_elements:
+                    print(f"✅ [VISION] Parsed {len(text_elements)} text elements from raw text fallback")
+            except Exception as e2:
+                print(f"⚠️ [VISION] Error in raw text fallback: {e2}")
         except Exception as e:
             print(f"⚠️ [VISION] Error reading screen_content.text: {e}")
         
@@ -7477,12 +7773,32 @@ def operate_capcut():
         return hwnd
 
     # ============================================
-    # CHECK INTERFACE STATE
+    # TEXT NORMALIZATION HELPER
+    # ============================================
+    
+    def normalize_text_for_comparison(text):
+        if not text:
+            return ""
+        t = text.lower()
+        t = re.sub(r'[^a-z0-9]', '', t)
+        return t
+
+    def text_contains_normalized(text_to_search, target_text):
+        if not text_to_search or not target_text:
+            return False
+        normalized_search = normalize_text_for_comparison(text_to_search)
+        normalized_target = normalize_text_for_comparison(target_text)
+        return normalized_target in normalized_search
+
+    # ============================================
+    # CHECK INTERFACE STATE - UPDATED FOR NEW JSON STRUCTURE
     # ============================================
     
     def check_interface_state():
         """
         Checks the screen_content.text file to determine the current CapCut interface state.
+        Now uses the new JSON structure with 'ocr_results' key.
+        CRITICAL: Only detects "Create project" if it's the ONLY meaningful item in the region.
         Returns:
             dict: {
                 'has_create_project': bool,
@@ -7491,7 +7807,7 @@ def operate_capcut():
                 'found_values': list
             }
         """
-        print("🔍 [CAPCUT_STATE] Analyzing CapCut interface state...")
+        print("🔍 [CAPCUT_STATE] Analyzing CapCut interface state using new JSON structure...")
         
         result = {
             'has_create_project': False,
@@ -7505,207 +7821,389 @@ def operate_capcut():
                 print(f"❌ [CAPCUT_STATE] screen_content.text not found at: {SCREEN_TEXT_CONTENT}")
                 return result
             
+            # Read the JSON file
             with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
-                content = file.read()
+                data = json.load(file)
             
             # ============================================
-            # Check for "Create project" with coordinates
+            # METHOD 1: Check ocr_results structure (NEW)
             # ============================================
-            create_project_pattern = r'"text_\d+":\s*"([^"]*Create[Pp]roject[^"]*)"\s*,\s*"coordinates":\s*\{\s*"top":\s*(\d+)\s*,\s*"right":\s*(\d+)\s*,\s*"left":\s*(\d+)\s*,\s*"bottom":\s*(\d+)\s*\}'
-            
-            create_match = re.search(create_project_pattern, content, re.DOTALL | re.IGNORECASE)
-            
-            if create_match:
-                text_value = create_match.group(1)
-                top = int(create_match.group(2))
-                right = int(create_match.group(3))
-                left = int(create_match.group(4))
-                bottom = int(create_match.group(5))
+            if 'ocr_results' in data:
+                ocr_results = data['ocr_results']
+                print(f"✅ [CAPCUT_STATE] Found {len(ocr_results)} OCR result entries")
                 
-                result['has_create_project'] = True
-                result['create_project_coords'] = {
-                    'left': left,
-                    'top': top,
-                    'right': right,
-                    'bottom': bottom,
-                    'text': text_value
-                }
-                result['found_values'].append('create_project')
-                print(f"✅ [CAPCUT_STATE] Found 'Create project' at ({left}, {top}) -> ({right}, {bottom})")
+                # Iterate through each region in ocr_results
+                for region_key, region_data in ocr_results.items():
+                    # Extract text_value_found (list of text items)
+                    text_list = region_data.get('text_value_found', [])
+                    
+                    # Get coordinates
+                    left = region_data.get('Left', 0)
+                    top = region_data.get('Top', 0)
+                    right = region_data.get('Right', 0)
+                    bottom = region_data.get('Bottom', 0)
+                    width = region_data.get('Width', 0)
+                    height = region_data.get('Height', 0)
+                    
+                    # If text_list is empty, skip
+                    if not text_list:
+                        continue
+                    
+                    # ============================================
+                    # CRITICAL VALIDATION: Check for "Createproject" and edit keywords
+                    # ============================================
+                    # Filter out noise items
+                    meaningful_items = []
+                    create_project_item = None
+                    found_edit_keywords = []
+                    
+                    edit_keywords = ["media", "audio", "import"]
+                    
+                    for item in text_list:
+                        if not item or not item.strip():
+                            continue
+                        
+                        item_clean = item.strip()
+                        item_lower = item_clean.lower()
+                        
+                        # Check if this is "Createproject"
+                        if "createproject" in item_lower or "create project" in item_lower:
+                            create_project_item = item_clean
+                            meaningful_items.append(item_clean)
+                            continue
+                        
+                        # Check for edit keywords
+                        for keyword in edit_keywords:
+                            if keyword in item_lower and keyword not in found_edit_keywords:
+                                found_edit_keywords.append(keyword)
+                                # Don't add to meaningful_items for edit detection
+                        
+                        # Skip noise items (single characters, symbols, short numbers, etc.)
+                        if len(item_clean) <= 2 and not item_clean.isalpha():
+                            continue
+                        if len(item_clean) == 1:
+                            continue
+                        if item_clean.isdigit() and len(item_clean) <= 4:
+                            continue
+                        if item_clean in ['-', '_', '.', ',', '!', '?', ':', ';', '(', ')', '[', ']', '{', '}', '|', '\\', '/', '"', "'"]:
+                            continue
+                        
+                        meaningful_items.append(item_clean)
+                    
+                    # Check if Createproject exists and is the ONLY meaningful item
+                    if create_project_item and len(meaningful_items) == 1:
+                        result['has_create_project'] = True
+                        result['create_project_coords'] = {
+                            'left': left,
+                            'top': top,
+                            'right': right,
+                            'bottom': bottom,
+                            'text': create_project_item,
+                            'width': width,
+                            'height': height
+                        }
+                        if 'create_project' not in result['found_values']:
+                            result['found_values'].append('create_project')
+                        print(f"✅ [CAPCUT_STATE] Found 'Create project' as ONLY meaningful item in region {region_key}")
+                        print(f"   Region size: {width} x {height} pixels")
+                    elif create_project_item and len(meaningful_items) > 1:
+                        print(f"⚠️ [CAPCUT_STATE] 'Create project' found but NOT the ONLY meaningful item in region {region_key}")
+                        print(f"   Meaningful items: {len(meaningful_items)} - skipping (region too large)")
+                    
+                    # Check for edit interface keywords (regardless of region)
+                    for keyword in found_edit_keywords:
+                        if keyword not in result['found_values']:
+                            result['found_values'].append(keyword)
+                            print(f"✅ [CAPCUT_STATE] Found '{keyword}' in ocr_results")
+                
+                # Determine if we have edit interface
+                edit_interface_values = ["media", "audio", "import"]
+                has_edit_values = any(val in result['found_values'] for val in edit_interface_values)
+                
+                if has_edit_values:
+                    result['has_edit_interface'] = True
+                    print(f"✅ [CAPCUT_STATE] Edit interface detected! Found: {', '.join([v for v in result['found_values'] if v in edit_interface_values])}")
+                
+                # If we found create project, that's the highest priority
+                if result['has_create_project']:
+                    return result
             
             # ============================================
-            # Check for edit interface values (media, audio, import)
+            # METHOD 2: Fallback to text_regions structure
             # ============================================
-            # Search in JSON format
-            json_pattern = r'"text_\d+":\s*"([^"]+)"'
-            json_matches = re.findall(json_pattern, content, re.IGNORECASE)
-            
-            edit_keywords = ["media", "audio", "import"]
-            
-            for text in json_matches:
-                text_lower = text.lower()
-                for keyword in edit_keywords:
-                    if keyword in text_lower and keyword not in result['found_values']:
-                        result['found_values'].append(keyword)
-                        print(f"✅ [CAPCUT_STATE] Found '{keyword}' in text: '{text[:50]}...'")
-            
-            # Search in compact format
-            compact_pattern = r',\s*[\'"]([^\'"]+)[\'"]'
-            compact_matches = re.findall(compact_pattern, content, re.IGNORECASE)
-            
-            for text in compact_matches:
-                text_lower = text.lower()
-                for keyword in edit_keywords:
-                    if keyword in text_lower and keyword not in result['found_values']:
-                        result['found_values'].append(keyword)
-                        print(f"✅ [CAPCUT_STATE] Found '{keyword}' in compact format: '{text[:50]}...'")
-            
-            # Search in text format
-            text_pattern = r'•\s*([^\n]+)'
-            text_matches = re.findall(text_pattern, content)
-            
-            for text in text_matches:
-                text_lower = text.lower()
-                for keyword in edit_keywords:
-                    if keyword in text_lower and keyword not in result['found_values']:
-                        result['found_values'].append(keyword)
-                        print(f"✅ [CAPCUT_STATE] Found '{keyword}' in text format: '{text[:50]}...'")
-            
-            # Determine if we have edit interface
-            edit_interface_values = ["media", "audio", "import"]
-            has_edit_values = any(val in result['found_values'] for val in edit_interface_values)
-            
-            if has_edit_values:
-                result['has_edit_interface'] = True
-                print(f"✅ [CAPCUT_STATE] Edit interface detected! Found: {', '.join([v for v in result['found_values'] if v in edit_interface_values])}")
+            if 'text_regions' in data and data['text_regions']:
+                print(f"ℹ️ [CAPCUT_STATE] Falling back to text_regions format")
+                
+                for region in data['text_regions']:
+                    region_text = region.get('text', '').strip()
+                    if not region_text:
+                        continue
+                    
+                    region_text_lower = region_text.lower()
+                    
+                    # Check for "create project" - but only if the region is small (likely a button)
+                    left = region.get('left', 0)
+                    top = region.get('top', 0)
+                    right = region.get('right', 0)
+                    bottom = region.get('bottom', 0)
+                    width = right - left
+                    height = bottom - top
+                    
+                    if ("create project" in region_text_lower or "createproject" in region_text_lower) and width < 500 and height < 100:
+                        result['has_create_project'] = True
+                        result['create_project_coords'] = {
+                            'left': left,
+                            'top': top,
+                            'right': right,
+                            'bottom': bottom,
+                            'text': region_text,
+                            'width': width,
+                            'height': height
+                        }
+                        if 'create_project' not in result['found_values']:
+                            result['found_values'].append('create_project')
+                        print(f"✅ [CAPCUT_STATE] Found 'Create project' in text_regions (small region)")
+                    
+                    # Check for edit interface keywords
+                    edit_keywords = ["media", "audio", "import"]
+                    for keyword in edit_keywords:
+                        if keyword in region_text_lower and keyword not in result['found_values']:
+                            result['found_values'].append(keyword)
+                            print(f"✅ [CAPCUT_STATE] Found '{keyword}' in text_regions")
+                
+                # Determine if we have edit interface
+                edit_interface_values = ["media", "audio", "import"]
+                has_edit_values = any(val in result['found_values'] for val in edit_interface_values)
+                
+                if has_edit_values:
+                    result['has_edit_interface'] = True
+                    print(f"✅ [CAPCUT_STATE] Edit interface detected from text_regions!")
+                
+                if result['has_create_project']:
+                    return result
             
             return result
             
+        except json.JSONDecodeError as e:
+            print(f"⚠️ [CAPCUT_STATE] JSON decode error: {e}")
+            return result
         except Exception as e:
             print(f"❌ [CAPCUT_STATE] Error: {e}")
             import traceback
             traceback.print_exc()
-            return result
+        
+        return result
 
     # ============================================
-    # CLICK CREATE PROJECT - DIRECT FILE READ
+    # CLICK CREATE PROJECT - UPDATED FOR NEW JSON STRUCTURE
     # ============================================
     
     def click_create_project():
         """
-        Directly reads the screen_content.text file, finds "Createproject" in the JSON format,
+        Directly reads the screen_content.text file, finds "Create project" in the JSON structure,
         extracts the coordinates, and clicks on the center of the region.
-        Does NOT call safe_vision() - just reads the file and clicks.
+        Now uses the new JSON structure with 'ocr_results' key.
+        CRITICAL: Only clicks if "Createproject" is the ONLY item in text_value_found,
+        otherwise it means the region is too large and clicking would hit the wrong area.
         
         Returns:
             bool: True if successful, False otherwise
         """
-        print("🔍 [CAPCUT_CLICK] Looking for 'Createproject' in screen_content.text...")
+        print("🔍 [CAPCUT_CLICK] Looking for 'Create project' in screen_content.text using new JSON structure...")
         
         try:
             if not os.path.exists(SCREEN_TEXT_CONTENT):
                 print(f"❌ [CAPCUT_CLICK] screen_content.text not found at: {SCREEN_TEXT_CONTENT}")
                 return False
             
+            # Read the JSON file
             with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
-                content = file.read()
+                data = json.load(file)
             
             # ============================================
-            # METHOD 1: Find "Createproject" in JSON format
+            # METHOD 1: Check ocr_results structure (NEW)
             # ============================================
-            json_pattern = r'"text_\d+":\s*"([^"]*Create[Pp]roject[^"]*)"\s*,\s*"coordinates":\s*\{\s*"top":\s*(\d+)\s*,\s*"right":\s*(\d+)\s*,\s*"left":\s*(\d+)\s*,\s*"bottom":\s*(\d+)\s*\}'
-            
-            match = re.search(json_pattern, content, re.DOTALL | re.IGNORECASE)
-            
-            if match:
-                text_value = match.group(1)
-                top = int(match.group(2))
-                right = int(match.group(3))
-                left = int(match.group(4))
-                bottom = int(match.group(5))
+            if 'ocr_results' in data:
+                ocr_results = data['ocr_results']
+                print(f"✅ [CAPCUT_CLICK] Found {len(ocr_results)} OCR result entries")
                 
-                print(f"✅ [CAPCUT_CLICK] Found 'Createproject' in JSON:")
-                print(f"   Text: '{text_value}'")
-                print(f"   Coordinates: Left={left}, Top={top}, Right={right}, Bottom={bottom}")
+                # Iterate through each region in ocr_results
+                for region_key, region_data in ocr_results.items():
+                    # Extract text_value_found (list of text items)
+                    text_list = region_data.get('text_value_found', [])
+                    
+                    # Get coordinates
+                    left = region_data.get('Left', 0)
+                    top = region_data.get('Top', 0)
+                    right = region_data.get('Right', 0)
+                    bottom = region_data.get('Bottom', 0)
+                    width = region_data.get('Width', 0)
+                    height = region_data.get('Height', 0)
+                    
+                    # If text_list is empty, skip
+                    if not text_list:
+                        continue
+                    
+                    # ============================================
+                    # CRITICAL VALIDATION: Check if "Createproject" is the ONLY meaningful item
+                    # ============================================
+                    # Filter out noise items (single characters, symbols, numbers, etc.)
+                    meaningful_items = []
+                    create_project_item = None
+                    
+                    for item in text_list:
+                        if not item or not item.strip():
+                            continue
+                        
+                        item_clean = item.strip()
+                        item_lower = item_clean.lower()
+                        
+                        # Check if this is "Createproject"
+                        if "createproject" in item_lower or "create project" in item_lower:
+                            create_project_item = item_clean
+                            meaningful_items.append(item_clean)
+                            continue
+                        
+                        # Skip noise items (single characters, symbols, short numbers, etc.)
+                        # Only keep items that are actual words/phrases
+                        if len(item_clean) <= 2 and not item_clean.isalpha():
+                            continue  # Skip symbols and short numbers
+                        if len(item_clean) == 1:
+                            continue  # Skip single characters
+                        if item_clean.isdigit() and len(item_clean) <= 4:
+                            continue  # Skip short numbers
+                        if item_clean in ['-', '_', '.', ',', '!', '?', ':', ';', '(', ')', '[', ']', '{', '}', '|', '\\', '/', '"', "'"]:
+                            continue  # Skip standalone punctuation
+                        
+                        meaningful_items.append(item_clean)
+                    
+                    # Check if Createproject exists and is the ONLY meaningful item
+                    if create_project_item and len(meaningful_items) == 1:
+                        print(f"✅ [CAPCUT_CLICK] Found 'Createproject' as the ONLY meaningful item in region {region_key}")
+                        print(f"   Text: '{create_project_item}'")
+                        print(f"   Coordinates: Left={left}, Top={top}, Right={right}, Bottom={bottom}")
+                        print(f"   Region size: {width} x {height} pixels")
+                        
+                        # Calculate click position (center of the region)
+                        click_x = left + ((right - left) // 2) if (right - left) > 0 else left + 10
+                        click_y = top + ((bottom - top) // 2) if (bottom - top) > 0 else top + 10
+                        
+                        print(f"🎯 [CAPCUT_CLICK] Click position: ({click_x}, {click_y})")
+                        
+                        pyautogui.moveTo(click_x, click_y, duration=0.2)
+                        pyautogui.click()
+                        
+                        print(f"✅ [CAPCUT_CLICK] Clicked 'Create project' at ({click_x}, {click_y})")
+                        return True
+                        
+                    elif create_project_item and len(meaningful_items) > 1:
+                        print(f"⚠️ [CAPCUT_CLICK] 'Createproject' found but NOT the ONLY meaningful item in region {region_key}")
+                        print(f"   Meaningful items found ({len(meaningful_items)}): {', '.join(meaningful_items[:10])}")
+                        print(f"   This means the region is too large (likely the entire window).")
+                        print(f"   Skipping click to avoid clicking the wrong area.")
+                        # Continue to next region
                 
-                click_x = left + ((right - left) // 2)
-                click_y = top + ((bottom - top) // 2)
-                
-                print(f"🎯 [CAPCUT_CLICK] Click position: ({click_x}, {click_y})")
-                
-                pyautogui.moveTo(click_x, click_y, duration=0.2)
-                pyautogui.click()
-                
-                print(f"✅ [CAPCUT_CLICK] Clicked 'Createproject' at ({click_x}, {click_y})")
-                return True
+                print(f"❌ [CAPCUT_CLICK] No valid 'Createproject' region found (region must contain ONLY 'Createproject')")
             
             # ============================================
-            # METHOD 2: Look for "Createproject" in compact format
+            # METHOD 2: Fallback to text_regions structure
             # ============================================
-            compact_pattern = r'(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*[\'"]([^\'"]*Create[Pp]roject[^\'"]*)[\'"]'
-            
-            compact_match = re.search(compact_pattern, content, re.IGNORECASE)
-            
-            if compact_match:
-                left = int(compact_match.group(1))
-                top = int(compact_match.group(2))
-                right = int(compact_match.group(3))
-                bottom = int(compact_match.group(4))
-                text_value = compact_match.group(5)
+            if 'text_regions' in data and data['text_regions']:
+                print(f"ℹ️ [CAPCUT_CLICK] Falling back to text_regions format")
                 
-                print(f"✅ [CAPCUT_CLICK] Found 'Createproject' in compact format:")
-                print(f"   Text: '{text_value}'")
-                print(f"   Coordinates: Left={left}, Top={top}, Right={right}, Bottom={bottom}")
-                
-                click_x = left + ((right - left) // 2)
-                click_y = top + ((bottom - top) // 2)
-                
-                print(f"🎯 [CAPCUT_CLICK] Click position: ({click_x}, {click_y})")
-                
-                pyautogui.moveTo(click_x, click_y, duration=0.2)
-                pyautogui.click()
-                
-                print(f"✅ [CAPCUT_CLICK] Clicked 'Createproject' at ({click_x}, {click_y})")
-                return True
+                for region in data['text_regions']:
+                    region_text = region.get('text', '').strip()
+                    if not region_text:
+                        continue
+                    
+                    region_text_lower = region_text.lower()
+                    
+                    if "create project" in region_text_lower or "createproject" in region_text_lower:
+                        left = region.get('left', 0)
+                        top = region.get('top', 0)
+                        right = region.get('right', 0)
+                        bottom = region.get('bottom', 0)
+                        
+                        # Check if this is a small region (likely a button)
+                        width = right - left
+                        height = bottom - top
+                        
+                        if width < 500 and height < 100:  # Reasonable button size
+                            print(f"✅ [CAPCUT_CLICK] Found 'Create project' in text_regions (small region):")
+                            print(f"   Text: '{region_text}'")
+                            print(f"   Coordinates: Left={left}, Top={top}, Right={right}, Bottom={bottom}")
+                            print(f"   Region size: {width} x {height} pixels")
+                            
+                            click_x = left + (width // 2)
+                            click_y = top + (height // 2)
+                            
+                            print(f"🎯 [CAPCUT_CLICK] Click position: ({click_x}, {click_y})")
+                            
+                            pyautogui.moveTo(click_x, click_y, duration=0.2)
+                            pyautogui.click()
+                            
+                            print(f"✅ [CAPCUT_CLICK] Clicked 'Create project' at ({click_x}, {click_y})")
+                            return True
+                        else:
+                            print(f"⚠️ [CAPCUT_CLICK] 'Create project' region is too large ({width}x{height}), skipping")
             
             # ============================================
-            # METHOD 3: Look for "Createproject" in text format
+            # METHOD 3: Try to find a small region containing "Createproject"
             # ============================================
-            text_pattern = r'TEXT BLOCK #\d+:\s*•\s*(.+?Create[Pp]roject.+?)\s+Left:\s*(\d+)\s+Top:\s*(\d+)\s+Right:\s*(\d+)\s+Bottom:\s*(\d+)'
+            print(f"ℹ️ [CAPCUT_CLICK] Looking for 'Createproject' in text blocks with reasonable size...")
+            content = json.dumps(data, indent=2)
             
-            text_match = re.search(text_pattern, content, re.DOTALL | re.IGNORECASE)
+            # Parse TEXT BLOCK patterns
+            text_blocks = re.findall(
+                r'TEXT BLOCK #\d+:\s*•\s*(.+?)\s+Left:\s*(\d+)\s+Top:\s*(\d+)\s+Right:\s*(\d+)\s+Bottom:\s*(\d+)\s+Width:\s*(\d+)\s+Height:\s*(\d+)',
+                content,
+                re.DOTALL
+            )
             
-            if text_match:
-                text_value = text_match.group(1).strip()
-                left = int(text_match.group(2))
-                top = int(text_match.group(3))
-                right = int(text_match.group(4))
-                bottom = int(text_match.group(5))
+            for match in text_blocks:
+                text, left, top, right, bottom, width, height = match
+                text_lower = text.lower()
                 
-                print(f"✅ [CAPCUT_CLICK] Found 'Createproject' in text format:")
-                print(f"   Text: '{text_value}'")
-                print(f"   Coordinates: Left={left}, Top={top}, Right={right}, Bottom={bottom}")
-                
-                click_x = left + ((right - left) // 2)
-                click_y = top + ((bottom - top) // 2)
-                
-                print(f"🎯 [CAPCUT_CLICK] Click position: ({click_x}, {click_y})")
-                
-                pyautogui.moveTo(click_x, click_y, duration=0.2)
-                pyautogui.click()
-                
-                print(f"✅ [CAPCUT_CLICK] Clicked 'Createproject' at ({click_x}, {click_y})")
-                return True
+                if "create project" in text_lower or "createproject" in text_lower:
+                    left = int(left)
+                    top = int(top)
+                    right = int(right)
+                    bottom = int(bottom)
+                    width = int(width)
+                    height = int(height)
+                    
+                    # Check if this is a reasonable button size
+                    if width < 500 and height < 100:
+                        print(f"✅ [CAPCUT_CLICK] Found 'Create project' in text blocks (reasonable size):")
+                        print(f"   Text: '{text.strip()}'")
+                        print(f"   Coordinates: Left={left}, Top={top}, Right={right}, Bottom={bottom}")
+                        print(f"   Region size: {width} x {height} pixels")
+                        
+                        click_x = left + (width // 2)
+                        click_y = top + (height // 2)
+                        
+                        print(f"🎯 [CAPCUT_CLICK] Click position: ({click_x}, {click_y})")
+                        
+                        pyautogui.moveTo(click_x, click_y, duration=0.2)
+                        pyautogui.click()
+                        
+                        print(f"✅ [CAPCUT_CLICK] Clicked 'Create project' at ({click_x}, {click_y})")
+                        return True
+                    else:
+                        print(f"⚠️ [CAPCUT_CLICK] 'Create project' block is too large ({width}x{height}), skipping")
             
-            print(f"❌ [CAPCUT_CLICK] Could not find 'Createproject' in screen_content.text")
+            print(f"❌ [CAPCUT_CLICK] Could not find a valid 'Create project' button (region too large or not found)")
             return False
             
+        except json.JSONDecodeError as e:
+            print(f"⚠️ [CAPCUT_CLICK] JSON decode error: {e}")
+            return False
         except Exception as e:
             print(f"❌ [CAPCUT_CLICK] Error: {e}")
             import traceback
             traceback.print_exc()
             return False
-
+        
     # ============================================
     # MAIN CAPCUT WORKFLOW
     # ============================================
@@ -8309,7 +8807,8 @@ def extend_images():
     }
 
 
-
 if __name__ == "__main__":
-   extend_images()
-    
+   operate_capcut()
+
+   
+       
