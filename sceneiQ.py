@@ -25,17 +25,27 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from moviepy import ImageClip
+import os
+import re
+import json
+import shutil
+from moviepy import ImageClip
+
 
 # Configure Paths
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-os.environ["TESSDATA_PREFIX"] = r"C:\xampp\htdocs\sceniq\pytesseract\tessdata"
-tessdata_path = r"C:\xampp\htdocs\scenIQ\pytesseract\tessdata\eng.traineddata"
+os.environ["TESSDATA_PREFIX"] = r"C:\xampp\htdocs\AI automation\scenIQ\pytesseract\tessdata"
+tessdata_path = r"C:\xampp\htdocs\AI automation\scenIQ\pytesseract\tessdata\eng.traineddata"
 edge_path = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-PANEL_PATH = r"C:\xampp\htdocs\scenIQ\panel.json"
-INPUT_IMAGE_PATH = r"C:\xampp\htdocs\sceniq\input_images"
-GUI_IMAGE_PATH = r"C:\xampp\htdocs\sceniq\gui_images"
-OUTPUT_TEXT_PATH = r"C:\xampp\htdocs\scenIQ\screen_content.text"
-IMAGES_PATH = r"C:\xampp\htdocs\sceniq\project"
+SCREEN_IMAGE = r"C:\xampp\htdocs\AI automation\scenIQ\input_images\screen.png"
+TEXT_TARGET = r"C:\xampp\htdocs\AI automation\scenIQ\text_target.json"
+PANEL_PATH = r"C:\xampp\htdocs\AI automation\scenIQ\panel.json"
+SCREEN_TEXT_CONTENT = r"C:\xampp\htdocs\AI automation\scenIQ\screen_content.text"
+INPUT_IMAGES = r"C:\xampp\htdocs\AI automation\scenIQ\input_images"
+GUI_IMAGES = r"C:\xampp\htdocs\AI automation\scenIQ\gui_images"
+IMAGES_PATH = r"C:\xampp\htdocs\AI automation\scenIQ\project"
 
 class AutomationHUD:
     def __init__(self):
@@ -158,49 +168,51 @@ class AutomationHUD:
             self.root.destroy()
 hud = AutomationHUD()
 
-def ocr():
+
+
+def process_single_region(args):
     """
-    Validates environment, cleans working directories, captures the screen,
-    extracts all characters, spatially merges characters/words purely by coordinate 
-    proximity (ignoring brittle Tesseract line numbers) to rebuild clean text chunks, 
-    writes output logs, and summarizes results.
+    Process a single region with vision.
+    
+    Args:
+        args: Tuple containing (region_data, SCREEN_IMAGE, region_index)
+    
+    Returns:
+        Dictionary with vision results for this region
     """
+    import cv2
+    import pytesseract
+    import os
     
+    region, preprocessed_SCREEN_IMAGE, idx = args
     
-    if not os.path.exists(pytesseract.pytesseract.tesseract_cmd):
-        print(f"❌ Error: Tesseract executable not found at: {pytesseract.pytesseract.tesseract_cmd}")
-        return None
-    if not os.path.exists(tessdata_path):
-        print(f"❌ Error: English language data not found at: {tessdata_path}")
-        return None
     try:
-        # Create the input_images directory if it doesn't exist
-        os.makedirs(INPUT_IMAGE_PATH, exist_ok=True)
+        # Load the preprocessed image
+        image = cv2.imread(preprocessed_SCREEN_IMAGE)
+        if image is None:
+            return {'region_id': idx, 'error': f"Failed to load image at {preprocessed_SCREEN_IMAGE}"}
         
-        if os.path.exists(INPUT_IMAGE_PATH):
-            for file in glob.glob(os.path.join(INPUT_IMAGE_PATH, "*.png")):
-                try:
-                    os.remove(file)
-                except Exception as e:
-                    print(f"   ⚠️ Could not delete {os.path.basename(file)}: {e}")
-
-        print("📸 Capturing screen...")
-        screenshot = pyautogui.screenshot()
-        output_image_path = os.path.join(INPUT_IMAGE_PATH, "screen.png")
-        screenshot.save(output_image_path)
-
-        screen_width, screen_height = pyautogui.size()
-        print(f"🖥️ Screen Dimensions: {screen_width} x {screen_height} pixels")
+        left = region['left']
+        top = region['top']
+        right = region['right']
+        bottom = region['bottom']
         
-        print("📝 Extracting text with coordinates...")
+        # Crop the region from the image
+        cropped = image[top:bottom, left:right]
+        
+        if cropped.size == 0:
+            return {'region_id': idx, 'error': "Empty region", 'texts': []}
+        
+        # Process cropped region with Tesseract
         custom_config = (
             '--psm 11 -c tessedit_char_whitelist='
             '\'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,:-_=@############/\\\\?&|()[]{}<>~°%©®+— \\"\\\'\''
         )
         
-        data = pytesseract.image_to_data(screenshot, config=custom_config, output_type=pytesseract.Output.DICT)
+        data = pytesseract.image_to_data(cropped, config=custom_config, output_type=pytesseract.Output.DICT)
         
-        raw_elements = []
+        # Extract text from this region
+        region_texts = []
         n_boxes = len(data['text'])
         
         for i in range(n_boxes):
@@ -208,35 +220,40 @@ def ocr():
             confidence = int(data['conf'][i])
             
             if text:
-                left = data['left'][i]
-                top = data['top'][i]
-                width = data['width'][i]
-                height = data['height'][i]
+                # Adjust coordinates relative to the full image
+                rel_left = data['left'][i] + left
+                rel_top = data['top'][i] + top
+                rel_width = data['width'][i]
+                rel_height = data['height'][i]
                 
-                raw_elements.append({
+                region_texts.append({
                     'text': text,
-                    'left': left,
-                    'top': top,
-                    'right': left + width,
-                    'bottom': top + height,
-                    'width': width,
-                    'height': height,
-                    'confidence': confidence
+                    'left': rel_left,
+                    'top': rel_top,
+                    'right': rel_left + rel_width,
+                    'bottom': rel_top + rel_height,
+                    'width': rel_width,
+                    'height': rel_height,
+                    'confidence': confidence,
+                    'region_id': idx
                 })
-        clean_texts = []
         
-        if raw_elements:
-            raw_elements.sort(key=lambda x: (x['top'], x['left']))
+        # Merge characters into words within this region
+        if region_texts:
+            region_texts.sort(key=lambda x: (x['top'], x['left']))
             
-            while raw_elements:
-                current = raw_elements.pop(0)
-                max_horizontal_gap = max(12, current['height'] * 0.4) 
-                max_vertical_deviation = current['height'] * 0.4      
+            merged_texts = []
+            screen_height = image.shape[0]
+            
+            while region_texts:
+                current = region_texts.pop(0)
+                max_horizontal_gap = max(12, current['height'] * 0.4)
+                max_vertical_deviation = current['height'] * 0.4
                 
                 merged_any = True
                 while merged_any:
                     merged_any = False
-                    for i, next_el in enumerate(raw_elements):
+                    for i, next_el in enumerate(region_texts):
                         current_center_y = current['top'] + (current['height'] / 2)
                         next_center_y = next_el['top'] + (next_el['height'] / 2)
                         
@@ -260,64 +277,864 @@ def ocr():
                             if current['confidence'] != -1 and next_el['confidence'] != -1:
                                 current['confidence'] = (current['confidence'] + next_el['confidence']) // 2
                             
-                            raw_elements.pop(i)
+                            region_texts.pop(i)
                             merged_any = True
                             break
+                
+                # Fix common vision errors
+                if "htips" in current['text']:
+                    current['text'] = current['text'].replace("htips", "https")
+                if "searcl" in current['text'].lower():
+                    current['text'] = current['text'].lower().replace("searcl", "search").replace("Searcl", "Search")
                 
                 current['distance_from_top'] = current['top']
                 current['distance_from_bottom'] = screen_height - current['bottom']
                 current['screen_percentage'] = (current['top'] / screen_height) * 100
                 
-                if "htips" in current['text']:
-                    current['text'] = current['text'].replace("htips", "https")
-                if "searcl" in current['text'].lower():
-                    current['text'] = current['text'].lower().replace("searcl", "search").replace("Searcl", "Search")
-                    
-                clean_texts.append(current)
-
-            clean_texts.sort(key=lambda x: (x['top'], x['left']))
-
-        # Create the output directory if it doesn't exist
-        os.makedirs(os.path.dirname(OUTPUT_TEXT_PATH), exist_ok=True)
-        with open(OUTPUT_TEXT_PATH, 'w', encoding='utf-8') as f:
-            f.write("="*80 + "\n")
-            f.write("GEOMETRICALLY CLEANED SCREEN EXTRACTION\n")
-            f.write(f"Extracted on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Screen Resolution: {screen_width} x {screen_height} pixels\n")
-            f.write("="*80 + "\n\n")
+                merged_texts.append(current)
             
-            for i, word_data in enumerate(clean_texts, 1):
-                f.write(f"Text Block {i}: {word_data['text']}\n")
-                f.write(f"  Left: {word_data['left']:>6}  Top: {word_data['top']:>6}\n")
-                f.write(f"  Right: {word_data['right']:>6}  Bottom: {word_data['bottom']:>6}\n")
-                f.write(f"  Width: {word_data['width']:>6}  Height: {word_data['height']:>6}\n")
-                f.write(f"  📏 Distance from Top: {word_data['distance_from_top']:>6} pixels ({word_data['screen_percentage']:.1f}% of screen)\n")
-                f.write(f"  📏 Distance from Bottom: {word_data['distance_from_bottom']:>6} pixels\n")
-                f.write(f"  Confidence: {word_data['confidence']}%\n")
+            return {
+                'region_id': idx,
+                'texts': merged_texts,
+                'error': None
+            }
+        else:
+            return {'region_id': idx, 'error': "No text found", 'texts': []}
+            
+    except Exception as e:
+        return {'region_id': idx, 'error': str(e), 'texts': []}
+    
+def vision():
+    def prepare_file():
+        """
+        Captures the screen, saves it to SCREEN_IMAGE, and creates/empties the output text file.
+        """
+        
+        if not os.path.exists(pytesseract.pytesseract.tesseract_cmd):
+            print(f"❌ Error: Tesseract executable not found at: {pytesseract.pytesseract.tesseract_cmd}")
+            return None
+        if not os.path.exists(tessdata_path):
+            print(f"❌ Error: English language data not found at: {tessdata_path}")
+            return None
+            
+        try:
+            # Create directories if they don't exist
+            os.makedirs(os.path.dirname(SCREEN_TEXT_CONTENT), exist_ok=True)
+            os.makedirs(os.path.dirname(SCREEN_IMAGE), exist_ok=True)
+            
+            # Create/empty the output text file
+            with open(SCREEN_TEXT_CONTENT, 'w', encoding='utf-8') as f:
+                pass  # Just create or empty the file
+            print(f"📝 Created/emptied output file: {SCREEN_TEXT_CONTENT}")
+            
+            # Capture screen
+            print("📸 Capturing screen...")
+            screenshot = pyautogui.screenshot()
+            
+            # Save to SCREEN_IMAGE
+            screenshot.save(SCREEN_IMAGE)
+            print(f"✅ Screen saved to: {SCREEN_IMAGE}")
+            
+            screen_width, screen_height = pyautogui.size()
+            print(f"🖥️ Screen Dimensions: {screen_width} x {screen_height} pixels")
+            
+            print("="*80)
+            print(f"✅ Ready for processing. Image saved to: {SCREEN_IMAGE}")
+            print(f"✅ Output file ready at: {SCREEN_TEXT_CONTENT}")
+            print("="*80)
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error during execution: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        
+    def preprocess_image():
+        """
+        Loads the image from global SCREEN_IMAGE, applies CLAHE for contrast enhancement,
+        and uses adaptive thresholding to robustly handle varied text colors, uneven lighting,
+        and shadows (preventing broken characters), then saves the result.
+        Also detects text regions and records their positions to a text file.
+        Takes no parameters.
+        """
+        import numpy as np
+        
+        # Ensure SCREEN_IMAGE is available
+        if 'SCREEN_IMAGE' not in globals() and 'SCREEN_IMAGE' not in locals():
+            print("❌ Error: 'SCREEN_IMAGE' variable is not defined.")
+            return None
+
+        if not os.path.exists(SCREEN_IMAGE):
+            print(f"❌ Error: Image not found at: {SCREEN_IMAGE}")
+            return None
+
+        # Load image
+        img = cv2.imread(SCREEN_IMAGE)
+        if img is None:
+            print(f"❌ Error: Failed to load image at {SCREEN_IMAGE}")
+            return None
+
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization) 
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+
+        # Apply Adaptive Thresholding
+        preprocessed_img = cv2.adaptiveThreshold(
+            enhanced, 
+            255, 
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 
+            blockSize=11, 
+            C=2
+        )
+
+        # Load original color image
+        original_color = cv2.imread(SCREEN_IMAGE)
+        if original_color is None:
+            print("❌ Error: Failed to load original image for visualization")
+            return None
+        
+        # Find all black regions
+        black_mask = (preprocessed_img == 0).astype(np.uint8) * 255
+        
+        # Find connected components
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            black_mask, 
+            connectivity=8
+        )
+        
+        # Define size threshold
+        LARGE_REGION_THRESHOLD = 500
+        
+        # Store detected boxes
+        detected_boxes = []
+        
+        # Process each connected component
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            x = stats[i, cv2.CC_STAT_LEFT]
+            y = stats[i, cv2.CC_STAT_TOP]
+            w = stats[i, cv2.CC_STAT_WIDTH]
+            h = stats[i, cv2.CC_STAT_HEIGHT]
+            
+            if area >= LARGE_REGION_THRESHOLD:
+                # Draw green border
+                cv2.rectangle(original_color, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                
+                # Store box coordinates (left, top, right, bottom)
+                detected_boxes.append({
+                    'left': x,
+                    'top': y,
+                    'right': x + w,
+                    'bottom': y + h,
+                    'width': w,
+                    'height': h,
+                    'area': area
+                })
+        
+        # ===== TEXT REGION DETECTION (Sub-boxing) =====
+        print("🔍 Detecting text regions and sub-boxing...")
+        
+        # 1. Adaptive Thresholding for text detection
+        thresh = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY_INV, 15, 8
+        )
+
+        # 2. Pass 1: Macro-level grouping (find lines/paragraphs)
+        macro_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (18, 3))
+        macro_dilated = cv2.dilate(thresh, macro_kernel, iterations=1)
+        macro_closing = cv2.morphologyEx(macro_dilated, cv2.MORPH_CLOSE, macro_kernel)
+        
+        contours, _ = cv2.findContours(macro_closing, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        padding = 3  # 3px padding around text chunks
+        text_boxes = []
+
+        # 3. Pass 2: Sub-boxing wide regions into individual word chunks
+        micro_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 1))
+
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            
+            # Filter layout noise
+            if w > 12 and h > 8 and w < img.shape[1] * 0.95 and h < img.shape[0] * 0.4:
+                # If the block is wide (multiple words or sentence), sub-segment it
+                if w > 75:  
+                    roi_thresh = thresh[y:y+h, x:x+w]
+                    roi_dilated = cv2.dilate(roi_thresh, micro_kernel, iterations=1)
+                    sub_contours, _ = cv2.findContours(roi_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    
+                    sub_found = False
+                    for sub_cnt in sub_contours:
+                        sx, sy, sw, sh = cv2.boundingRect(sub_cnt)
+                        if sw > 4 and sh > 4:  # Valid sub-box dimensions
+                            global_x = x + sx
+                            global_y = y + sy
+                            
+                            x_pad = max(0, global_x - padding)
+                            y_pad = max(0, global_y - padding)
+                            w_pad = min(img.shape[1] - x_pad, sw + (2 * padding))
+                            h_pad = min(img.shape[0] - y_pad, sh + (2 * padding))
+                            
+                            text_boxes.append({
+                                'left': x_pad,
+                                'top': y_pad,
+                                'right': x_pad + w_pad,
+                                'bottom': y_pad + h_pad,
+                                'width': w_pad,
+                                'height': h_pad
+                            })
+                            # Draw inner sub-boxes in Orange (BGR: 0, 140, 255)
+                            cv2.rectangle(original_color, (x_pad, y_pad), (x_pad + w_pad, y_pad + h_pad), (0, 140, 255), 1)
+                            sub_found = True
+                    
+                    # Fallback if sub-segmentation didn't split it cleanly
+                    if not sub_found:
+                        x_pad = max(0, x - padding)
+                        y_pad = max(0, y - padding)
+                        w_pad = min(img.shape[1] - x_pad, w + (2 * padding))
+                        h_pad = min(img.shape[0] - y_pad, h + (2 * padding))
+                        text_boxes.append({
+                            'left': x_pad,
+                            'top': y_pad,
+                            'right': x_pad + w_pad,
+                            'bottom': y_pad + h_pad,
+                            'width': w_pad,
+                            'height': h_pad
+                        })
+                        cv2.rectangle(original_color, (x_pad, y_pad), (x_pad + w_pad, y_pad + h_pad), (0, 255, 0), 2)
+                else:
+                    # Small box, keep as a single chunk
+                    x_pad = max(0, x - padding)
+                    y_pad = max(0, y - padding)
+                    w_pad = min(img.shape[1] - x_pad, w + (2 * padding))
+                    h_pad = min(img.shape[0] - y_pad, h + (2 * padding))
+                    text_boxes.append({
+                        'left': x_pad,
+                        'top': y_pad,
+                        'right': x_pad + w_pad,
+                        'bottom': y_pad + h_pad,
+                        'width': w_pad,
+                        'height': h_pad
+                    })
+                    cv2.rectangle(original_color, (x_pad, y_pad), (x_pad + w_pad, y_pad + h_pad), (0, 255, 0), 2)
+
+        # ===== RECORD BOX POSITIONS TO TEXT FILE =====
+        print(f"📝 Recording box positions to: {SCREEN_TEXT_CONTENT}")
+        
+        with open(SCREEN_TEXT_CONTENT, 'w') as f:
+            f.write("=" * 60 + "\n")
+            f.write("DETECTED LARGE REGIONS (Green Boxes)\n")
+            f.write("=" * 60 + "\n\n")
+            
+            for idx, box in enumerate(detected_boxes, 1):
+                f.write(f"Large Region #{idx}:\n")
+                f.write(f"  Left: {box['left']}\n")
+                f.write(f"  Top: {box['top']}\n")
+                f.write(f"  Right: {box['right']}\n")
+                f.write(f"  Bottom: {box['bottom']}\n")
+                f.write(f"  Width: {box['width']}\n")
+                f.write(f"  Height: {box['height']}\n")
+                f.write(f"  Area: {box['area']} pixels\n")
                 f.write("-" * 40 + "\n")
             
-            f.write("\n\n" + "="*80 + "\n")
-            f.write("COMPACT FORMAT (left, top, right, bottom, distance_from_top_px, screen_percentage%, text):\n")
-            f.write("="*80 + "\n")
-            for word_data in clean_texts:
-                f.write(f"{word_data['left']:>6}, {word_data['top']:>6}, {word_data['right']:>6}, {word_data['bottom']:>6}, "
-                        f"{word_data['distance_from_top']:>6}px, {word_data['screen_percentage']:>5.1f}%, '{word_data['text']}'\n")
-
-        full_text = "   ".join([word['text'] for word in clean_texts])
-        print(f"✅ Total clean text blocks saved: {len(clean_texts)}")
+            f.write("\n" + "=" * 60 + "\n")
+            f.write("DETECTED TEXT REGIONS (Orange/Green Sub-boxes)\n")
+            f.write("=" * 60 + "\n\n")
+            
+            for idx, box in enumerate(text_boxes, 1):
+                f.write(f"Text Region #{idx}:\n")
+                f.write(f"  Left: {box['left']}\n")
+                f.write(f"  Top: {box['top']}\n")
+                f.write(f"  Right: {box['right']}\n")
+                f.write(f"  Bottom: {box['bottom']}\n")
+                f.write(f"  Width: {box['width']}\n")
+                f.write(f"  Height: {box['height']}\n")
+                f.write("-" * 40 + "\n")
+            
+            f.write("\n" + "=" * 60 + "\n")
+            f.write(f"SUMMARY:\n")
+            f.write(f"  Total Large Regions: {len(detected_boxes)}\n")
+            f.write(f"  Total Text Regions: {len(text_boxes)}\n")
+            f.write("=" * 60 + "\n")
         
-        if clean_texts:
-            highest = min(clean_texts, key=lambda x: x['top'])
-            lowest = max(clean_texts, key=lambda x: x['bottom'])
-        print("="*80)
+        # Save the image as preprocessed.png
+        base = os.path.dirname(SCREEN_IMAGE)
+        marked_original_path = os.path.join(base, "preprocessed.png")
+        cv2.imwrite(marked_original_path, original_color)
+        
+        print(f"✅ Saved: {marked_original_path}")
+        print(f"✅ Detected {len(detected_boxes)} large regions and {len(text_boxes)} text regions")
+        
+        return marked_original_path
 
-        return clean_texts
+    def full_image_vision():
+        """
+        Process the entire image at once without using regions or multiprocessing.
+        This runs FIRST as the primary approach.
+        
+        Returns:
+            List of vision results for the entire image, or None if failed
+        """
+        import cv2
+        import pytesseract
+        import os
+        import json
+        from datetime import datetime
+        
+        # Check if Tesseract is available
+        if not os.path.exists(pytesseract.pytesseract.tesseract_cmd):
+            print(f"❌ Error: Tesseract executable not found at: {pytesseract.pytesseract.tesseract_cmd}")
+            return None
+        if not os.path.exists(tessdata_path):
+            print(f"❌ Error: English language data not found at: {tessdata_path}")
+            return None
+        
+        # Check if preprocessed image exists
+        preprocessed_SCREEN_IMAGE = os.path.join(os.path.dirname(SCREEN_IMAGE), "preprocessed.png")
+        if not os.path.exists(preprocessed_SCREEN_IMAGE):
+            print(f"❌ Error: Preprocessed image not found at: {preprocessed_SCREEN_IMAGE}")
+            return None
+        
+        try:
+            # Load the preprocessed image
+            print(f"📂 Loading preprocessed image from: {preprocessed_SCREEN_IMAGE}")
+            image = cv2.imread(preprocessed_SCREEN_IMAGE)
+            if image is None:
+                print(f"❌ Error: Failed to load image at {preprocessed_SCREEN_IMAGE}")
+                return None
+            
+            screen_height, screen_width = image.shape[:2]
+            print(f"🖥️ Image Dimensions: {screen_width} x {screen_height} pixels")
+            
+            # Process the entire image with Tesseract
+            print("🔍 Running FULL IMAGE vision (First Attempt)...")
+            
+            custom_config = (
+                '--psm 11 -c tessedit_char_whitelist='
+                '\'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.,:-_=@############/\\\\?&|()[]{}<>~°%©®+— \\"\\\'\''
+            )
+            
+            data = pytesseract.image_to_data(image, config=custom_config, output_type=pytesseract.Output.DICT)
+            
+            # Extract text from the entire image
+            all_texts = []
+            n_boxes = len(data['text'])
+            
+            for i in range(n_boxes):
+                text = data['text'][i].strip()
+                confidence = int(data['conf'][i])
+                
+                if text:
+                    all_texts.append({
+                        'text': text,
+                        'left': data['left'][i],
+                        'top': data['top'][i],
+                        'right': data['left'][i] + data['width'][i],
+                        'bottom': data['top'][i] + data['height'][i],
+                        'width': data['width'][i],
+                        'height': data['height'][i],
+                        'confidence': confidence,
+                        'region_id': 0  # Single region for entire image
+                    })
+            
+            # Merge characters into words
+            if all_texts:
+                all_texts.sort(key=lambda x: (x['top'], x['left']))
+                
+                merged_texts = []
+                
+                while all_texts:
+                    current = all_texts.pop(0)
+                    max_horizontal_gap = max(12, current['height'] * 0.4)
+                    max_vertical_deviation = current['height'] * 0.4
+                    
+                    merged_any = True
+                    while merged_any:
+                        merged_any = False
+                        for i, next_el in enumerate(all_texts):
+                            current_center_y = current['top'] + (current['height'] / 2)
+                            next_center_y = next_el['top'] + (next_el['height'] / 2)
+                            
+                            is_same_line_geometry = abs(current_center_y - next_center_y) <= max_vertical_deviation
+                            horizontal_gap = next_el['left'] - current['right']
+                            is_close_horizontally = (-5 <= horizontal_gap <= max_horizontal_gap)
+                            
+                            if is_same_line_geometry and is_close_horizontally:
+                                if horizontal_gap > 3 and not current['text'].endswith(('/', ':', '.', '@', '-')):
+                                    current['text'] += " " + next_el['text']
+                                else:
+                                    current['text'] += next_el['text']
+                                    
+                                current['right'] = max(current['right'], next_el['right'])
+                                current['left'] = min(current['left'], next_el['left'])
+                                current['top'] = min(current['top'], next_el['top'])
+                                current['bottom'] = max(current['bottom'], next_el['bottom'])
+                                current['width'] = current['right'] - current['left']
+                                current['height'] = current['bottom'] - current['top']
+                                
+                                if current['confidence'] != -1 and next_el['confidence'] != -1:
+                                    current['confidence'] = (current['confidence'] + next_el['confidence']) // 2
+                                
+                                all_texts.pop(i)
+                                merged_any = True
+                                break
+                    
+                    # Fix common vision errors
+                    if "htips" in current['text']:
+                        current['text'] = current['text'].replace("htips", "https")
+                    if "searcl" in current['text'].lower():
+                        current['text'] = current['text'].lower().replace("searcl", "search").replace("Searcl", "Search")
+                    
+                    current['distance_from_top'] = current['top']
+                    current['distance_from_bottom'] = screen_height - current['bottom']
+                    current['screen_percentage'] = (current['top'] / screen_height) * 100
+                    
+                    merged_texts.append(current)
+                
+                # Prepare JSON data
+                json_data = []
+                for idx, result in enumerate(merged_texts, 1):
+                    json_data.append({
+                        f"text_{idx}": result['text'],
+                        "coordinates": {
+                            "top": result['top'],
+                            "right": result['right'],
+                            "left": result['left'],
+                            "bottom": result['bottom']
+                        }
+                    })
+                
+                # Append vision results to the text file
+                print(f"\n📝 Appending FULL IMAGE vision results to: {SCREEN_TEXT_CONTENT}")
+                
+                with open(SCREEN_TEXT_CONTENT, 'a', encoding='utf-8') as f:
+                    # Existing text format
+                    f.write("\n\n" + "="*80 + "\n")
+                    f.write("FULL IMAGE vision RESULTS (Primary Attempt - No Regions)\n")
+                    f.write("="*80 + "\n")
+                    f.write(f"Processed on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"Total Text Blocks Found: {len(merged_texts)}\n")
+                    f.write(f"Image Dimensions: {screen_width} x {screen_height} pixels\n")
+                    f.write("="*80 + "\n\n")
+                    
+                    for idx, result in enumerate(merged_texts, 1):
+                        f.write(f"TEXT BLOCK #{idx}:\n")
+                        f.write(f"  • {result['text']}\n")
+                        f.write(f"    Left: {result['left']:>6}  Top: {result['top']:>6}\n")
+                        f.write(f"    Right: {result['right']:>6}  Bottom: {result['bottom']:>6}\n")
+                        f.write(f"    Width: {result['width']:>6}  Height: {result['height']:>6}\n")
+                        f.write(f"    Confidence: {result['confidence']}%\n")
+                        f.write(f"    Distance from Top: {result['distance_from_top']:>6}px ({result['screen_percentage']:.1f}%)\n")
+                        f.write("-" * 30 + "\n")
+                    
+                    # Write compact format
+                    f.write("\n" + "="*80 + "\n")
+                    f.write("COMPACT FORMAT (left, top, right, bottom, text):\n")
+                    f.write("="*80 + "\n")
+                    for result in merged_texts:
+                        f.write(f"{result['left']:>6}, {result['top']:>6}, {result['right']:>6}, {result['bottom']:>6}, '{result['text']}'\n")
+                    
+                    # JSON format
+                    f.write("\n\n" + "="*80 + "\n")
+                    f.write("JSON FORMAT:\n")
+                    f.write("="*80 + "\n")
+                    json.dump(json_data, f, indent=2, ensure_ascii=False)
+                    f.write("\n")
+                
+                # Summary
+                print("\n" + "="*80)
+                print(f"✅ FULL IMAGE vision COMPLETE!")
+                print(f"  • Total Text Blocks Found: {len(merged_texts)}")
+                print(f"  • Results Appended to: {SCREEN_TEXT_CONTENT}")
+                print("="*80)
+                
+                return merged_texts
+            else:
+                return []
+                
+        except Exception as e:
+            print(f"❌ Error during full image vision: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
-    except Exception as e:
-        print(f"❌ Error during execution: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
+    def region_based_vision():
+        """
+        Reads region coordinates from SCREEN_TEXT_CONTENT, processes each region individually
+        using ThreadPoolExecutor for parallel processing, and appends vision results back to the text file.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import json
+        from datetime import datetime
+        
+        # Path to the specific image file requested
+        if not os.path.exists(pytesseract.pytesseract.tesseract_cmd):
+            print(f"❌ Error: Tesseract executable not found at: {pytesseract.pytesseract.tesseract_cmd}")
+            return None
+        if not os.path.exists(tessdata_path):
+            print(f"❌ Error: English language data not found at: {tessdata_path}")
+            return None
+            
+        # Check if preprocessed image exists
+        preprocessed_SCREEN_IMAGE = os.path.join(os.path.dirname(SCREEN_IMAGE), "preprocessed.png")
+        if not os.path.exists(preprocessed_SCREEN_IMAGE):
+            print(f"❌ Error: Preprocessed image not found at: {preprocessed_SCREEN_IMAGE}")
+            return None
+        
+        # Check if output text file exists with region data
+        if not os.path.exists(SCREEN_TEXT_CONTENT):
+            print(f"❌ Error: Output text file not found at: {SCREEN_TEXT_CONTENT}")
+            return None
+
+        try:
+            # Load the preprocessed image
+            print(f"📂 Loading preprocessed image from: {preprocessed_SCREEN_IMAGE}")
+            image = cv2.imread(preprocessed_SCREEN_IMAGE)
+            if image is None:
+                print(f"❌ Error: Failed to load image at {preprocessed_SCREEN_IMAGE}")
+                return None
+                
+            screen_height, screen_width = image.shape[:2]
+            print(f"🖥️ Image Dimensions: {screen_width} x {screen_height} pixels")
+            
+            # Parse the text file to extract region coordinates
+            print(f"📝 Reading regions from: {SCREEN_TEXT_CONTENT}")
+            
+            regions = []
+            current_region = {}
+            reading_large_regions = False
+            reading_text_regions = False
+            
+            with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                
+            for line in lines:
+                line = line.strip()
+                
+                # Detect which section we're in
+                if "DETECTED LARGE REGIONS" in line:
+                    reading_large_regions = True
+                    reading_text_regions = False
+                    continue
+                elif "DETECTED TEXT REGIONS" in line:
+                    reading_large_regions = False
+                    reading_text_regions = True
+                    continue
+                elif "SUMMARY" in line:
+                    break
+                    
+                # Parse region data
+                if "Large Region #" in line or "Text Region #" in line:
+                    if current_region and 'left' in current_region:
+                        regions.append(current_region)
+                    current_region = {}
+                    continue
+                    
+                # Parse coordinate lines
+                if "Left:" in line:
+                    current_region['left'] = int(line.split("Left:")[1].strip())
+                elif "Top:" in line:
+                    current_region['top'] = int(line.split("Top:")[1].strip())
+                elif "Right:" in line:
+                    current_region['right'] = int(line.split("Right:")[1].strip())
+                elif "Bottom:" in line:
+                    current_region['bottom'] = int(line.split("Bottom:")[1].strip())
+                elif "Width:" in line:
+                    current_region['width'] = int(line.split("Width:")[1].strip())
+                elif "Height:" in line:
+                    current_region['height'] = int(line.split("Height:")[1].strip())
+                elif "Area:" in line and reading_large_regions:
+                    current_region['area'] = int(line.split("Area:")[1].strip().split()[0])
+            
+            # Add the last region
+            if current_region and 'left' in current_region:
+                regions.append(current_region)
+            
+            print(f"✅ Found {len(regions)} regions to process")
+            
+            if len(regions) == 0:
+                print("⚠️ No regions found to process")
+                return None
+            
+            # Prepare arguments for parallel processing
+            args_list = [(region, preprocessed_SCREEN_IMAGE, idx) for idx, region in enumerate(regions, 1)]
+            
+            # Determine number of workers (threads)
+            # Use more threads than CPU cores for I/O bound operations
+            max_workers = min(len(regions), 100)  # Max 100 threads
+            print(f"🚀 Starting parallel processing with {max_workers} threads...")
+            
+            # Process regions in parallel using ThreadPoolExecutor
+            vision_results = []
+            region_count = 0
+            failed_regions = 0
+            
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all tasks
+                future_to_result = {
+                    executor.submit(process_single_region, args): idx 
+                    for idx, args in enumerate(args_list, 1)
+                }
+                
+                # Process results as they complete
+                for future in as_completed(future_to_result):
+                    region_id = future_to_result[future]
+                    try:
+                        result = future.result(timeout=60)  # 60 second timeout per region
+                        region_count += 1
+                        
+                        if result['error']:
+                            failed_regions += 1
+                            print(f"  ⚠️ Region #{result['region_id']}: {result['error']}")
+                        else:
+                            texts_found = len(result.get('texts', []))
+                            print(f"  ✅ Region #{result['region_id']}: Found {texts_found} text blocks")
+                        
+                        vision_results.append(result)
+                        
+                        # Show progress
+                        progress = (region_count / len(regions)) * 100
+                        
+                    except Exception as e:
+                        failed_regions += 1
+                        region_count += 1
+                        print(f"  ❌ Region #{region_id} failed with exception: {e}")
+                        vision_results.append({
+                            'region_id': region_id,
+                            'error': str(e),
+                            'texts': []
+                        })
+            
+            # Combine results
+            all_vision_results = []
+            for result in vision_results:
+                if not result.get('error') and result.get('texts'):
+                    all_vision_results.extend(result['texts'])
+            
+            # Sort results by region_id then by position
+            all_vision_results.sort(key=lambda x: (x['region_id'], x['top'], x['left']))
+            
+            print(f"\n✅ Processed {region_count} regions, found {len(all_vision_results)} text blocks")
+            
+            # Prepare JSON data
+            json_data = []
+            for idx, result in enumerate(all_vision_results, 1):
+                json_data.append({
+                    f"text_{idx}": result['text'],
+                    "coordinates": {
+                        "top": result['top'],
+                        "right": result['right'],
+                        "left": result['left'],
+                        "bottom": result['bottom']
+                    }
+                })
+            
+            # Append vision results to the text file
+            print(f"\n📝 Appending vision results to: {SCREEN_TEXT_CONTENT}")
+            
+            with open(SCREEN_TEXT_CONTENT, 'a', encoding='utf-8') as f:
+                # Existing text format
+                f.write("\n\n" + "="*80 + "\n")
+                f.write("vision EXTRACTION RESULTS (Per Region - Parallel Processing with Threads)\n")
+                f.write("="*80 + "\n")
+                f.write(f"Processed on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Total Regions Processed: {region_count}\n")
+                f.write(f"Total Text Blocks Found: {len(all_vision_results)}\n")
+                f.write(f"Failed Regions: {failed_regions}\n")
+                f.write(f"Parallel Workers: {max_workers} threads\n")
+                f.write("="*80 + "\n\n")
+                
+                # Group results by region
+                current_region = 0
+                for result in all_vision_results:
+                    if result['region_id'] != current_region:
+                        current_region = result['region_id']
+                        f.write(f"\n{'─'*40}\n")
+                        f.write(f"REGION #{current_region} RESULTS:\n")
+                        f.write(f"{'─'*40}\n")
+                    
+                    f.write(f"  • {result['text']}\n")
+                    f.write(f"    Left: {result['left']:>6}  Top: {result['top']:>6}\n")
+                    f.write(f"    Right: {result['right']:>6}  Bottom: {result['bottom']:>6}\n")
+                    f.write(f"    Width: {result['width']:>6}  Height: {result['height']:>6}\n")
+                    f.write(f"    Confidence: {result['confidence']}%\n")
+                    f.write(f"    Distance from Top: {result['distance_from_top']:>6}px ({result['screen_percentage']:.1f}%)\n")
+                    f.write("-" * 30 + "\n")
+                
+                # Write compact format
+                f.write("\n" + "="*80 + "\n")
+                f.write("COMPACT FORMAT (left, top, right, bottom, text):\n")
+                f.write("="*80 + "\n")
+                for result in all_vision_results:
+                    f.write(f"{result['left']:>6}, {result['top']:>6}, {result['right']:>6}, {result['bottom']:>6}, '{result['text']}'\n")
+                
+                # JSON format
+                f.write("\n\n" + "="*80 + "\n")
+                f.write("JSON FORMAT:\n")
+                f.write("="*80 + "\n")
+                json.dump(json_data, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            
+            # Summary
+            print("\n" + "="*80)
+            print(f"✅ vision COMPLETE!")
+            print(f"  • Regions Processed: {region_count}")
+            print(f"  • Total Text Blocks Found: {len(all_vision_results)}")
+            print(f"  • Failed Regions: {failed_regions}")
+            print(f"  • Results Appended to: {SCREEN_TEXT_CONTENT}")
+            print("="*80)
+            
+            return all_vision_results
+
+        except Exception as e:
+            print(f"❌ Error during execution: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def normalize_text_for_comparison(text):
+        """
+        Normalize text for comparison by removing all non-alphanumeric characters
+        and converting to lowercase.
+        """
+        if not text:
+            return ""
+        # Remove all non-alphanumeric characters and convert to lowercase
+        return re.sub(r'[^a-zA-Z0-9]', '', text).lower()
+
+    def main():
+        
+        print("🚀 Starting vision Process...")
+        
+        # Step 1: Capture screen and prepare files
+        result1 = prepare_file()
+        if result1 is None:
+            print("❌ Failed to prepare file. Exiting.")
+            return
+        
+        # Step 2: Preprocess image and detect regions
+        result2 = preprocess_image()
+        if result2 is None:
+            print("❌ Failed to preprocess image. Exiting.")
+            return
+        
+        # Step 3: Run FULL IMAGE vision FIRST
+        print("=" * 80)
+        print("🔍 Running FULL IMAGE vision (First Attempt)...")
+        print("=" * 80)
+        
+        full_image_vision()
+        
+        # Step 4: Check if the text target value was found in the screen content
+        # Read the text target file to get the value we're looking for
+        target_value = None
+        try:
+            if os.path.exists(TEXT_TARGET):
+                with open(TEXT_TARGET, 'r', encoding='utf-8') as file:
+                    text_target_data = json.load(file)
+                    target_value = text_target_data.get('value', '')
+                    print(f"🔍 [MAIN] Looking for target value: '{target_value}'")
+        except Exception as e:
+            print(f"⚠️ [MAIN] Error reading text target: {e}")
+        
+        # Normalize the target value for comparison
+        target_found_in_full_image = False
+        
+        if target_value:
+            # Read the screen content file to check if target value was found
+            try:
+                if os.path.exists(SCREEN_TEXT_CONTENT):
+                    with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
+                        screen_content = file.read()
+                    
+                    # Normalize both the target and the screen content for comparison
+                    normalized_target = normalize_text_for_comparison(target_value)
+                    
+                    # Check if the normalized target is in the screen content
+                    # Also check for common variations
+                    target_variations = [
+                        target_value,
+                        target_value.lower(),
+                        target_value.upper(),
+                        target_value.replace(' ', ''),
+                        target_value.replace(' ', '').lower(),
+                        target_value.replace(' ', '').upper(),
+                        target_value.replace(' ', '|'),
+                        target_value.replace(' ', ':'),
+                        target_value.replace(' ', ''),
+                        target_value.replace(' ', '') + '|',
+                        target_value.replace(' ', '') + ':',
+                    ]
+                    
+                    # Remove duplicates
+                    target_variations = list(set(target_variations))
+                    
+                    print(f"🔍 [MAIN] Checking for target variations: {target_variations[:5]}...")
+                    
+                    for variation in target_variations:
+                        if variation in screen_content:
+                            print(f"✅ [MAIN] Found target value variation in FULL IMAGE vision: '{variation}'")
+                            target_found_in_full_image = True
+                            break
+                    
+                    # Also check using regex for case-insensitive matching
+                    if not target_found_in_full_image:
+                        # Use regex with re.IGNORECASE
+                        pattern = re.compile(re.escape(target_value), re.IGNORECASE)
+                        if pattern.search(screen_content):
+                            print(f"✅ [MAIN] Found target value (case-insensitive) in FULL IMAGE vision: '{target_value}'")
+                            target_found_in_full_image = True
+                    
+                    # Also check normalized form (remove all non-alphanumeric)
+                    if not target_found_in_full_image:
+                        normalized_screen = re.sub(r'[^a-zA-Z0-9]', '', screen_content).lower()
+                        if normalized_target in normalized_screen:
+                            print(f"✅ [MAIN] Found normalized target in FULL IMAGE vision: '{normalized_target}'")
+                            target_found_in_full_image = True
+                            
+                else:
+                    print(f"⚠️ [MAIN] screen_content.text not found at: {SCREEN_TEXT_CONTENT}")
+                    
+            except Exception as e:
+                print(f"⚠️ [MAIN] Error checking screen content: {e}")
+        
+        # Step 5: Decide whether to run region-based vision
+        if target_found_in_full_image:
+            print("=" * 80)
+            print(f"✅ [MAIN] Target value '{target_value}' found in FULL IMAGE vision!")
+            print("🔄 [MAIN] Skipping region-based vision (target already found)")
+            print("=" * 80)
+            print("✅ vision COMPLETE! (Target found in full image)")
+        else:
+            print("=" * 80)
+            print(f"❌ [MAIN] Target value '{target_value}' NOT found in FULL IMAGE vision.")
+            print("🔄 [MAIN] Running region-based vision as fallback...")
+            print("=" * 80)
+            region_based_vision()
+            
+            # After region-based vision, check again if target was found
+            try:
+                if os.path.exists(SCREEN_TEXT_CONTENT):
+                    with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
+                        screen_content = file.read()
+                    
+                    if target_value and target_value in screen_content:
+                        print(f"✅ [MAIN] Target value found in region-based vision results!")
+            except Exception as e:
+                print(f"⚠️ [MAIN] Error checking screen content after region-based vision: {e}")
+        
+        # Final summary
+        print("=" * 80)
+
+    # Execute main
+    main()
     
 def abort_operation(reason="Operation aborted"):
         """
@@ -343,15 +1160,17 @@ def abort_operation(reason="Operation aborted"):
         # Raise KeyboardInterrupt to break out of loops
         raise KeyboardInterrupt(f"Operation aborted: {reason}")
 
-def operate_google_flow_browser():
+def operate_google_flow_project():
     """
-    Launches Microsoft Edge, maximizes it.
+    Launches/uses Microsoft Edge for Google Flow operations.
     Features: Live HUD tracking, click-through overlay, 
-    global hotkey interception, and step routing matrices.
+    global hotkey interception, and simple URL launch with "all media" detection.
+    Uses JSON format for text extraction and case-insensitive/normalized text matching.
+    Includes full download mechanism with modal dismissal, zip extraction, and image validation.
     """
     # --- SPEED TUNING PARAMETERS ---
-    pyautogui.PAUSE = 0.0  
-
+    pyautogui.PAUSE = 0.0
+    
     if not os.path.exists(PANEL_PATH):
         print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
         return
@@ -360,6 +1179,7 @@ def operate_google_flow_browser():
         panel_data = json.load(file)
 
     project_title = panel_data.get('project_title')
+    
     terminate_automation = False
     operation_status_flag = True  # Global flag tracking operation health
     operation_status_message = ""  # Current status message
@@ -414,14 +1234,14 @@ def operate_google_flow_browser():
     def abort_operation(reason):
         """Abort the operation with a specific reason."""
         print(f"🛑 [ABORT] Aborting operation: {reason}")
-        update_operation_status(f"Aborting {project_title}: {reason}", is_abort=True)
+        update_operation_status(f"Aborting Google Flow operation: {reason}", is_abort=True)
         # The update_operation_status will raise SystemExit
 
     def check_operation_status():
         """Check if operation status is still valid (not aborted/errored)."""
         if not operation_status_flag or operation_aborted:
             print("🛑 [STATUS] Operation status is invalid - aborting")
-            update_operation_status("Operation status invalid - aborting", is_abort=True)
+            update_operation_status("Operation status invalid - aborting Google Flow operation", is_abort=True)
             return False
         return True
 
@@ -430,27 +1250,305 @@ def operate_google_flow_browser():
         hud.print("🛑 Manual Stop Triggered!", "warning")
         print("🛑 Manual Stop Triggered!")
         terminate_automation = True
-        update_operation_status(f"Manually terminated by user (Alt+/)", is_abort=True)
+        update_operation_status("Google Flow operation manually terminated by user (Alt+/)", is_abort=True)
 
     keyboard.add_hotkey('alt+/', on_terminate_shortcut)
 
     def check_for_termination():
         if terminate_automation:
-            update_operation_status(f"Operation terminated by user", is_abort=True)
+            update_operation_status("Google Flow operation terminated by user", is_abort=True)
             raise KeyboardInterrupt("User forced exit via shortcut key.")
         if not check_operation_status():
             raise SystemExit("Operation status invalid")
 
-    def safe_ocr():
-        """Capture screen without hiding the HUD (HUD is click-through)"""
+    def safe_vision():
+        """
+        Capture screen without hiding the HUD (HUD is click-through)
+        AND properly parse the screen_content.text file to return text elements.
+        Now uses JSON format for parsing.
+        """
         check_for_termination()
-        return ocr()
+        
+        # Call the vision() function to capture screen
+        vision()
+        
+        # Now read the screen_content.text file to get the parsed results
+        text_elements = []
+        
+        try:
+            if os.path.exists(SCREEN_TEXT_CONTENT):
+                with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
+                    content = file.read()
+                
+                # ============================================
+                # FIRST: Parse JSON format from FULL IMAGE vision RESULTS
+                # ============================================
+                # Look for JSON array in the FULL IMAGE section
+                full_image_json_match = re.search(
+                    r'FULL IMAGE vision RESULTS.*?JSON FORMAT:\s*=\s*\n(\[.*?\])\s*(?=\n\n|$|\s*vision EXTRACTION RESULTS)',
+                    content,
+                    re.DOTALL | re.IGNORECASE
+                )
+                
+                if full_image_json_match:
+                    try:
+                        json_text = full_image_json_match.group(1)
+                        # Clean up any extraneous text that might be in the JSON
+                        json_text = re.sub(r'^[^{[]*', '', json_text)
+                        json_text = re.sub(r'[^}\]]*$', '', json_text)
+                        json_data = json.loads(json_text)
+                        
+                        for item in json_data:
+                            # Extract text from the dynamic key (text_1, text_2, etc.)
+                            text_value = None
+                            for key, value in item.items():
+                                if key.startswith('text_'):
+                                    text_value = value
+                                    break
+                            
+                            if text_value and 'coordinates' in item:
+                                coords = item['coordinates']
+                                text_elements.append({
+                                    'text': text_value.strip(),
+                                    'left': coords.get('left', 0),
+                                    'top': coords.get('top', 0),
+                                    'right': coords.get('right', 0),
+                                    'bottom': coords.get('bottom', 0),
+                                    'width': coords.get('right', 0) - coords.get('left', 0),
+                                    'height': coords.get('bottom', 0) - coords.get('top', 0)
+                                })
+                        
+                        if text_elements:
+                            print(f"✅ [VISION] Parsed {len(text_elements)} text elements from FULL IMAGE JSON section")
+                    except json.JSONDecodeError as e:
+                        print(f"⚠️ [VISION] Failed to parse FULL IMAGE JSON: {e}")
+                        # Continue to next parsing method if JSON fails
+                
+                # ============================================
+                # SECOND: Parse JSON format from REGION-BASED vision RESULTS
+                # ============================================
+                if not text_elements:
+                    # Find all JSON sections from region-based results
+                    region_json_matches = re.findall(
+                        r'vision EXTRACTION RESULTS.*?JSON FORMAT:\s*=\s*\n(\[.*?\])\s*(?=\n\n|$|\s*FULL IMAGE vision RESULTS)',
+                        content,
+                        re.DOTALL | re.IGNORECASE
+                    )
+                    
+                    for json_match in region_json_matches:
+                        try:
+                            json_text = json_match
+                            json_text = re.sub(r'^[^{[]*', '', json_text)
+                            json_text = re.sub(r'[^}\]]*$', '', json_text)
+                            json_data = json.loads(json_text)
+                            
+                            for item in json_data:
+                                text_value = None
+                                for key, value in item.items():
+                                    if key.startswith('text_'):
+                                        text_value = value
+                                        break
+                                
+                                if text_value and 'coordinates' in item:
+                                    coords = item['coordinates']
+                                    text_elements.append({
+                                        'text': text_value.strip(),
+                                        'left': coords.get('left', 0),
+                                        'top': coords.get('top', 0),
+                                        'right': coords.get('right', 0),
+                                        'bottom': coords.get('bottom', 0),
+                                        'width': coords.get('right', 0) - coords.get('left', 0),
+                                        'height': coords.get('bottom', 0) - coords.get('top', 0)
+                                    })
+                            
+                            if text_elements:
+                                print(f"✅ [VISION] Parsed {len(text_elements)} text elements from REGION-BASED JSON section")
+                                break
+                        except json.JSONDecodeError as e:
+                            print(f"⚠️ [VISION] Failed to parse REGION-BASED JSON: {e}")
+                            continue
+                
+                # ============================================
+                # THIRD: Fallback - Try parsing TEXT format if JSON parsing failed
+                # ============================================
+                if not text_elements:
+                    print("ℹ️ [VISION] No JSON data found, falling back to text format parsing...")
+                    
+                    # Parse FULL IMAGE vision RESULTS (text format)
+                    text_blocks = re.findall(
+                        r'TEXT BLOCK #\d+:\s*•\s*(.+?)\s+Left:\s*(\d+)\s+Top:\s*(\d+)\s+Right:\s*(\d+)\s+Bottom:\s*(\d+)\s+Width:\s*(\d+)\s+Height:\s*(\d+)',
+                        content,
+                        re.DOTALL
+                    )
+                    
+                    for match in text_blocks:
+                        text, left, top, right, bottom, width, height = match
+                        text_elements.append({
+                            'text': text.strip(),
+                            'left': int(left),
+                            'top': int(top),
+                            'right': int(right),
+                            'bottom': int(bottom),
+                            'width': int(width),
+                            'height': int(height)
+                        })
+                    
+                    if text_elements:
+                        print(f"✅ [VISION] Parsed {len(text_elements)} text elements from FULL IMAGE text section")
+                    
+                    # Parse REGION-BASED vision RESULTS (text format)
+                    if not text_elements:
+                        region_sections = re.findall(
+                            r'────────────────────────────────────────\s*REGION #(\d+) RESULTS:\s*────────────────────────────────────────\s*(.*?)(?=(?:────────────────────────────────────────\s*REGION #\d+ RESULTS:|$))',
+                            content,
+                            re.DOTALL | re.IGNORECASE
+                        )
+                        
+                        region_count = 0
+                        for region_num, region_content in region_sections:
+                            region_texts = re.findall(
+                                r'•\s*(.+?)\s+Left:\s*(\d+)\s+Top:\s*(\d+)\s+Right:\s*(\d+)\s+Bottom:\s*(\d+)\s+Width:\s*(\d+)\s+Height:\s*(\d+)',
+                                region_content,
+                                re.DOTALL
+                            )
+                            
+                            for match in region_texts:
+                                text, left, top, right, bottom, width, height = match
+                                text_elements.append({
+                                    'text': text.strip(),
+                                    'left': int(left),
+                                    'top': int(top),
+                                    'right': int(right),
+                                    'bottom': int(bottom),
+                                    'width': int(width),
+                                    'height': int(height)
+                                })
+                                region_count += 1
+                        
+                        if region_count > 0:
+                            print(f"✅ [VISION] Parsed {region_count} text elements from REGION-BASED text sections")
+                    
+                    # Parse COMPACT FORMAT section as last resort
+                    if not text_elements:
+                        compact_section = re.search(
+                            r'COMPACT FORMAT.*?\n(.*?)(?:\n\n|\Z)',
+                            content,
+                            re.DOTALL | re.IGNORECASE
+                        )
+                        
+                        if compact_section:
+                            compact_lines = compact_section.group(1).strip().split('\n')
+                            for line in compact_lines:
+                                if line.strip():
+                                    match = re.match(
+                                        r'\s*(\d+),\s*(\d+),\s*(\d+),\s*(\d+),\s*[\'"](.+?)[\'"]\s*$',
+                                        line.strip()
+                                    )
+                                    if match:
+                                        left, top, right, bottom, text = match.groups()
+                                        text_elements.append({
+                                            'text': text.strip(),
+                                            'left': int(left),
+                                            'top': int(top),
+                                            'right': int(right),
+                                            'bottom': int(bottom),
+                                            'width': int(right) - int(left),
+                                            'height': int(bottom) - int(top)
+                                        })
+                            
+                            if text_elements:
+                                print(f"✅ [VISION] Parsed {len(text_elements)} text elements from COMPACT format")
+                
+                # ============================================
+                # FINAL: Log what we found
+                # ============================================
+                if text_elements:
+                    print(f"📊 [VISION] TOTAL: {len(text_elements)} text elements parsed")
+                    # Print first 5 for debugging
+                    for i, el in enumerate(text_elements[:5]):
+                        print(f"  [{i}] '{el.get('text', '')}'")
+                else:
+                    print(f"⚠️ [VISION] Could not parse any text elements from screen_content.text")
+                    
+        except Exception as e:
+            print(f"⚠️ [VISION] Error reading screen_content.text: {e}")
+        
+        return text_elements
+    
+    # ============================================
+    # TEXT NORMALIZATION HELPERS
+    # ============================================
+    
+    def normalize_text_for_comparison(text):
+        """
+        Normalize text for comparison by:
+        1. Converting to lowercase
+        2. Removing all non-alphanumeric characters (spaces, punctuation, special chars)
+        3. This makes "all media", "AllMedia", "all-media", "all_media" all become "allmedia"
+        
+        Args:
+            text: The text string to normalize
+            
+        Returns:
+            Normalized string with only alphanumeric characters, lowercase
+        """
+        if not text:
+            return ""
+        
+        # Convert to lowercase
+        t = text.lower()
+        
+        # Remove all non-alphanumeric characters
+        # This handles spaces, apostrophes, hyphens, underscores, punctuation, etc.
+        t = re.sub(r'[^a-z0-9]', '', t)
+        
+        return t
+
+    def text_contains_normalized(text_to_search, target_text):
+        """
+        Check if target_text is contained in text_to_search using normalized comparison.
+        
+        Args:
+            text_to_search: The text to search within
+            target_text: The target text to look for
+            
+        Returns:
+            True if the normalized target is found in the normalized search text
+        """
+        if not text_to_search or not target_text:
+            return False
+        
+        normalized_search = normalize_text_for_comparison(text_to_search)
+        normalized_target = normalize_text_for_comparison(target_text)
+        
+        return normalized_target in normalized_search
 
     def clean_string_completely(text):
-        if not text: return ""
-        t = text.lower().replace("https", "").replace("http", "").replace("www", "")
-        return re.sub(r'[^a-z0-9]', '', t)
-    
+        """
+        Clean a string for comparison by:
+        1. Converting to lowercase
+        2. Removing all non-alphanumeric characters
+        3. Removing common URL prefixes
+        4. Normalizing spaces and special characters
+        
+        This ensures that "iamkennyking's project_1" and "iamkennyking'sproject_1" 
+        both become "iamkennykingsproject1"
+        """
+        if not text:
+            return ""
+        
+        # Convert to lowercase
+        t = text.lower()
+        
+        # Remove common URL prefixes
+        t = t.replace("https://", "").replace("http://", "").replace("www.", "")
+        
+        # Remove all non-alphanumeric characters (this handles apostrophes, spaces, underscores, etc.)
+        # This is the key change - it removes ALL non-alphanumeric characters
+        t = re.sub(r'[^a-z0-9]', '', t)
+        
+        return t
+
     # ============================================
     # SECTION 1: WINDOW MANAGEMENT HELPERS
     # ============================================
@@ -526,14 +1624,14 @@ def operate_google_flow_browser():
                 time.sleep(0.2)
                 
                 print("✅ [WINDOW] Window ready - maximized and focused")
-                update_operation_status(f"Browser window ready and maximized")
+                update_operation_status("Browser window ready for Google Flow operation")
                 return hwnd
             except Exception as e:
                 print(f"⚠️ [WINDOW] Error preparing existing window: {e}")
                 pass
         
         print("💻 [WINDOW] No Edge window found, launching new instance...")
-        update_operation_status(f"Launching Microsoft Edge browser...")
+        update_operation_status("Launching browser for Google Flow operation...")
         subprocess.Popen([edge_path, "about:blank"])
         
         for attempt in range(20):
@@ -553,13 +1651,13 @@ def operate_google_flow_browser():
                     win32gui.SetForegroundWindow(hwnd)
                     time.sleep(0.2)
                     print("✅ [WINDOW] New window ready - maximized and focused")
-                    update_operation_status(f"Microsoft Edge launched and maximized")
+                    update_operation_status("Browser launched for Google Flow operation")
                     return hwnd
                 except Exception as e:
                     print(f"⚠️ [WINDOW] Error preparing new window: {e}")
                     continue
         
-        error_msg = "Failed to get or launch Edge window"
+        error_msg = "Failed to get or launch Edge window for Google Flow operation"
         update_operation_status(error_msg, is_error=True)
         abort_operation(error_msg)
         raise RuntimeError(error_msg)
@@ -610,7 +1708,7 @@ def operate_google_flow_browser():
 
     def fast_paste_url(hwnd, url):
         check_for_termination()
-        hud.print("📋 Navigating to destination...", "typing")
+        hud.print("📋 Navigating to URL...", "typing")
         print(f"📋 Pasting URL: {url}")
         pyperclip.copy(url)
         
@@ -621,848 +1719,170 @@ def operate_google_flow_browser():
         enforce_window_focus(hwnd)
         pyautogui.hotkey('ctrl', 'v')
         pyautogui.press('enter')
-        hud.print("")
-        update_operation_status(f"Navigating to {project_title if project_title else 'destination'}...")
+        update_operation_status(f"Navigating to Google Flow URL...")
 
     # ============================================
-    # SECTION 2: COMMON UTILITY FUNCTIONS
+    # SECTION 2: GOOGLE FLOW SPECIFIC HELPERS
     # ============================================
     
-    def analyze_url_visibility(target, extracted_elements):
-        """Check if we're on the right page based on URL text in OCR"""
-        if not extracted_elements: 
-            return False, None
-        clean_target = clean_string_completely(target)
-        clean_project_sig = clean_string_completely(f"{target}/project")
-        if not clean_target: 
-            return False, None
+    def check_for_all_media_with_vision(hwnd, timeout_seconds=30, check_interval=0.5):
+        """
+        Google Flow specific: Write "all media" to text_target.json and then call vision.
+        Wait for "all media" to appear in the screen content using case-insensitive
+        and normalized text matching. Uses JSON format for text extraction.
+        
+        Returns: (found, text_elements)
+        """
+        print("🔍 [GOOGLE_FLOW] Checking for 'all media' in screen content (case-insensitive, normalized)...")
+        update_operation_status("Checking for 'all media' content...")
+        
+        # Pre-normalize the target text for comparison
+        normalized_target = normalize_text_for_comparison("all media")
+        print(f"🔍 [GOOGLE_FLOW] Normalized target: '{normalized_target}'")
+        
+        start_time = time.time()
+        attempts = 0
+        
+        while time.time() - start_time < timeout_seconds:
+            check_for_termination()
+            enforce_window_focus(hwnd)
+            attempts += 1
             
-        is_base_found = False
-        is_project_found = False
-
-        for element in extracted_elements:
-            clean_element_text = clean_string_completely(element['text'])
-            if clean_project_sig in clean_element_text:
-                is_project_found = True
-            elif clean_target in clean_element_text:
-                is_base_found = True
-
-        if is_project_found:
-            return True, "project"
-        elif is_base_found:
-            return True, "all_projects"
+            print(f"📝 [GOOGLE_FLOW] Attempt {attempts}: Writing 'all media' to text target...")
             
+            # Write "all media" to text_target.json
+            try:
+                text_target_data = {"value": "all media"}
+                with open(TEXT_TARGET, 'w', encoding='utf-8') as file:
+                    json.dump(text_target_data, file, indent=4)
+                print(f"✅ [GOOGLE_FLOW] Wrote 'all media' to {TEXT_TARGET}")
+            except Exception as e:
+                print(f"⚠️ [GOOGLE_FLOW] Error writing to text_target.json: {e}")
+            
+            # Wait a moment for the system to process the text target
+            time.sleep(0.3)
+            
+            # Call vision to capture screen content (now uses JSON format)
+            current_texts = safe_vision()
+            
+            if current_texts:
+                print(f"🔍 [GOOGLE_FLOW] Found {len(current_texts)} text elements on screen")
+                
+                # Check if "all media" is in the screen content using normalized comparison
+                found_all_media = False
+                for element in current_texts:
+                    element_text = element['text'].strip()
+                    
+                    # Use the normalized text comparison function
+                    if text_contains_normalized(element_text, "all media"):
+                        print(f"✅ [GOOGLE_FLOW] Found 'all media' in screen content: '{element_text}'")
+                        found_all_media = True
+                        update_operation_status("'All media' found in Google Flow project")
+                        return True, current_texts
+                
+                if found_all_media:
+                    return True, current_texts
+                else:
+                    print(f"⏳ [GOOGLE_FLOW] 'all media' not found in screen content yet (attempt {attempts})")
+                    
+                    # Log a few examples of what was found to help with debugging
+                    if attempts <= 3:
+                        sample_texts = [e['text'].strip()[:50] for e in current_texts[:10]]
+                        print(f"🔍 [GOOGLE_FLOW] Sample texts found: {sample_texts}")
+            else:
+                print(f"⏳ [GOOGLE_FLOW] No text found on screen (attempt {attempts})")
+                
+                # Check if the screen_content.text file exists and has content
+                if os.path.exists(SCREEN_TEXT_CONTENT):
+                    try:
+                        with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                            # Check JSON format for "AllMedia"
+                            json_match = re.search(r'"text_\d+":\s*"([^"]*AllMedia[^"]*)"', content, re.IGNORECASE)
+                            if json_match:
+                                print(f"✅ [GOOGLE_FLOW] Found 'AllMedia' in JSON format: {json_match.group(1)}")
+                                # Manually add the text element
+                                current_texts = [{'text': json_match.group(1), 'left': 0, 'top': 0, 'right': 0, 'bottom': 0, 'width': 0, 'height': 0}]
+                                update_operation_status("'All media' found in Google Flow project (direct JSON match)")
+                                return True, current_texts
+                    except Exception as e:
+                        print(f"⚠️ [GOOGLE_FLOW] Error checking screen_content.text: {e}")
+            
+            # If attempts exceeded 10, try reloading the page
+            if attempts > 10 and attempts % 3 == 0:
+                print(f"🔄 [GOOGLE_FLOW] Attempt {attempts}: 'all media' not found, reloading page...")
+                hud.print("🔄 Reloading page...", "warning")
+                update_operation_status(f"Reloading page (attempt {attempts})...")
+                enforce_window_focus(hwnd)
+                pyautogui.hotkey('ctrl', 'r')
+                time.sleep(2)
+                hwnd = ensure_window_ready_and_focused()
+                continue
+            
+            time.sleep(check_interval)
+        
+        print(f"❌ [GOOGLE_FLOW] 'all media' not found within {timeout_seconds} seconds")
+        hud.print("❌ 'All media' not found", "error")
+        error_msg = f"'All media' not found within {timeout_seconds} seconds"
+        update_operation_status(error_msg, is_error=True)
         return False, None
 
-    def get_screen_fingerprint(extracted_elements):
-        """Create a fingerprint of current screen text for change detection"""
-        if not extracted_elements: 
-            return ""
-        return "||".join([el['text'].strip() for el in extracted_elements])
-
-    def verify_if_text_changes(current_texts, previous_fingerprint):
+    def load_google_flow_url(hwnd, google_flow_url):
         """
-        Compare current OCR text with previous fingerprint.
-        Returns: (text_changed, new_fingerprint)
+        Load the Google Flow URL directly.
         """
-        current_fingerprint = get_screen_fingerprint(current_texts)
+        print(f"🌐 [GOOGLE_FLOW] Loading Google Flow URL: {google_flow_url}")
+        hud.print("📋 Loading Google Flow...", "navigating")
+        update_operation_status(f"Loading Google Flow project...")
         
-        if not previous_fingerprint:
-            print("🔄 [CHANGE] First scan - treating as changed")
-            return True, current_fingerprint
-        
-        if current_fingerprint == previous_fingerprint:
-            print("📄 [CHANGE] No text content changes detected")
-            return False, current_fingerprint
-        else:
-            print("🔄 [CHANGE] Text content has changed")
-            return True, current_fingerprint
-
-    # ============================================
-    # SECTION 3: SELF-HEALING HELPERS FOR ALL PROJECTS PAGE
-    # ============================================
-    
-    def analyze_current_page_context(hwnd, target_url, project_title=None):
-        """
-        Analyzes current page context.
-        For SPA: We check if the project name is visible AND if we're on the correct view.
-        Returns: (is_on_all_projects, is_on_project_page, project_title_found, context_string)
-        """
-        check_for_termination()
-        current_texts = safe_ocr()
-        
-        if not current_texts:
-            return False, False, False, "no_text"
-        
-        # Check URL context
-        url_found, current_state = analyze_url_visibility(target_url, current_texts)
-        
-        # Check for project page indicators
-        has_all_media = False
-        has_new_project = False
-        project_title_found = False
-        
-        clean_project_title = clean_string_completely(project_title) if project_title else ""
-        
-        for element in current_texts:
-            clean_text = clean_string_completely(element['text'])
-            if "allmedia" in clean_text or "all media" in clean_text:
-                has_all_media = True
-            if "newproject" in clean_text:
-                has_new_project = True
-            if clean_project_title and clean_project_title in clean_text:
-                project_title_found = True
-                # Check if this element is likely a card (not header/button)
-                element_text = element['text'].lower()
-                if "all media" in element_text or "new project" in element_text:
-                    # This is UI text, not a card
-                    project_title_found = False
-        
-        # SPECIAL SPA DETECTION:
-        # If we see "All Media" AND the project name, we're ON a project page
-        # If we see "New Project" AND project name is visible in a card context, we're on All Projects
-        # But if project name is found AND "All Media" is found, we're on project page
-        # If project name is found AND "New Project" is found, we're on All Projects page
-        
-        is_on_project = False
-        is_on_all_projects = False
-        
-        # CRITICAL FIX: Detect project page by presence of "All Media" AND project name
-        if has_all_media and project_title_found:
-            is_on_project = True
-            is_on_all_projects = False
-            return False, True, True, "project_correct"
-        
-        # Detect All Projects page by presence of "New Project" AND project name in card context
-        if has_new_project and project_title_found:
-            is_on_all_projects = True
-            is_on_project = False
-            return True, False, True, "all_projects"
-        
-        # If only project name found but no context, check URL-based detection
-        if url_found and current_state == "all_projects":
-            return True, False, project_title_found, "all_projects"
-        elif (url_found and current_state == "project") or has_all_media:
-            return False, True, project_title_found, "project_correct"
-        
-        # If we only found project name without context, assume All Projects
-        if project_title_found:
-            return True, False, True, "all_projects"
-        
-        return False, False, False, "unknown"
-    
-    def all_project_watchdog(hwnd, all_project_url, project_title, depth=0):
-        """Watchdog for All Projects page with self-healing capabilities."""
-        check_for_termination()
-        print("🛡️ [ALL_WATCHDOG] Starting all projects watchdog...")
-        hud.print("🔍 Analyzing page context...", "searching")
-        update_operation_status(f"Analyzing page context for projects list...")
-        
-        if depth > 5:
-            print("❌ [ALL_WATCHDOG] Max recursion depth reached")
-            hud.print("❌ Watchdog recursion limit", "error")
-            error_msg = "Max recursion depth reached in watchdog"
-            update_operation_status(error_msg, is_error=True)
-            abort_operation(error_msg)
-            return False, False, False, hwnd
-        
-        # Analyze current page context
-        on_all, on_project, project_found, context = analyze_current_page_context(
-            hwnd, all_project_url, project_title
-        )
-        
-        print(f"📊 [ALL_WATCHDOG] Page context: {context}, on_all={on_all}, on_project={on_project}, project_found={project_found}")
-        
-        # If we're on All Projects page
-        if on_all:
-            print("✅ [ALL_WATCHDOG] On All Projects page")
-            hud.print("📋 On projects list", "success")
-            update_operation_status(f"Successfully navigated to All Projects page")
-            return True, False, False, hwnd
-        
-        # If we're on a project page
-        if on_project:
-            print("✅ [ALL_WATCHDOG] On a specific project page")
-            hud.print("📋 On project page", "info")
-            update_operation_status(f"Currently on a project page, verifying {project_title}...")
-            
-            if project_found:
-                print("✅ [ALL_WATCHDOG] Target project identified on page")
-                hud.print(f"✅ {project_title} verified", "success")
-                update_operation_status(f"Successfully verified {project_title} on project page")
-                return False, True, True, hwnd
-            else:
-                print(f"⚠️ [ALL_WATCHDOG] On project page but target project not found")
-                hud.print("⚠️ Project mismatch", "warning")
-                error_msg = f"On project page but {project_title} not found"
-                update_operation_status(error_msg, is_error=True)
-                abort_operation(error_msg)
-                return False, True, False, hwnd
-        
-        # Context unknown - navigate to all projects
-        print("❌ [ALL_WATCHDOG] Page context unknown, navigating to all projects...")
-        hud.print("❌ Page context unknown, navigating...", "error")
-        update_operation_status(f"Page context unknown, navigating to projects list...")
-        fast_paste_url(hwnd, all_project_url)
+        # Navigate to the URL
+        fast_paste_url(hwnd, google_flow_url)
         time.sleep(3)
-        return all_project_watchdog(hwnd, all_project_url, project_title, depth + 1)
+        hwnd = ensure_window_ready_and_focused()
+        
+        return True, hwnd
 
-    def wait_for_all_projects_page_ready(hwnd, all_project_url, project_title, timeout_seconds=60, depth=0):
-        """Wait for All Projects page to be ready with context analysis on each attempt."""
-        check_for_termination()
-        print("⏳ [ALL_READY] Waiting for All Projects page to load...")
-        hud.print("⏳ Loading projects list...", "waiting")
-        update_operation_status(f"Loading All Projects page...")
+    def verify_google_flow_page_loaded(hwnd, max_attempts=10):
+        """
+        Verify Google Flow page is loaded by writing "all media" to text_target.json
+        and checking if it appears in vision results using normalized comparison.
+        Uses JSON format for text extraction.
+        """
+        print(f"🔍 [GOOGLE_FLOW] Verifying page is loaded with 'all media' detection (case-insensitive, normalized)...")
+        hud.print("⏳ Checking Google Flow...", "waiting")
+        update_operation_status("Verifying Google Flow page load...")
         
-        if depth > 5:
-            print("❌ [ALL_READY] Max recursion depth reached")
-            hud.print("❌ Page ready timeout", "error")
-            error_msg = "Max recursion depth reached waiting for All Projects page"
-            update_operation_status(error_msg, is_error=True)
-            abort_operation(error_msg)
-            return False, hwnd
-        
-        start_time = time.time()
-        confirmation_text = "new project"
-        clean_confirmation = clean_string_completely(confirmation_text)
-        specific_attempts = 0
-        
-        while time.time() - start_time < timeout_seconds:
+        for attempt in range(max_attempts):
             check_for_termination()
-            enforce_window_focus(hwnd)
             
-            # Analyze current page context
-            on_all, on_project, project_found, context = analyze_current_page_context(
-                hwnd, all_project_url, project_title
+            # Write "all media" to text target and check vision
+            found_all_media, current_texts = check_for_all_media_with_vision(
+                hwnd, timeout_seconds=5, check_interval=0.3
             )
             
-            print(f"📊 [ALL_READY] Page context: {context}, on_all={on_all}, on_project={on_project}, project_found={project_found}")
-            
-            # If on project page with correct project, we're done
-            if on_project and project_found:
-                print("✅ [ALL_READY] Already on correct project page - proceeding")
-                hud.print("✅ Target found, proceeding...", "success")
-                update_operation_status(f"Already on {project_title} project page")
+            if found_all_media:
+                print(f"✅ [GOOGLE_FLOW] Page loaded successfully - 'all media' found!")
+                hud.print("✅ Google Flow loaded", "success")
+                update_operation_status("Google Flow project loaded successfully")
                 return True, hwnd
             
-            # If on project page with wrong project, navigate back
-            if on_project and not project_found:
-                print(f"⚠️ [ALL_READY] On project page but wrong project (attempt {specific_attempts + 1})")
-                hud.print("⚠️ Wrong project, navigating back...", "warning")
-                update_operation_status(f"Wrong project detected, navigating back to projects list...")
-                
-                if specific_attempts < 3:
-                    fast_paste_url(hwnd, all_project_url)
-                    time.sleep(3)
-                    specific_attempts += 1
-                    continue
-                else:
-                    print("🔄 [ALL_READY] Too many attempts, proceeding with specific page")
-                    hud.print("📋 Proceeding with current page...", "info")
-                    update_operation_status(f"Proceeding with current page after multiple attempts")
-                    return True, hwnd
-            
-            # If on all projects page, check for confirmation text
-            if on_all:
-                current_texts = safe_ocr()
-                confirmation_found = False
-                for element in current_texts:
-                    if clean_confirmation in clean_string_completely(element['text']):
-                        confirmation_found = True
-                        break
-                
-                if confirmation_found:
-                    print("✅ [ALL_READY] All Projects page ready")
-                    hud.print("✅ Projects list loaded", "success")
-                    update_operation_status(f"All Projects page ready and loaded")
-                    return True, hwnd
-            
-            # If context unknown, navigate
-            if context == "unknown":
-                print(f"⏳ [ALL_READY] Context unknown, navigating to all projects...")
-                update_operation_status(f"Page context unknown, navigating to projects list...")
-                fast_paste_url(hwnd, all_project_url)
+            # If not found, try reloading
+            if attempt < max_attempts - 1:
+                print(f"🔄 [GOOGLE_FLOW] Attempt {attempt + 1}/{max_attempts} - Reloading page...")
+                hud.print(f"🔄 Reloading... ({attempt + 1}/{max_attempts})", "warning")
+                enforce_window_focus(hwnd)
+                pyautogui.hotkey('ctrl', 'r')
                 time.sleep(3)
-                continue
-            
-            # Not ready yet, wait and retry
-            elapsed = int(time.time() - start_time)
-            print(f"⏳ [ALL_READY] Waiting for page to be ready... ({elapsed}s)")
-            hud.print(f"⏳ Loading... ({elapsed}s)", "waiting")
-            update_operation_status(f"Loading All Projects page... ({elapsed}s elapsed)")
-            time.sleep(1.0)
-        
-        print("❌ [ALL_READY] Timeout - attempting recovery...")
-        hud.print("🔄 Attempting recovery...", "warning")
-        error_msg = f"Timeout waiting for All Projects page after {timeout_seconds} seconds"
-        update_operation_status(error_msg, is_error=True)
-        fast_paste_url(hwnd, all_project_url)
-        time.sleep(3)
-        return wait_for_all_projects_page_ready(hwnd, all_project_url, project_title, timeout_seconds, depth + 1)
-
-    def scroll_in_all_projects(hwnd, all_project_url, project_title, depth=0):
-        """Scroll through All Projects page to find the project card with context analysis."""
-        check_for_termination()
-        print("⬇️ [SCROLL_ALL] Starting scroll in All Projects page...")
-        hud.print("🔍 Searching for target...", "searching")
-        update_operation_status(f"Searching for {project_title} in projects list...")
-        
-        if depth > 5:
-            print("❌ [SCROLL_ALL] Max recursion depth reached - restarting")
-            hud.print("🔄 Restarting search...", "warning")
-            error_msg = f"Max recursion depth reached searching for {project_title}"
-            update_operation_status(error_msg, is_error=True)
-            abort_operation(error_msg)
-            return False, None, hwnd
-        
-        if not project_title or not project_title.strip():
-            print("❌ [SCROLL_ALL] Project name is empty!")
-            hud.print("❌ Project name missing", "error")
-            error_msg = "Project title is empty or missing"
-            update_operation_status(error_msg, is_error=True)
-            abort_operation(error_msg)
-            return False, None, hwnd
-        
-        current_monitor = get_current_monitor()
-        monitor_left, monitor_top, monitor_right, monitor_bottom = current_monitor
-        center_x = monitor_left + (monitor_right - monitor_left) // 2
-        center_y = monitor_top + (monitor_bottom - monitor_top) // 2
-        
-        clean_project_title = clean_string_completely(project_title)
-        print(f"🔍 [SCROLL_ALL] Searching for target project...")
-        
-        previous_fingerprint = ""
-        scroll_attempts = 0
-        max_scroll_attempts = 10
-        scroll_direction = "down"
-        down_scroll_complete = False
-        recovery_attempts = 0
-        
-        while True:
-            check_for_termination()
-            
-            if not enforce_window_focus(hwnd):
-                print("🔄 [SCROLL_ALL] Window lost, reacquiring...")
                 hwnd = ensure_window_ready_and_focused()
-            
-            # Analyze current page context
-            on_all, on_project, project_found, context = analyze_current_page_context(
-                hwnd, all_project_url, project_title
-            )
-            
-            print(f"📊 [SCROLL_ALL] Page context: {context}, on_all={on_all}, on_project={on_project}, project_found={project_found}")
-            
-            # If on correct project page, we're done - return success with no card needed
-            if on_project and project_found:
-                print("✅ [SCROLL_ALL] Already on target project page - no card needed")
-                hud.print("✅ Target located", "success")
-                update_operation_status(f"Target {project_title} already located")
-                return True, None, hwnd
-            
-            # If on wrong project page, navigate back
-            if on_project and not project_found:
-                print("⚠️ [SCROLL_ALL] On wrong project page - navigating back")
-                hud.print("⚠️ Wrong project, navigating back...", "warning")
-                update_operation_status(f"Wrong project detected, returning to projects list...")
-                fast_paste_url(hwnd, all_project_url)
-                time.sleep(3)
-                recovery_attempts += 1
-                if recovery_attempts > 3:
-                    print("🔄 [SCROLL_ALL] Too many recovery attempts, restarting...")
-                    error_msg = f"Too many recovery attempts while searching for {project_title}"
-                    update_operation_status(error_msg, is_error=True)
-                    abort_operation(error_msg)
-                    return scroll_in_all_projects(hwnd, all_project_url, project_title, depth + 1)
-                continue
-            
-            # If context unknown, navigate
-            if context == "unknown":
-                print("⚠️ [SCROLL_ALL] Page context unknown - navigating to all projects")
-                hud.print("⚠️ Page context lost, navigating...", "warning")
-                update_operation_status(f"Page context lost, navigating to projects list...")
-                fast_paste_url(hwnd, all_project_url)
-                time.sleep(3)
-                continue
-            
-            # If not on all projects, navigate
-            if not on_all:
-                print("⚠️ [SCROLL_ALL] Not on all projects page - navigating...")
-                update_operation_status(f"Not on All Projects page, navigating...")
-                fast_paste_url(hwnd, all_project_url)
-                time.sleep(3)
-                continue
-            
-            # Get current texts for searching
-            current_texts = safe_ocr()
-            
-            # Search for project on current screen
-            found_element = None
-            for element in current_texts:
-                if clean_project_title in clean_string_completely(element['text']):
-                    # Verify this is a card element (not a header/button)
-                    element_text = element['text'].lower()
-                    # Skip if this is UI text that contains project name but isn't a card
-                    if "new project" in element_text or "all media" in element_text:
-                        continue
-                    found_element = element
-                    print(f"🎉 [SCROLL_ALL] Target card found at position ({element['left']}, {element['top']})")
-                    hud.print("✅ Target located!", "success")
-                    update_operation_status(f"Found {project_title} card in projects list")
-                    return True, found_element, hwnd
-            
-            if not found_element:
-                print(f"🔍 [SCROLL_ALL] Target not found on current screen")
-            
-            text_changed, current_fingerprint = verify_if_text_changes(current_texts, previous_fingerprint)
-            
-            if not text_changed:
-                scroll_attempts += 1
-                print(f"🔄 [SCROLL_ALL] No change detected - scroll attempt {scroll_attempts}/{max_scroll_attempts}")
-                
-                if scroll_attempts >= max_scroll_attempts:
-                    if not down_scroll_complete:
-                        print("⬆️ [SCROLL_ALL] Reached bottom, switching to scroll up...")
-                        hud.print("⬆️ Reached bottom, scrolling up...", "navigating")
-                        update_operation_status(f"Reached bottom, scrolling up to find {project_title}...")
-                        scroll_direction = "up"
-                        down_scroll_complete = True
-                        scroll_attempts = 0
-                        previous_fingerprint = ""
-                        pyautogui.moveTo(center_x, center_y, duration=0)
-                        pyautogui.scroll(5000)
-                        time.sleep(2.0)
-                        continue
-                    else:
-                        print("❌ [SCROLL_ALL] Target not found - refreshing and retrying...")
-                        hud.print("🔄 Refreshing and retrying...", "warning")
-                        error_msg = f"Could not find {project_title} in projects list after scrolling"
-                        update_operation_status(error_msg, is_error=True)
-                        fast_paste_url(hwnd, all_project_url)
-                        time.sleep(3)
-                        return scroll_in_all_projects(hwnd, all_project_url, project_title, depth + 1)
-            else:
-                scroll_attempts = 0
-                previous_fingerprint = current_fingerprint
-            
-            if scroll_direction == "down":
-                print("⬇️ [SCROLL_ALL] Scrolling down...")
-                hud.print("⬇️ Scrolling...", "navigating")
-                update_operation_status(f"Scrolling down through projects list...")
-                pyautogui.moveTo(center_x, center_y, duration=0)
-                pyautogui.scroll(-500)
-                time.sleep(1.5)
-            else:
-                print("⬆️ [SCROLL_ALL] Scrolling up...")
-                hud.print("⬆️ Scrolling...", "navigating")
-                update_operation_status(f"Scrolling up through projects list...")
-                pyautogui.moveTo(center_x, center_y, duration=0)
-                pyautogui.scroll(500)
-                time.sleep(1.5)
-
-    def click_project_card(hwnd, card_element, all_project_url, project_title, depth=0):
-        """Click on the project card with context analysis on each attempt."""
-        check_for_termination()
-        print("🎯 [CLICK] Clicking project card...")
-        hud.print("🎯 Selecting target...", "selecting")
-        update_operation_status(f"Selecting {project_title} from projects list...")
         
-        if depth > 5:
-            print("❌ [CLICK] Max recursion depth reached - restarting")
-            hud.print("🔄 Restarting selection...", "warning")
-            error_msg = f"Max recursion depth reached while selecting {project_title}"
-            update_operation_status(error_msg, is_error=True)
-            abort_operation(error_msg)
-            return False, hwnd
-        
-        # Analyze current page context
-        on_all, on_project, project_found, context = analyze_current_page_context(
-            hwnd, all_project_url, project_title
-        )
-        
-        print(f"📊 [CLICK] Page context before click: {context}, on_all={on_all}, on_project={on_project}, project_found={project_found}")
-        
-        # If already on correct project page, we're done
-        if on_project and project_found:
-            print("✅ [CLICK] Already on target project page")
-            hud.print("✅ Target selected", "success")
-            update_operation_status(f"Already on {project_title} project page")
-            return True, hwnd
-        
-        # If no card element provided, we need to find it
-        if card_element is None:
-            print("ℹ️ [CLICK] No card element provided - attempting to find it")
-            update_operation_status(f"Locating {project_title} card...")
-            
-            # Try to find the card in current OCR
-            current_texts = safe_ocr()
-            clean_project_title = clean_string_completely(project_title)
-            found_element = None
-            
-            for element in current_texts:
-                if clean_project_title in clean_string_completely(element['text']):
-                    element_text = element['text'].lower()
-                    if "new project" not in element_text and "all media" not in element_text:
-                        found_element = element
-                        break
-            
-            if found_element:
-                print(f"✅ [CLICK] Found card at position ({found_element['left']}, {found_element['top']})")
-                card_element = found_element
-            else:
-                print("❌ [CLICK] Could not find card element")
-                hud.print("❌ Cannot select - no card", "error")
-                error_msg = f"Could not find {project_title} card to click"
-                update_operation_status(error_msg, is_error=True)
-                abort_operation(error_msg)
-                return False, hwnd
-        
-        # Calculate click position
-        click_x = int(card_element['left'] + (card_element['width'] / 2))
-        click_y = int(card_element['top'] - 50)  # Click above the text to avoid text selection
-        
-        print(f"🎯 [CLICK] Selecting at position: ({click_x}, {click_y})")
-        hud.print("📍 Selecting target...", "selecting")
-        update_operation_status(f"Clicking on {project_title} card...")
-        
-        enforce_window_focus(hwnd)
-        pyautogui.click(x=click_x, y=click_y)
-        time.sleep(2)
-        
-        # Verify selection worked by analyzing context again
-        on_all, on_project, project_found, context = analyze_current_page_context(
-            hwnd, all_project_url, project_title
-        )
-        
-        print(f"📊 [CLICK] Page context after click: {context}, on_all={on_all}, on_project={on_project}, project_found={project_found}")
-        
-        # CRITICAL: In SPA, the context might not change immediately
-        # We need to check if we see "All Media" AND project name together (means we're on project page)
-        if on_project and project_found:
-            print("✅ [CLICK] Target selected successfully")
-            hud.print("✅ Target opened", "success")
-            update_operation_status(f"Successfully opened {project_title} project")
-            return True, hwnd
-        
-        # If we're on all projects still, click might have failed or SPA didn't navigate
-        if on_all:
-            print("⚠️ [CLICK] Still on all projects page - trying click at different position")
-            hud.print("⚠️ Retrying selection...", "warning")
-            update_operation_status(f"Retrying selection of {project_title}...")
-            
-            # Try clicking on the actual text
-            click_x_alt = int(card_element['left'] + (card_element['width'] / 2))
-            click_y_alt = int(card_element['top'] + (card_element['height'] / 2))
-            pyautogui.click(x=click_x_alt, y=click_y_alt)
-            time.sleep(2)
-            
-            # Final verification
-            on_all, on_project, project_found, context = analyze_current_page_context(
-                hwnd, all_project_url, project_title
-            )
-            
-            print(f"📊 [CLICK] Final context after retry: {context}, on_project={on_project}, project_found={project_found}")
-            
-            if on_project and project_found:
-                print("✅ [CLICK] Target selected on retry")
-                hud.print("✅ Target opened", "success")
-                update_operation_status(f"Successfully opened {project_title} project on retry")
-                return True, hwnd
-        
-        # If context unknown, navigate to all projects and retry
-        if context == "unknown":
-            print("⚠️ [CLICK] Page context unknown - navigating to all projects")
-            update_operation_status(f"Page context lost, returning to projects list...")
-            fast_paste_url(hwnd, all_project_url)
-            time.sleep(3)
-            return click_project_card(hwnd, card_element, all_project_url, project_title, depth + 1)
-        
-        print("❌ [CLICK] Failed to open target - restarting")
-        hud.print("🔄 Restarting operation...", "warning")
-        error_msg = f"Failed to open {project_title} project"
+        print(f"❌ [GOOGLE_FLOW] Page verification failed after {max_attempts} attempts")
+        hud.print("❌ Google Flow load failed", "error")
+        error_msg = f"Page verification failed after {max_attempts} attempts"
         update_operation_status(error_msg, is_error=True)
-        abort_operation(error_msg)
-        return click_project_card(hwnd, card_element, all_project_url, project_title, depth + 1)
+        return False, hwnd
 
     # ============================================
-    # SECTION 4: SELF-HEALING HELPERS FOR SPECIFIC PROJECT PAGE
-    # ============================================
-    
-    def specific_project_watchdog(hwnd, specific_url, project_title, depth=0):
-        """Watchdog for Specific Project page with context analysis first."""
-        check_for_termination()
-        print("🛡️ [SPEC_WATCHDOG] Starting specific project watchdog...")
-        hud.print("🔍 Analyzing page context...", "searching")
-        update_operation_status(f"Analyzing page context for {project_title}...")
-        
-        if depth > 5:
-            print("❌ [SPEC_WATCHDOG] Max recursion depth reached")
-            hud.print("❌ Watchdog recursion limit", "error")
-            error_msg = f"Max recursion depth reached in watchdog for {project_title}"
-            update_operation_status(error_msg, is_error=True)
-            abort_operation(error_msg)
-            return False, False, hwnd
-        
-        # Analyze current page context
-        on_all, on_project, project_found, context = analyze_current_page_context(
-            hwnd, specific_url, project_title
-        )
-        
-        print(f"📊 [SPEC_WATCHDOG] Page context: {context}, on_all={on_all}, on_project={on_project}, project_found={project_found}")
-        
-        # If on project page
-        if on_project:
-            print("✅ [SPEC_WATCHDOG] On specific project page")
-            hud.print("📋 On project page", "success")
-            update_operation_status(f"Currently on {project_title} project page")
-            
-            if project_found:
-                print("✅ [SPEC_WATCHDOG] Project verification successful")
-                hud.print(f"✅ {project_title} verified", "success")
-                update_operation_status(f"Successfully verified {project_title} project")
-                return True, True, hwnd
-            else:
-                print(f"⚠️ [SPEC_WATCHDOG] On project page but target project not found")
-                hud.print("⚠️ Project mismatch", "warning")
-                error_msg = f"On project page but {project_title} not found"
-                update_operation_status(error_msg, is_error=True)
-                abort_operation(error_msg)
-                return True, False, hwnd
-        
-        # If on all projects page, navigate to project
-        if on_all:
-            print("🔄 [SPEC_WATCHDOG] On all projects page - navigating to project")
-            hud.print("🔄 Navigating to project...", "warning")
-            update_operation_status(f"Navigating to {project_title} from projects list...")
-            fast_paste_url(hwnd, specific_url)
-            time.sleep(3)
-            return specific_project_watchdog(hwnd, specific_url, project_title, depth + 1)
-        
-        # If context unknown, navigate to project
-        print("❌ [SPEC_WATCHDOG] Page context unknown - navigating to project")
-        hud.print("❌ Page context unknown, navigating...", "error")
-        update_operation_status(f"Page context unknown, navigating to {project_title}...")
-        fast_paste_url(hwnd, specific_url)
-        time.sleep(3)
-        return specific_project_watchdog(hwnd, specific_url, project_title, depth + 1)
-
-    def wait_for_specific_page_ready(hwnd, specific_url, project_title, timeout_seconds=60, depth=0):
-        """Wait for Specific Project page to be ready with context analysis."""
-        check_for_termination()
-        print("⏳ [SPEC_READY] Waiting for project page to load...")
-        hud.print("⏳ Loading project page...", "waiting")
-        update_operation_status(f"Loading {project_title} project page...")
-        
-        if depth > 5:
-            print("❌ [SPEC_READY] Max recursion depth reached")
-            hud.print("❌ Page ready timeout", "error")
-            error_msg = f"Max recursion depth reached waiting for {project_title} page"
-            update_operation_status(error_msg, is_error=True)
-            abort_operation(error_msg)
-            return False, False, hwnd
-        
-        start_time = time.time()
-        confirmation_text = "all media"
-        clean_confirmation = clean_string_completely(confirmation_text)
-        
-        while time.time() - start_time < timeout_seconds:
-            check_for_termination()
-            enforce_window_focus(hwnd)
-            
-            # Analyze current page context
-            on_all, on_project, project_found, context = analyze_current_page_context(
-                hwnd, specific_url, project_title
-            )
-            
-            print(f"📊 [SPEC_READY] Page context: {context}, on_all={on_all}, on_project={on_project}, project_found={project_found}")
-            
-            # If on all projects page, navigate to project
-            if on_all:
-                print("🔄 [SPEC_READY] On all projects page - navigating to project")
-                update_operation_status(f"Navigating to {project_title} project...")
-                fast_paste_url(hwnd, specific_url)
-                time.sleep(3)
-                continue
-            
-            # If not on project page and context unknown, navigate
-            if not on_project and context == "unknown":
-                print(f"⏳ [SPEC_READY] Context unknown, navigating to project...")
-                update_operation_status(f"Page context unknown, navigating to {project_title}...")
-                fast_paste_url(hwnd, specific_url)
-                time.sleep(3)
-                continue
-            
-            # If on project page, check for confirmation text
-            if on_project:
-                current_texts = safe_ocr()
-                confirmation_found = False
-                for element in current_texts:
-                    if clean_confirmation in clean_string_completely(element['text']):
-                        confirmation_found = True
-                        break
-                
-                if confirmation_found:
-                    print("✅ [SPEC_READY] Project page ready - confirmation text found")
-                    hud.print("✅ Project page loaded", "success")
-                    update_operation_status(f"{project_title} project page loaded successfully")
-                    
-                    # Verify project name
-                    if project_found:
-                        print(f"✅ [SPEC_READY] Target project confirmed on page")
-                        update_operation_status(f"Successfully verified {project_title} project")
-                        return True, True, hwnd
-                    else:
-                        print(f"⚠️ [SPEC_READY] Target project not found on page - will try to scroll")
-                        update_operation_status(f"Searching for {project_title} on page...")
-                        scroll_complete, found_after_scroll, recovered_hwnd = scroll_in_specific_project(
-                            hwnd, specific_url, project_title, depth + 1
-                        )
-                        if found_after_scroll:
-                            update_operation_status(f"Found {project_title} after scrolling")
-                            return True, True, recovered_hwnd
-                        error_msg = f"Could not find {project_title} on page after scrolling"
-                        update_operation_status(error_msg, is_error=True)
-                        abort_operation(error_msg)
-                        return True, False, recovered_hwnd
-            
-            elapsed = int(time.time() - start_time)
-            print(f"⏳ [SPEC_READY] Waiting for page to be ready... ({elapsed}s)")
-            hud.print(f"⏳ Loading... ({elapsed}s)", "waiting")
-            update_operation_status(f"Loading {project_title} project page... ({elapsed}s elapsed)")
-            time.sleep(1.0)
-        
-        print("❌ [SPEC_READY] Timeout - attempting recovery...")
-        hud.print("🔄 Attempting recovery...", "warning")
-        error_msg = f"Timeout waiting for {project_title} page after {timeout_seconds} seconds"
-        update_operation_status(error_msg, is_error=True)
-        fast_paste_url(hwnd, specific_url)
-        time.sleep(3)
-        return wait_for_specific_page_ready(hwnd, specific_url, project_title, timeout_seconds, depth + 1)
-
-    def scroll_in_specific_project(hwnd, specific_url, project_title, depth=0):
-        """
-        Scroll in Specific Project page with context analysis.
-        Only scrolls up twice, then navigates back if not found.
-        """
-        check_for_termination()
-        print("⬆️ [SCROLL_SPEC] Starting scroll in specific project page...")
-        hud.print("🔍 Verifying project...", "searching")
-        update_operation_status(f"Verifying {project_title} on project page...")
-        
-        if depth > 5:
-            print("❌ [SCROLL_SPEC] Max recursion depth reached - navigating back")
-            hud.print("🔄 Navigating back...", "warning")
-            error_msg = f"Max recursion depth reached while verifying {project_title}"
-            update_operation_status(error_msg, is_error=True)
-            abort_operation(error_msg)
-            return False, False, hwnd
-        
-        if not project_title or not project_title.strip():
-            print("❌ [SCROLL_SPEC] Project name is empty!")
-            hud.print("❌ Project name missing", "error")
-            error_msg = "Project title is empty or missing"
-            update_operation_status(error_msg, is_error=True)
-            abort_operation(error_msg)
-            return False, False, hwnd
-        
-        current_monitor = get_current_monitor()
-        monitor_left, monitor_top, monitor_right, monitor_bottom = current_monitor
-        center_x = monitor_left + (monitor_right - monitor_left) // 2
-        center_y = monitor_top + (monitor_bottom - monitor_top) // 2
-        
-        clean_project_title = clean_string_completely(project_title)
-        print(f"🔍 [SCROLL_SPEC] Verifying target project...")
-        
-        # Analyze current page context
-        on_all, on_project, project_found, context = analyze_current_page_context(
-            hwnd, specific_url, project_title
-        )
-        
-        print(f"📊 [SCROLL_SPEC] Initial context: {context}, on_project={on_project}, project_found={project_found}")
-        
-        # If on project page and project found, we're done
-        if on_project and project_found:
-            print("✅ [SCROLL_SPEC] Target project already visible")
-            hud.print(f"✅ {project_title} verified", "success")
-            update_operation_status(f"{project_title} verified successfully")
-            return True, True, hwnd
-        
-        # If on all projects page, navigate to project
-        if on_all:
-            print("⚠️ [SCROLL_SPEC] On all projects page - navigating to project")
-            hud.print("⚠️ Navigating to project...", "warning")
-            update_operation_status(f"Navigating to {project_title} project...")
-            fast_paste_url(hwnd, specific_url)
-            time.sleep(3)
-            return scroll_in_specific_project(hwnd, specific_url, project_title, depth + 1)
-        
-        # If not on project page, navigate
-        if not on_project:
-            print("⚠️ [SCROLL_SPEC] Not on project page - navigating...")
-            hud.print("⚠️ Navigating to project...", "warning")
-            update_operation_status(f"Navigating to {project_title} project...")
-            fast_paste_url(hwnd, specific_url)
-            time.sleep(3)
-            return scroll_in_specific_project(hwnd, specific_url, project_title, depth + 1)
-        
-        # Target not found - perform up to 2 scrolls
-        print("⬆️ [SCROLL_SPEC] Target not visible, scrolling up (max 2 attempts)...")
-        hud.print("⬆️ Scrolling to locate target...", "navigating")
-        update_operation_status(f"Scrolling to locate {project_title} on page...")
-        
-        max_scrolls = 2
-        scroll_count = 0
-        
-        while scroll_count < max_scrolls:
-            check_for_termination()
-            
-            if not enforce_window_focus(hwnd):
-                print("🔄 [SCROLL_SPEC] Window lost, reacquiring...")
-                hwnd = ensure_window_ready_and_focused()
-            
-            # Scroll up
-            pyautogui.moveTo(center_x, center_y, duration=0)
-            pyautogui.scroll(500)
-            time.sleep(1.5)
-            scroll_count += 1
-            print(f"⬆️ [SCROLL_SPEC] Scroll {scroll_count}/{max_scrolls} completed")
-            hud.print(f"⬆️ Scrolling... ({scroll_count}/{max_scrolls})", "navigating")
-            update_operation_status(f"Scrolling to find {project_title} ({scroll_count}/{max_scrolls})...")
-            
-            # Analyze context after scroll
-            on_all, on_project, project_found, context = analyze_current_page_context(
-                hwnd, specific_url, project_title
-            )
-            
-            print(f"📊 [SCROLL_SPEC] After scroll {scroll_count} context: {context}, on_project={on_project}, project_found={project_found}")
-            
-            # If project found, we're done
-            if project_found:
-                print(f"✅ [SCROLL_SPEC] Target found after scroll {scroll_count}")
-                hud.print(f"✅ {project_title} verified", "success")
-                update_operation_status(f"Found {project_title} after scrolling")
-                return True, True, hwnd
-            
-            # If not on project page anymore, navigate back
-            if not on_project:
-                print("⚠️ [SCROLL_SPEC] Not on project page anymore - navigating back")
-                hud.print("⚠️ Page context lost", "warning")
-                update_operation_status(f"Page context lost, returning to project page...")
-                fast_paste_url(hwnd, specific_url)
-                time.sleep(3)
-                return scroll_in_specific_project(hwnd, specific_url, project_title, depth + 1)
-        
-        # After max scrolls, if not found, navigate back to all projects
-        print("❌ [SCROLL_SPEC] Target not found after max scroll attempts - navigating back to all projects")
-        hud.print("❌ Project not found, returning...", "error")
-        error_msg = f"Could not find {project_title} on project page after scrolling"
-        update_operation_status(error_msg, is_error=True)
-        abort_operation(error_msg)
-        fast_paste_url(hwnd, specific_url)
-        time.sleep(3)
-        return False, False, hwnd
-
-    # ============================================
-    # SECTION 5: VERTICAL DOT OPERATIONS WITH SELF-HEALING
+    # SECTION 3: DOWNLOAD AND EXTRACTION HELPERS (from operate_google_flow_browser)
     # ============================================
     
     def check_download_status(hwnd, timeout_seconds=300, check_interval=0.1):
@@ -1713,45 +2133,45 @@ def operate_google_flow_browser():
                                                             return True, new_zip_path, new_zip_name
                                                 except Exception:
                                                     pass
-                                else:
-                                    # File exists in our tracking, check if it's updated (size changed)
-                                    if entry.name in existing_zips:
-                                        try:
-                                            stat = entry.stat()
-                                            current_size = stat.st_size
-                                            existing_size = existing_zips[entry.name]['size']
+                                    else:
+                                        # File exists in our tracking, check if it's updated (size changed)
+                                        if entry.name in existing_zips:
+                                            try:
+                                                stat = entry.stat()
+                                                current_size = stat.st_size
+                                                existing_size = existing_zips[entry.name]['size']
+                                                
+                                                # If size changed significantly, it might be a new version
+                                                if abs(current_size - existing_size) > 10000:  # More than 10KB difference
+                                                    if os.name == 'nt':
+                                                        current_time = stat.st_ctime
+                                                    else:
+                                                        current_time = stat.st_mtime
+                                                    
+                                                    print(f"🔄 [DOWNLOAD_STATUS] File {entry.name} updated! Size: {existing_size} → {current_size}")
+                                                    # Update tracking
+                                                    existing_zips[entry.name]['size'] = current_size
+                                                    existing_zips[entry.name]['time'] = current_time
+                                                    
+                                                    # Check if this update is different from latest known
+                                                    if latest_known_zip == entry.name:
+                                                        # Update latest known time
+                                                        latest_known_time = current_time
+                                                        print(f"📁 [DOWNLOAD_STATUS] Updated latest known timestamp for {entry.name}")
+                                            except Exception:
+                                                pass
                                             
-                                            # If size changed significantly, it might be a new version
-                                            if abs(current_size - existing_size) > 10000:  # More than 10KB difference
-                                                if os.name == 'nt':
-                                                    current_time = stat.st_ctime
-                                                else:
-                                                    current_time = stat.st_mtime
-                                                
-                                                print(f"🔄 [DOWNLOAD_STATUS] File {entry.name} updated! Size: {existing_size} → {current_size}")
-                                                # Update tracking
-                                                existing_zips[entry.name]['size'] = current_size
-                                                existing_zips[entry.name]['time'] = current_time
-                                                
-                                                # Check if this update is different from latest known
-                                                if latest_known_zip == entry.name:
-                                                    # Update latest known time
-                                                    latest_known_time = current_time
-                                                    print(f"📁 [DOWNLOAD_STATUS] Updated latest known timestamp for {entry.name}")
-                                        except Exception:
-                                            pass
-                                        
                 except Exception as e:
                     print(f"⚠️ [DOWNLOAD_STATUS] Error checking for new zip: {e}")
                 
                 # ============================================
-                # PART 2: MONITOR SCREEN FOR DOWNLOADING TEXT (FAST OCR)
+                # PART 2: MONITOR SCREEN FOR DOWNLOADING TEXT (FAST vision using JSON)
                 # ============================================
-                # Ensure window has focus for accurate OCR
+                # Ensure window has focus for accurate vision
                 enforce_window_focus(hwnd)
                 
-                # Get current screen text with fast OCR
-                current_texts = safe_ocr()
+                # Get current screen text with fast vision (now uses JSON format)
+                current_texts = safe_vision()
                 downloading_found = False
                 
                 # Search for "downloading items" or similar phrases
@@ -2282,8 +2702,8 @@ def operate_google_flow_browser():
             except:
                 pass
             return False, 0, 0
-     
-    def find_and_click_vertical_dot(hwnd, specific_url, project_title, depth=0, expected_images=None):
+    
+    def find_and_click_vertical_dot(hwnd, google_flow_url, project_title, depth=0, expected_images=None):
         """Searches for vertical dot menu and initiates download with context analysis."""
         try:
             check_for_termination()
@@ -2297,32 +2717,6 @@ def operate_google_flow_browser():
             
             print("🔘 [DOT] Starting download sequence...")
             update_operation_status(f"Initiating download for {project_title}...")
-            
-            # Analyze current page context
-            on_all, on_project, project_found, context = analyze_current_page_context(
-                hwnd, specific_url, project_title
-            )
-            
-            print(f"📊 [DOT] Initial context: {context}, on_project={on_project}, project_found={project_found}")
-            
-            # If not on project page, navigate
-            if not on_project:
-                print("❌ [DOT] Not on project page - navigating...")
-                hud.print("❌ Navigating to project...", "error")
-                update_operation_status(f"Not on {project_title} page, navigating...")
-                fast_paste_url(hwnd, specific_url)
-                time.sleep(3)
-                return find_and_click_vertical_dot(hwnd, specific_url, project_title, depth + 1, expected_images)
-            
-            # If on wrong project, navigate
-            if on_project and not project_found:
-                print("❌ [DOT] Project name not found - navigating back")
-                hud.print("❌ Project mismatch, navigating...", "error")
-                error_msg = f"Project name mismatch: {project_title} not found on page"
-                update_operation_status(error_msg, is_error=True)
-                fast_paste_url(hwnd, specific_url)
-                time.sleep(3)
-                return find_and_click_vertical_dot(hwnd, specific_url, project_title, depth + 1, expected_images)
             
             enforce_window_focus(hwnd)
             
@@ -2340,8 +2734,8 @@ def operate_google_flow_browser():
             
             region = (region_left, region_top, region_width, region_height)
             
-            dot_1_path = os.path.join(GUI_IMAGE_PATH, "vertical_dot_1.png")
-            dot_2_path = os.path.join(GUI_IMAGE_PATH, "vertical_dot_2.png")
+            dot_1_path = os.path.join(GUI_IMAGES, "vertical_dot_1.png")
+            dot_2_path = os.path.join(GUI_IMAGES, "vertical_dot_2.png")
             
             found_location = None
             used_image = None
@@ -2395,7 +2789,7 @@ def operate_google_flow_browser():
                 pyautogui.moveTo(center_x, center_y, duration=0)
                 pyautogui.scroll(-300)
                 time.sleep(1)
-                return find_and_click_vertical_dot(hwnd, specific_url, project_title, depth + 1, expected_images)
+                return find_and_click_vertical_dot(hwnd, google_flow_url, project_title, depth + 1, expected_images)
             
             x, y = found_location
             print(f"🎯 [DOT] Selecting at position ({x}, {y})")
@@ -2404,7 +2798,7 @@ def operate_google_flow_browser():
             if not enforce_window_focus(hwnd):
                 print("❌ [WATCHDOG] Window not focusable before selection")
                 hwnd = ensure_window_ready_and_focused()
-                return find_and_click_vertical_dot(hwnd, specific_url, project_title, depth + 1, expected_images)
+                return find_and_click_vertical_dot(hwnd, google_flow_url, project_title, depth + 1, expected_images)
             
             pyautogui.moveTo(x, y, duration=0.2)
             pyautogui.click()
@@ -2424,7 +2818,7 @@ def operate_google_flow_browser():
                     hwnd = ensure_window_ready_and_focused()
                     continue
                 
-                current_texts = safe_ocr()
+                current_texts = safe_vision()
                 
                 if not current_texts:
                     print(f"⚠️ [WATCHDOG] No text found during download search (attempt {attempt+1})")
@@ -2454,14 +2848,14 @@ def operate_google_flow_browser():
                 hud.print("🔄 Retrying download search...", "warning")
                 error_msg = f"Could not find download option for {project_title}"
                 update_operation_status(error_msg, is_error=True)
-                return find_and_click_vertical_dot(hwnd, specific_url, project_title, depth + 1, expected_images)
+                return find_and_click_vertical_dot(hwnd, google_flow_url, project_title, depth + 1, expected_images)
             
             click_x, click_y = download_click_position
             
             if not enforce_window_focus(hwnd):
                 print("❌ [WATCHDOG] Window not focusable before download selection")
                 hwnd = ensure_window_ready_and_focused()
-                return find_and_click_vertical_dot(hwnd, specific_url, project_title, depth + 1, expected_images)
+                return find_and_click_vertical_dot(hwnd, google_flow_url, project_title, depth + 1, expected_images)
             
             pyautogui.moveTo(click_x, click_y, duration=0.2)
             pyautogui.click()
@@ -2518,7 +2912,7 @@ def operate_google_flow_browser():
             update_operation_status(error_msg, is_error=True)
             print("🔄 [DOT] Attempting recovery...")
             hwnd = ensure_window_ready_and_focused()
-            return find_and_click_vertical_dot(hwnd, specific_url, project_title, depth + 1, expected_images)
+            return find_and_click_vertical_dot(hwnd, google_flow_url, project_title, depth + 1, expected_images)
     
     def dismiss_download_modal_if_present(hwnd):
         """
@@ -2530,8 +2924,8 @@ def operate_google_flow_browser():
         print(f"🔍 [MODAL] Checking for download modal using icon recognition...")
         
         # Define paths to download icon images
-        downloads_icon1_path = os.path.join(GUI_IMAGE_PATH, "downloads_icon1.png")
-        downloads_icon2_path = os.path.join(GUI_IMAGE_PATH, "downloads_icon2.png")
+        downloads_icon1_path = os.path.join(GUI_IMAGES, "downloads_icon1.png")
+        downloads_icon2_path = os.path.join(GUI_IMAGES, "downloads_icon2.png")
         
         # Check if image files exist
         if not os.path.exists(downloads_icon1_path) and not os.path.exists(downloads_icon2_path):
@@ -2617,68 +3011,161 @@ def operate_google_flow_browser():
             print(f"ℹ️ [MODAL] No downloads icon found - no modal to dismiss")
         
         return hwnd
-      
+
     # ============================================
-    # SECTION 6: MAIN EXECUTION FLOW - NEVER EXITS UNLESS CRITICAL
+    # SECTION 4: MAIN GOOGLE FLOW WORKFLOW WITH DOWNLOAD
     # ============================================
-    def perform_navigation_and_restart(hwnd, url, operation_name="navigation"):
-        """Perform navigation and then restart the entire operation from beginning"""
-        print(f"🔄 [RESTART] {operation_name} - navigating to {url} and restarting operation")
-        hud.print(f"🔄 Restarting operation after {operation_name}...", "warning")
-        update_operation_status(f"Restarting operation after {operation_name}...")
-        
-        # Navigate to the destination
-        fast_paste_url(hwnd, url)
-        time.sleep(3)
-        
-        # Ensure window is ready after navigation
-        hwnd = ensure_window_ready_and_focused()
-        
-        # CRITICAL: Restart the entire operation by calling main()
-        print(f"🔄 [RESTART] Operation restarting from beginning after {operation_name}")
-        hud.print("🔄 Operation restarting...", "warning")
-        update_operation_status(f"Operation restarting after {operation_name}")
-        time.sleep(1)
-        
-        # Call main() to restart the entire workflow
-        main()
-        return  # This will never be reached if main() runs properly
-        
-    def main():
+    
+    def main_google_flow_workflow_with_restart(hwnd=None, google_flow_url=None, depth=0, expected_images=None):
+        """
+        Main Google Flow workflow execution with restart capability.
+        Simple: Open Edge, launch URL, wait for "all media" to appear.
+        Then initiate download, monitor, extract, and validate.
+        Uses case-insensitive and normalized text matching with JSON format parsing.
+        """
+        try:
+            # Load panel data once at the beginning
+            if not os.path.exists(PANEL_PATH):
+                print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
+                update_operation_status("panel.json not found", is_error=True)
+                return False
+            
+            with open(PANEL_PATH, 'r', encoding='utf-8') as file:
+                panel_data = json.load(file)
+            
+            # Navigate to google_flow_config
+            google_flow_config = panel_data.get('google_flow_config', {})
+            operate_google_flow = google_flow_config.get('operate_google_flow', False)
+            
+            if not operate_google_flow:
+                print("ℹ️ Google Flow operation is disabled in config")
+                hud.print("ℹ️ Google Flow operation disabled", "info")
+                update_operation_status("Google Flow operation is disabled in configuration")
+                return False
+            
+            # Get Google Flow project link
+            if google_flow_url is None:
+                google_flow_url = google_flow_config.get('google_flow_project_link')
+                if not google_flow_url or not google_flow_url.strip():
+                    print("❌ Error: 'google_flow_project_link' not configured")
+                    hud.print("❌ No Google Flow URL configured", "error")
+                    error_msg = "No Google Flow URL configured in google_flow_config"
+                    update_operation_status(error_msg, is_error=True)
+                    return False
+            
+            # Get expected images count
+            if expected_images is None:
+                expected_images = google_flow_config.get('expected_projectlink_images')
+                if expected_images is not None:
+                    print(f"📊 [CONFIG] Expected images: {expected_images}")
+                else:
+                    print(f"ℹ️ [CONFIG] No expected image count specified")
+            
+            # Get project title (from root level)
+            project_title = panel_data.get('project_title', 'google_flow_project')
+            
+            if hwnd is None:
+                hwnd = ensure_window_ready_and_focused()
+                print(f"🪟 [GOOGLE_FLOW] Browser ready (HWND: {hwnd})")
+            
+            print(f"🎬 [GOOGLE_FLOW] Starting Google Flow workflow (depth {depth})...")
+            print(f"🌐 [GOOGLE_FLOW] URL: {google_flow_url}")
+            print(f"📁 [GOOGLE_FLOW] Project: '{project_title}'")
+            print(f"🔍 [GOOGLE_FLOW] Using case-insensitive, normalized text matching with JSON format")
+            update_operation_status(f"Starting Google Flow workflow for {project_title}")
+            
+            # Step 1: Load the Google Flow URL
+            print(f"🔍 [GOOGLE_FLOW] Step 1: Loading Google Flow URL...")
+            success, hwnd = load_google_flow_url(hwnd, google_flow_url)
+            if not success:
+                print(f"❌ [GOOGLE_FLOW] Failed to load Google Flow URL")
+                error_msg = f"Failed to load Google Flow URL"
+                update_operation_status(error_msg, is_error=True)
+                return False
+            
+            # Step 2: Verify page loaded using "all media" detection with normalized matching
+            print(f"🔍 [GOOGLE_FLOW] Step 2: Verifying page loaded with 'all media' detection (case-insensitive, normalized)...")
+            success, hwnd = verify_google_flow_page_loaded(hwnd, max_attempts=10)
+            if not success:
+                print(f"❌ [GOOGLE_FLOW] Page verification failed")
+                error_msg = f"Page verification failed for Google Flow"
+                update_operation_status(error_msg, is_error=True)
+                return False
+            
+            print("✅ [GOOGLE_FLOW] Page loaded and verified! Proceeding to download...")
+            update_operation_status(f"Page verified, initiating download for {project_title}...")
+            
+            # Step 3: Find and click vertical dot to initiate download
+            print(f"🔘 [GOOGLE_FLOW] Step 3: Initiating download...")
+            download_success = find_and_click_vertical_dot(
+                hwnd, 
+                google_flow_url, 
+                project_title,
+                expected_images=expected_images
+            )
+            
+            if download_success:
+                print("🎉 [GOOGLE_FLOW] Download and extraction completed successfully!")
+                hud.print("🎉 Google Flow workflow complete!", "success")
+                update_operation_status(f"Google Flow operation for {project_title} completed successfully", is_success=True)
+                return True
+            else:
+                print(f"❌ [GOOGLE_FLOW] Download failed for {project_title}")
+                error_msg = f"Download failed for {project_title}"
+                update_operation_status(error_msg, is_error=True)
+                return False
+            
+        except KeyboardInterrupt as ki:
+            update_operation_status("Google Flow operation manually terminated by user", is_abort=True)
+            hud.show_summary("🛑 Program Halted")
+            print(f"\n✅ Program successfully halted: {ki}")
+            return False
+        except SystemExit as se:
+            # This is expected from abort_operation
+            print(f"🛑 System exit: {se}")
+            return False
+        except Exception as e:
+            print(f"❌ [GOOGLE_FLOW] Error: {e}")
+            error_msg = f"Error in Google Flow workflow: {str(e)}"
+            update_operation_status(error_msg, is_error=True)
+            hud.print("❌ Error occurred", "error")
+            return False
+        finally:
+            try:
+                keyboard.remove_hotkey('alt+/')
+                print("🧹 Cleaned up hotkey")
+            except Exception:
+                pass
+
+    def main_google_flow_workflow():
+        """Wrapper for main Google Flow workflow with restart capability."""
         try:
             if not os.path.exists(PANEL_PATH):
                 print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
                 update_operation_status("panel.json not found", is_error=True)
                 return
-        
+            
             with open(PANEL_PATH, 'r', encoding='utf-8') as file:
                 panel_data = json.load(file)
             
-            # ===== CHECK IF OPERATION WAS ALREADY ABORTED =====
-            existing_status = panel_data.get('operation_status', '')
-            
-            # Check if the existing status contains abortion indicators
-            if 'aborting' in existing_status.lower() or 'aborted' in existing_status.lower():
-                print(f"🛑 [SYNC] Operation was previously aborted: '{existing_status}'")
-                print(f"🛑 [SYNC] Skipping Google Flow operation to maintain sync")
-                hud.print("🛑 Operation was aborted - skipping", "error")
-                update_operation_status("Operation was previously aborted - skipping Google Flow", is_abort=True)
-                return
-            
-            # Get google_flow_config
+            # Navigate to google_flow_config
             google_flow_config = panel_data.get('google_flow_config', {})
-            
-            # Check if Google Flow operation is enabled
             operate_google_flow = google_flow_config.get('operate_google_flow', False)
+            
             if not operate_google_flow:
                 print("ℹ️ Google Flow operation is disabled in config")
                 hud.print("ℹ️ Google Flow operation disabled", "info")
                 update_operation_status("Google Flow operation is disabled in configuration")
                 return
             
-            # Get URLs from the nested config
-            all_project_url = google_flow_config.get('google_flow_url')
-            google_flow_project_link = google_flow_config.get('google_flow_project_link')
+            # Get Google Flow project link
+            google_flow_url = google_flow_config.get('google_flow_project_link')
+            if not google_flow_url or not google_flow_url.strip():
+                print("❌ Error: 'google_flow_project_link' not configured")
+                hud.print("❌ No Google Flow URL configured", "error")
+                error_msg = "No Google Flow URL configured in google_flow_config"
+                update_operation_status(error_msg, is_error=True)
+                return
             
             # Get expected images count
             expected_images = google_flow_config.get('expected_projectlink_images')
@@ -2687,478 +3174,1553 @@ def operate_google_flow_browser():
             else:
                 print(f"ℹ️ [CONFIG] No expected image count specified")
             
-            # Get project title from the root level
-            project_title = panel_data.get('project_title')
+            # Initialize browser window
+            hwnd = ensure_window_ready_and_focused()
+            print(f"🪟 [MAIN] Browser ready (HWND: {hwnd})")
+            update_operation_status("Browser initialized for Google Flow operation")
             
-            if project_title:
-                project_title = project_title.strip()
+            success = main_google_flow_workflow_with_restart(
+                hwnd=hwnd,
+                google_flow_url=google_flow_url,
+                depth=0,
+                expected_images=expected_images
+            )
             
-            print(f"🌐 [MAIN] All Projects URL: {all_project_url}")
-            print(f"🌐 [MAIN] Project Name: [HIDDEN]")
-            print(f"🌐 [MAIN] Project Link: {google_flow_project_link if google_flow_project_link else '[EMPTY]'}")
-            
-            # CRITICAL: Only exit if these are missing
-            if not all_project_url and not google_flow_project_link:
-                print("❌ Error: Neither 'google_flow_url' nor 'google_flow_project_link' configured.")
-                update_operation_status("Error: Neither Google Flow URL nor project link is configured", is_error=True)
-                return
-            
-            # CRITICAL: Exit if project name is empty when using all projects workflow
-            if all_project_url and (not project_title or not project_title.strip()):
-                print("❌ Error: 'project_title' is empty or missing.")
-                update_operation_status("Error: Project title is empty or missing", is_error=True)
-                return
-            
-            # Update initial status
-            update_operation_status(f"Starting Google Flow operation for {project_title}")
-            
-            # Ensure browser is ready
-            hwnd_to_use = ensure_window_ready_and_focused()
-            current_monitor = get_current_monitor()
-            monitor_left, monitor_top, monitor_right, monitor_bottom = current_monitor
-            monitor_width = monitor_right - monitor_left
-            monitor_height = monitor_bottom - monitor_top
-            print(f"🖥️ [MAIN] Monitor bounds: ({monitor_left}, {monitor_top}) to ({monitor_right}, {monitor_bottom})")
-            print(f"📐 [MAIN] Monitor size: {monitor_width} x {monitor_height} pixels")
-            
-            time.sleep(0.5)
-            
-            # ============================================
-            # FLOW 1: DIRECT PROJECT LINK PROVIDED - SIMPLIFIED
-            # ============================================
-            
-            if google_flow_project_link and google_flow_project_link.strip():
-                print("🚀 [ROUTING] Project link detected - loading directly...")
-                update_operation_status(f"Loading {project_title} from direct link...")
-                
-                # Navigate to the project link
-                fast_paste_url(hwnd_to_use, google_flow_project_link)
-                hwnd_to_use = ensure_window_ready_and_focused()
-                
-                # Wait a moment for the page to render
-                time.sleep(2)
-                
-                print("🔍 [MAIN] Looking for project name immediately...")
-                update_operation_status(f"Verifying {project_title} on page...")
-                
-                # FIRST: Try to find the project name directly
-                current_texts = safe_ocr()
-                clean_project_title = clean_string_completely(project_title)
-                project_found = False
-                
-                if current_texts:
-                    for element in current_texts:
-                        if clean_project_title in clean_string_completely(element['text']):
-                            element_text = element['text'].lower()
-                            # Skip UI text that isn't the project card
-                            if "new project" not in element_text and "all media" not in element_text:
-                                project_found = True
-                                print(f"✅ [MAIN] Project name found immediately!")
-                                hud.print("✅ Project found!", "success")
-                                update_operation_status(f"Successfully verified {project_title} on page")
-                                break
-                
-                # If project name found, proceed directly to download
-                if project_found:
-                    print("🚀 [MAIN] Project verified - proceeding directly to download...")
-                    hud.print("🚀 Proceeding to download...", "success")
-                    update_operation_status(f"Proceeding to download {project_title}...")
-                    
-                    # Scroll to make sure the page is ready
-                    scroll_complete, found_after_scroll, recovered_hwnd = scroll_in_specific_project(
-                        hwnd_to_use, google_flow_project_link, project_title
-                    )
-                    
-                    if recovered_hwnd != hwnd_to_use:
-                        hwnd_to_use = recovered_hwnd
-                        print("🔄 [MAIN] Window recovered after scrolling")
-                    
-                    # Proceed to download immediately
-                    success = find_and_click_vertical_dot(
-                        hwnd_to_use, 
-                        google_flow_project_link, 
-                        project_title,
-                        expected_images=expected_images
-                    )
-                    
-                    if success:
-                        update_operation_status(f"Google Flow operation for {project_title} completed successfully", is_success=True)
-                        hud.print("✅ Operation complete!", "success")
-                        print("✅ [VERIFICATION] Download initiated successfully!")
-                        return
-                    else:
-                        print("⚠️ [MAIN] Download flow incomplete, retrying...")
-                        hud.print("🔄 Retrying download...", "warning")
-                        update_operation_status(f"Download flow incomplete for {project_title}, retrying...", is_error=True)
-                        time.sleep(2)
-                        # Try one more time with recovery
-                        return main()
-                
-                # SECOND: If project name not found, use the existing recovery mechanisms
-                print("⚠️ [MAIN] Project name not found immediately - using recovery flow")
-                hud.print("🔄 Project not found - checking page...", "warning")
-                update_operation_status(f"Project {project_title} not found immediately, running recovery...")
-                
-                # Now use the existing recovery logic
-                max_attempts = 5
-                attempt = 0
-                success = False
-                
-                while attempt < max_attempts and not success:
-                    attempt += 1
-                    print(f"🔄 [MAIN] Recovery attempt {attempt}/{max_attempts}...")
-                    update_operation_status(f"Recovery attempt {attempt}/{max_attempts} for {project_title}...")
-                    
-                    # Analyze current page context
-                    on_all, on_project, project_found_recovery, context = analyze_current_page_context(
-                        hwnd_to_use, google_flow_project_link, project_title
-                    )
-                    
-                    print(f"📊 [MAIN] Recovery context: {context}, on_project={on_project}, project_found={project_found_recovery}")
-                    
-                    if on_project:
-                        print("✅ [MAIN] On project page (recovery mode)")
-                        hud.print("✅ On project page", "success")
-                        update_operation_status(f"On {project_title} project page (recovery mode)")
-                        
-                        page_ready, name_verified, recovered_hwnd = wait_for_specific_page_ready(
-                            hwnd_to_use, google_flow_project_link, project_title
-                        )
-                        
-                        if recovered_hwnd != hwnd_to_use:
-                            hwnd_to_use = recovered_hwnd
-                            print("🔄 [MAIN] Window recovered after page ready")
-                        
-                        if page_ready:
-                            print("✅ [MAIN] Project page ready, proceeding to download...")
-                            hud.print("🚀 Proceeding...", "success")
-                            update_operation_status(f"Project page ready, proceeding to download {project_title}...")
-                            
-                            scroll_complete, found_after_scroll, recovered_hwnd = scroll_in_specific_project(
-                                hwnd_to_use, google_flow_project_link, project_title
-                            )
-                            
-                            if recovered_hwnd != hwnd_to_use:
-                                hwnd_to_use = recovered_hwnd
-                                print("🔄 [MAIN] Window recovered after scrolling")
-                            
-                            if scroll_complete:
-                                print("✅ [MAIN] Project verified")
-                                hud.print(f"✅ {project_title} verified", "success")
-                                update_operation_status(f"Successfully verified {project_title}")
-                                
-                                # Pass expected_images to download function
-                                success = find_and_click_vertical_dot(
-                                    hwnd_to_use, 
-                                    google_flow_project_link, 
-                                    project_title,
-                                    expected_images=expected_images
-                                )
-                                
-                                if success:
-                                    update_operation_status(f"Google Flow operation for {project_title} completed successfully", is_success=True)
-                                    hud.print("✅ Operation complete!", "success")
-                                    print("✅ [VERIFICATION] All checks passed and download initiated!")
-                                    return
-                                else:
-                                    print("⚠️ [MAIN] Download flow incomplete, retrying...")
-                                    hud.print("🔄 Retrying download...", "warning")
-                                    update_operation_status(f"Download flow incomplete for {project_title}, retrying...", is_error=True)
-                                    time.sleep(2)
-                            else:
-                                print("⚠️ [MAIN] Project verification incomplete, retrying...")
-                                hud.print("🔄 Retrying verification...", "warning")
-                                update_operation_status(f"Project verification incomplete for {project_title}, retrying...", is_error=True)
-                                time.sleep(2)
-                        else:
-                            print("⚠️ [MAIN] Page not ready, retrying...")
-                            hud.print("🔄 Retrying page load...", "warning")
-                            update_operation_status(f"Page not ready for {project_title}, retrying...", is_error=True)
-                            time.sleep(2)
-                    else:
-                        print("⚠️ [MAIN] Not on project page - refreshing and trying again...")
-                        hud.print("🔄 Refreshing page...", "warning")
-                        update_operation_status(f"Not on {project_title} page, refreshing...")
-                        fast_paste_url(hwnd_to_use, google_flow_project_link)
-                        time.sleep(3)
-                        hwnd_to_use = ensure_window_ready_and_focused()
-                
-                # If we exhausted attempts, restart the whole process
-                print("🔄 [MAIN] Max recovery attempts reached, restarting...")
-                hud.print("🔄 Restarting operation...", "warning")
-                error_msg = f"Max recovery attempts reached for {project_title}, restarting..."
+            if success:
+                print("✅ [MAIN] Google Flow workflow completed successfully!")
+                update_operation_status("Google Flow workflow completed successfully", is_success=True)
+            else:
+                print("❌ [MAIN] Google Flow workflow failed after multiple attempts")
+                error_msg = "Google Flow workflow failed after multiple attempts"
                 update_operation_status(error_msg, is_error=True)
-                time.sleep(2)
-                perform_navigation_and_restart(hwnd_to_use, google_flow_project_link, "max recovery attempts")
-                return
-            
-            # ============================================
-            # FLOW 2: ALL PROJECTS WORKFLOW - UNCHANGED
-            # ============================================
-            
-            if all_project_url and all_project_url.strip():
-                # ... (keep the existing ALL PROJECTS WORKFLOW code unchanged) ...
-                print("🚀 [ROUTING] Using All Projects page workflow...")
-                hud.print("📋 Navigating to projects list...", "navigating")
-                update_operation_status(f"Navigating to All Projects page for {project_title}...")
                 
-                # Keep retrying until we succeed
-                max_attempts = 5
-                attempt = 0
-                success = False
-                
-                while attempt < max_attempts and not success:
-                    attempt += 1
-                    print(f"🔄 [MAIN] Attempt {attempt}/{max_attempts} for all projects workflow...")
-                    update_operation_status(f"Attempt {attempt}/{max_attempts} for {project_title}...")
-                    
-                    # Analyze current page context
-                    on_all, on_project, project_found, context = analyze_current_page_context(
-                        hwnd_to_use, all_project_url, project_title
-                    )
-                    
-                    print(f"📊 [MAIN] Page context: {context}, on_all={on_all}, on_project={on_project}, project_found={project_found}")
-                    
-                    # CRITICAL FIX: If on project page AND project found, skip selection and go to download
-                    if on_project and project_found:
-                        print("✅ [MAIN] Already on target project page - skipping card selection")
-                        hud.print("✅ On target page", "success")
-                        update_operation_status(f"Already on {project_title} project page")
-                        
-                        page_ready, name_verified, recovered_hwnd = wait_for_specific_page_ready(
-                            hwnd_to_use, all_project_url, project_title
-                        )
-                        
-                        if recovered_hwnd != hwnd_to_use:
-                            hwnd_to_use = recovered_hwnd
-                            print("🔄 [MAIN] Window recovered after page ready")
-                        
-                        if page_ready:
-                            print("✅ [MAIN] Project page ready, proceeding to download...")
-                            hud.print("🚀 Proceeding...", "success")
-                            update_operation_status(f"Project page ready, proceeding to download {project_title}...")
-                            
-                            scroll_complete, found_after_scroll, recovered_hwnd = scroll_in_specific_project(
-                                hwnd_to_use, all_project_url, project_title
-                            )
-                            
-                            if recovered_hwnd != hwnd_to_use:
-                                hwnd_to_use = recovered_hwnd
-                                print("🔄 [MAIN] Window recovered after scrolling")
-                            
-                            if scroll_complete:
-                                print("✅ [MAIN] Project verified")
-                                hud.print(f"✅ {project_title} verified", "success")
-                                update_operation_status(f"Successfully verified {project_title}")
-                                
-                                # Pass expected_images to download function
-                                success = find_and_click_vertical_dot(
-                                    hwnd_to_use, 
-                                    all_project_url, 
-                                    project_title,
-                                    expected_images=expected_images
-                                )
-                                
-                                if success:
-                                    update_operation_status(f"Google Flow operation for {project_title} completed successfully", is_success=True)
-                                    hud.print("✅ Operation complete!", "success")
-                                    print("✅ [VERIFICATION] All checks passed and download initiated!")
-                                    return
-                                else:
-                                    print("⚠️ [MAIN] Download flow incomplete, retrying...")
-                                    hud.print("🔄 Retrying download...", "warning")
-                                    update_operation_status(f"Download flow incomplete for {project_title}, retrying...", is_error=True)
-                                    time.sleep(2)
-                            else:
-                                print("⚠️ [MAIN] Project verification incomplete, retrying...")
-                                hud.print("🔄 Retrying verification...", "warning")
-                                update_operation_status(f"Project verification incomplete for {project_title}, retrying...", is_error=True)
-                                time.sleep(2)
-                        else:
-                            print("⚠️ [MAIN] Page not ready, retrying...")
-                            hud.print("🔄 Retrying page load...", "warning")
-                            update_operation_status(f"Page not ready for {project_title}, retrying...", is_error=True)
-                            time.sleep(2)
-                        continue
-                    
-                    # If on wrong project page, navigate to all projects
-                    if on_project and not project_found:
-                        print("⚠️ [MAIN] On wrong project page - navigating to all projects")
-                        hud.print("⚠️ Wrong project, navigating...", "warning")
-                        update_operation_status(f"Wrong project detected, navigating to projects list...")
-                        fast_paste_url(hwnd_to_use, all_project_url)
-                        time.sleep(3)
-                        # RESTART: We navigated to all projects, so restart the operation
-                        perform_navigation_and_restart(hwnd_to_use, all_project_url, "wrong project navigation")
-                        return
-                    
-                    # If context unknown, navigate to all projects
-                    if context == "unknown":
-                        print("⚠️ [MAIN] Page context unknown - navigating to all projects")
-                        update_operation_status(f"Page context unknown, navigating to projects list...")
-                        fast_paste_url(hwnd_to_use, all_project_url)
-                        time.sleep(3)
-                        hwnd_to_use = ensure_window_ready_and_focused()
-                        # RESTART: We navigated to all projects, so restart the operation
-                        perform_navigation_and_restart(hwnd_to_use, all_project_url, "unknown context navigation")
-                        return
-                    
-                    # If not on all projects, navigate there
-                    if not on_all:
-                        fast_paste_url(hwnd_to_use, all_project_url)
-                        time.sleep(3)
-                        hwnd_to_use = ensure_window_ready_and_focused()
-                        # RESTART: We navigated to all projects, so restart the operation
-                        perform_navigation_and_restart(hwnd_to_use, all_project_url, "not on all projects navigation")
-                        return
-                    
-                    # Now we should be on all projects page
-                    page_ready, recovered_hwnd = wait_for_all_projects_page_ready(
-                        hwnd_to_use, all_project_url, project_title
-                    )
-                    
-                    if recovered_hwnd != hwnd_to_use:
-                        hwnd_to_use = recovered_hwnd
-                        print("🔄 [MAIN] Window recovered after page ready")
-                    
-                    if page_ready:
-                        print("✅ [MAIN] All Projects page ready")
-                        update_operation_status(f"All Projects page ready, searching for {project_title}...")
-                        
-                        card_found, card_element, recovered_hwnd = scroll_in_all_projects(
-                            hwnd_to_use, all_project_url, project_title
-                        )
-                        
-                        if recovered_hwnd != hwnd_to_use:
-                            hwnd_to_use = recovered_hwnd
-                            print("🔄 [MAIN] Window recovered after scrolling")
-                        
-                        # If we're already on the project page (card_element is None)
-                        if card_found and card_element is None:
-                            print("✅ [MAIN] Already on project page, proceeding to download...")
-                            hud.print("🚀 Proceeding...", "success")
-                            update_operation_status(f"Already on {project_title} page, proceeding to download...")
-                            
-                            # Pass expected_images to download function
-                            success = find_and_click_vertical_dot(
-                                hwnd_to_use, 
-                                all_project_url, 
-                                project_title,
-                                expected_images=expected_images
-                            )
-                            
-                            if success:
-                                update_operation_status(f"Google Flow operation for {project_title} completed successfully", is_success=True)
-                                hud.print("✅ Operation complete!", "success")
-                                print("✅ [VERIFICATION] All checks passed and download initiated!")
-                                return
-                            else:
-                                print("⚠️ [MAIN] Download flow incomplete, retrying...")
-                                hud.print("🔄 Retrying download...", "warning")
-                                update_operation_status(f"Download flow incomplete for {project_title}, retrying...", is_error=True)
-                                time.sleep(2)
-                                continue
-                        
-                        # We found a card to click
-                        if card_found and card_element:
-                            print("✅ [MAIN] Project card found - clicking it")
-                            hud.print("✅ Target located - clicking", "success")
-                            update_operation_status(f"Found {project_title} card, clicking...")
-                            
-                            click_success, recovered_hwnd = click_project_card(
-                                hwnd_to_use, card_element, all_project_url, project_title
-                            )
-                            
-                            if recovered_hwnd != hwnd_to_use:
-                                hwnd_to_use = recovered_hwnd
-                                print("🔄 [MAIN] Window recovered after selection")
-                            
-                            if click_success:
-                                print("✅ [MAIN] Project card selected, proceeding to download...")
-                                hud.print("🚀 Proceeding...", "success")
-                                update_operation_status(f"Successfully selected {project_title}, proceeding to download...")
-                                
-                                # Wait a bit for the page to load
-                                time.sleep(2)
-                                
-                                # Pass expected_images to download function
-                                success = find_and_click_vertical_dot(
-                                    hwnd_to_use, 
-                                    all_project_url, 
-                                    project_title,
-                                    expected_images=expected_images
-                                )
-                                
-                                if success:
-                                    update_operation_status(f"Google Flow operation for {project_title} completed successfully", is_success=True)
-                                    hud.print("✅ Operation complete!", "success")
-                                    print("✅ [VERIFICATION] All checks passed and download initiated!")
-                                    return
-                                else:
-                                    print("⚠️ [MAIN] Download flow incomplete, retrying...")
-                                    hud.print("🔄 Retrying download...", "warning")
-                                    update_operation_status(f"Download flow incomplete for {project_title}, retrying...", is_error=True)
-                                    time.sleep(2)
-                            else:
-                                print("⚠️ [MAIN] Failed to select project card, retrying...")
-                                hud.print("🔄 Retrying selection...", "warning")
-                                update_operation_status(f"Failed to select {project_title} card, retrying...", is_error=True)
-                                time.sleep(2)
-                        else:
-                            print("⚠️ [MAIN] Project card not found, retrying...")
-                            hud.print("🔄 Retrying search...", "warning")
-                            update_operation_status(f"Could not find {project_title} card, retrying...", is_error=True)
-                            time.sleep(2)
-                    else:
-                        print("⚠️ [MAIN] All Projects page not ready, retrying...")
-                        hud.print("🔄 Retrying page load...", "warning")
-                        update_operation_status(f"All Projects page not ready, retrying...", is_error=True)
-                        time.sleep(2)
-                
-                # If we exhausted attempts, restart the whole process
-                print("🔄 [MAIN] Max attempts reached, restarting...")
-                hud.print("🔄 Restarting operation...", "warning")
-                error_msg = f"Max attempts reached for {project_title}, restarting..."
-                update_operation_status(error_msg, is_error=True)
-                time.sleep(2)
-                perform_navigation_and_restart(hwnd_to_use, all_project_url, "max attempts reached")
-                return
-
         except KeyboardInterrupt as ki:
-            update_operation_status(f"Google Flow operation manually terminated by user", is_abort=True)
+            update_operation_status("Google Flow operation manually terminated by user", is_abort=True)
             hud.show_summary("🛑 Program Halted")
             print(f"\n✅ Program successfully halted: {ki}")
         except SystemExit as se:
             # This is expected from abort_operation
             print(f"🛑 System exit: {se}")
-            # The abort message is already in the status
         except Exception as e:
-            print(f"❌ Error caught: {e}")
-            error_msg = f"Unexpected error in main: {str(e)}"
+            print(f"❌ [MAIN] Error: {e}")
+            error_msg = f"Unexpected error in Google Flow operation: {str(e)}"
             update_operation_status(error_msg, is_error=True)
-            hud.print("🔄 Attempting recovery...", "warning")
-            print("🔄 [MAIN] Attempting global recovery...")
-            time.sleep(2)
-            # Restart the entire operation
-            try:
-                # Try to get current URL and restart
-                if all_project_url and all_project_url.strip():
-                    hwnd = ensure_window_ready_and_focused()
-                    perform_navigation_and_restart(hwnd, all_project_url, "exception recovery")
-                elif google_flow_project_link and google_flow_project_link.strip():
-                    hwnd = ensure_window_ready_and_focused()
-                    perform_navigation_and_restart(hwnd, google_flow_project_link, "exception recovery")
-                else:
-                    return main()
-            except:
-                pass
+            hud.print("❌ Error occurred", "error")
         finally:
             try:
                 keyboard.remove_hotkey('alt+/')
                 print("🧹 Cleaned up hotkey")
             except Exception:
                 pass
-    main()
+    
+    main_google_flow_workflow()
+
+def operate_turboscribe():
+    """
+    Launches/uses Microsoft Edge for Turboscribe operations.
+    Workflow:
+    1. Navigate to Turboscribe project URL
+    2. Confirm page loaded by detecting project title (case-insensitive, normalized)
+    3. Click on project title to focus/select it
+    4. Ctrl+A to select all text, Ctrl+C to copy
+    5. Save copied text to project's audio folder as {project_title}.txt
+    6. Clean up text: remove everything before "Speaker 1" and after "Ready to Go Unlimited?"
+    7. Delete existing audio files in the project's audio folder
+    8. Look for any download button (txt, pdf, srt, docx) - move mouse to it but DON'T click
+    9. Scroll down to reveal "download audio" button
+    10. Find and click "download audio" button
+    11. Monitor audio download
+    12. Move downloaded audio file to project's audio folder
+    13. Dismiss download modal when it appears
+    """
+    # --- SPEED TUNING PARAMETERS ---
+    pyautogui.PAUSE = 0.0
+    
+    if not os.path.exists(PANEL_PATH):
+        print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
+        return
+
+    with open(PANEL_PATH, 'r', encoding='utf-8') as file:
+        panel_data = json.load(file)
+
+    project_title = panel_data.get('project_title')
+    
+    terminate_automation = False
+    operation_status_flag = True
+    operation_status_message = ""
+    operation_aborted = False
+
+    def update_operation_status(message, is_error=False, is_abort=False, is_success=False):
+        nonlocal operation_status_message, operation_status_flag, operation_aborted
+        
+        try:
+            with open(PANEL_PATH, 'r', encoding='utf-8') as file:
+                current_panel = json.load(file)
+            
+            if is_abort:
+                operation_status_message = f"❌ ABORTED: {message}"
+                operation_status_flag = False
+                operation_aborted = True
+            elif is_error:
+                operation_status_message = f"⚠️ ERROR: {message}"
+                operation_status_flag = False
+            elif is_success:
+                operation_status_message = f"✅ {message}"
+                operation_status_flag = True
+            else:
+                operation_status_message = f"ℹ️ {message}"
+            
+            current_panel['operation_status'] = operation_status_message
+            
+            with open(PANEL_PATH, 'w', encoding='utf-8') as file:
+                json.dump(current_panel, file, indent=4, ensure_ascii=False)
+            
+            if is_abort:
+                print(f"🛑 [STATUS] Operation aborted: {message}")
+                raise SystemExit(f"Operation aborted: {message}")
+                
+        except Exception as e:
+            print(f"⚠️ [STATUS] Failed to update operation status: {e}")
+
+    def abort_operation(reason):
+        print(f"🛑 [ABORT] Aborting operation: {reason}")
+        update_operation_status(f"Aborting Turboscribe operation: {reason}", is_abort=True)
+
+    def check_operation_status():
+        if not operation_status_flag or operation_aborted:
+            print("🛑 [STATUS] Operation status is invalid - aborting")
+            update_operation_status("Operation status invalid - aborting Turboscribe operation", is_abort=True)
+            return False
+        return True
+
+    def on_terminate_shortcut():
+        nonlocal terminate_automation
+        hud.print("🛑 Manual Stop Triggered!", "warning")
+        print("🛑 Manual Stop Triggered!")
+        terminate_automation = True
+        update_operation_status("Turboscribe operation manually terminated by user (Alt+/)", is_abort=True)
+
+    keyboard.add_hotkey('alt+/', on_terminate_shortcut)
+
+    def check_for_termination():
+        if terminate_automation:
+            update_operation_status("Turboscribe operation terminated by user", is_abort=True)
+            raise KeyboardInterrupt("User forced exit via shortcut key.")
+        if not check_operation_status():
+            raise SystemExit("Operation status invalid")
+
+    # ============================================
+    # WINDOW MANAGEMENT HELPERS
+    # ============================================
+    
+    def get_current_monitor():
+        try:
+            cursor_pos = win32api.GetCursorPos()
+            monitor_info = win32api.GetMonitorInfo(win32api.MonitorFromPoint(cursor_pos))
+            return monitor_info['Monitor']
+        except Exception:
+            return (0, 0, win32api.GetSystemMetrics(win32con.SM_CXSCREEN), 
+                   win32api.GetSystemMetrics(win32con.SM_CYSCREEN))
+    
+    def get_edge_window_on_monitor(monitor_bounds):
+        monitor_left, monitor_top, monitor_right, monitor_bottom = monitor_bounds
+        edge_windows = []
+        edge_process_names = ["msedge.exe"]
+        
+        def enum_windows_callback(hwnd, windows):
+            if win32gui.IsWindowVisible(hwnd):
+                try:
+                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                    process = psutil.Process(pid)
+                    if process.name().lower() in edge_process_names:
+                        rect = win32gui.GetWindowRect(hwnd)
+                        left, top, right, bottom = rect
+                        width, height = right - left, bottom - top
+                        if width > 200 and height > 200:
+                            window_center_x = (left + right) / 2
+                            window_center_y = (top + bottom) / 2
+                            is_on_current_monitor = (
+                                monitor_left <= window_center_x <= monitor_right and
+                                monitor_top <= window_center_y <= monitor_bottom
+                            )
+                            if is_on_current_monitor:
+                                windows.append({'hwnd': hwnd, 'width': width, 'height': height})
+                except Exception:
+                    pass
+            return True
+        
+        win32gui.EnumWindows(enum_windows_callback, edge_windows)
+        edge_windows.sort(key=lambda w: w['width'] * w['height'], reverse=True)
+        return edge_windows
+
+    def ensure_edge_window_ready():
+        check_for_termination()
+        
+        current_monitor = get_current_monitor()
+        monitor_left, monitor_top, monitor_right, monitor_bottom = current_monitor
+        print(f"🖥️ [MONITOR] Bounds: ({monitor_left}, {monitor_top}) to ({monitor_right}, {monitor_bottom})")
+        print(f"📐 [MONITOR] Size: {monitor_right - monitor_left} x {monitor_bottom - monitor_top} pixels")
+        
+        edge_windows = get_edge_window_on_monitor(current_monitor)
+        
+        if edge_windows:
+            hwnd = edge_windows[0]['hwnd']
+            print(f"🪟 [WINDOW] Found existing Edge window handle: {hwnd}")
+            print(f"📏 [WINDOW] Size: {edge_windows[0]['width']} x {edge_windows[0]['height']}")
+            
+            try:
+                if win32gui.IsIconic(hwnd):
+                    print("🔄 [WINDOW] Window was minimized, restoring...")
+                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                    time.sleep(0.3)
+                
+                print("🔄 [WINDOW] Maximizing window...")
+                win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+                time.sleep(0.5)
+                
+                win32gui.SetForegroundWindow(hwnd)
+                time.sleep(0.2)
+                
+                print("✅ [WINDOW] Window ready - maximized and focused")
+                update_operation_status("Browser window ready for Turboscribe operation")
+                return hwnd
+            except Exception as e:
+                print(f"⚠️ [WINDOW] Error preparing existing window: {e}")
+                pass
+        
+        print("💻 [WINDOW] No Edge window found, launching new instance...")
+        update_operation_status("Launching browser for Turboscribe operation...")
+        subprocess.Popen([edge_path, "about:blank"])
+        
+        for attempt in range(20):
+            check_for_termination()
+            time.sleep(0.5)
+            edge_windows = get_edge_window_on_monitor(current_monitor)
+            if edge_windows:
+                hwnd = edge_windows[0]['hwnd']
+                print(f"🪟 [WINDOW] New Edge window launched, handle: {hwnd}")
+                
+                try:
+                    if win32gui.IsIconic(hwnd):
+                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                        time.sleep(0.3)
+                    win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+                    time.sleep(0.5)
+                    win32gui.SetForegroundWindow(hwnd)
+                    time.sleep(0.2)
+                    print("✅ [WINDOW] New window ready - maximized and focused")
+                    update_operation_status("Browser launched for Turboscribe operation")
+                    return hwnd
+                except Exception as e:
+                    print(f"⚠️ [WINDOW] Error preparing new window: {e}")
+                    continue
+        
+        error_msg = "Failed to get or launch Edge window for Turboscribe operation"
+        update_operation_status(error_msg, is_error=True)
+        abort_operation(error_msg)
+        raise RuntimeError(error_msg)
+
+    def enforce_window_focus(hwnd):
+        check_for_termination()
+        try:
+            if not win32gui.IsWindow(hwnd):
+                print("⚠️ [FOCUS] Window handle invalid, reacquiring...")
+                return False
+            
+            if win32gui.IsIconic(hwnd):
+                print("🔄 [FOCUS] Window was minimized, restoring...")
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                time.sleep(0.3)
+            
+            current_foreground = win32gui.GetForegroundWindow()
+            if current_foreground != hwnd:
+                print("🛡️ [FOCUS] Correcting window focus...")
+                win32gui.SetForegroundWindow(hwnd)
+                time.sleep(0.15)
+            
+            try:
+                placement = win32gui.GetWindowPlacement(hwnd)
+                if placement[1] != win32con.SW_SHOWMAXIMIZED:
+                    print("🔄 [FOCUS] Window not maximized, maximizing...")
+                    win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+                    time.sleep(0.3)
+            except Exception as e:
+                print(f"⚠️ [FOCUS] Could not check maximize state, attempting maximize anyway: {e}")
+                try:
+                    win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+                    time.sleep(0.3)
+                except:
+                    pass
+            
+            return True
+        except Exception as e:
+            print(f"⚠️ [FOCUS] Focus correction exception: {e}")
+            return False
+    
+    def ensure_window_ready_and_focused():
+        check_for_termination()
+        hwnd = ensure_edge_window_ready()
+        enforce_window_focus(hwnd)
+        return hwnd
+
+    def fast_paste_url(hwnd, url):
+        check_for_termination()
+        hud.print("📋 Navigating to URL...", "typing")
+        print(f"📋 Pasting URL: {url}")
+        pyperclip.copy(url)
+        
+        enforce_window_focus(hwnd)
+        pyautogui.hotkey('ctrl', 'l')
+        time.sleep(0.1)
+        
+        enforce_window_focus(hwnd)
+        pyautogui.hotkey('ctrl', 'v')
+        pyautogui.press('enter')
+        update_operation_status(f"Navigating to Turboscribe URL...")
+
+    # ============================================
+    # TEXT NORMALIZATION HELPERS
+    # ============================================
+    
+    def normalize_text_for_comparison(text):
+        if not text:
+            return ""
+        t = text.lower()
+        t = re.sub(r'[^a-z0-9]', '', t)
+        return t
+
+    def text_contains_normalized(text_to_search, target_text):
+        if not text_to_search or not target_text:
+            return False
+        normalized_search = normalize_text_for_comparison(text_to_search)
+        normalized_target = normalize_text_for_comparison(target_text)
+        return normalized_target in normalized_search
+
+    # ============================================
+    # VISION HELPER
+    # ============================================
+    
+    def safe_vision():
+        check_for_termination()
+        vision()
+        
+        text_elements = []
+        
+        try:
+            if os.path.exists(SCREEN_TEXT_CONTENT):
+                with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
+                    content = file.read()
+                
+                json_match = re.search(
+                    r'FULL IMAGE vision RESULTS.*?JSON FORMAT:\s*=\s*\n(\[.*?\])\s*(?=\n\n|$|\s*vision EXTRACTION RESULTS)',
+                    content,
+                    re.DOTALL | re.IGNORECASE
+                )
+                
+                if json_match:
+                    try:
+                        json_text = json_match.group(1)
+                        json_text = re.sub(r'^[^{[]*', '', json_text)
+                        json_text = re.sub(r'[^}\]]*$', '', json_text)
+                        json_data = json.loads(json_text)
+                        
+                        for item in json_data:
+                            text_value = None
+                            for key, value in item.items():
+                                if key.startswith('text_'):
+                                    text_value = value
+                                    break
+                            
+                            if text_value and 'coordinates' in item:
+                                coords = item['coordinates']
+                                text_elements.append({
+                                    'text': text_value.strip(),
+                                    'left': coords.get('left', 0),
+                                    'top': coords.get('top', 0),
+                                    'right': coords.get('right', 0),
+                                    'bottom': coords.get('bottom', 0),
+                                    'width': coords.get('right', 0) - coords.get('left', 0),
+                                    'height': coords.get('bottom', 0) - coords.get('top', 0)
+                                })
+                        
+                        if text_elements:
+                            print(f"✅ [VISION] Parsed {len(text_elements)} text elements from JSON")
+                    except json.JSONDecodeError:
+                        pass
+                
+                if not text_elements:
+                    text_blocks = re.findall(
+                        r'TEXT BLOCK #\d+:\s*•\s*(.+?)\s+Left:\s*(\d+)\s+Top:\s*(\d+)\s+Right:\s*(\d+)\s+Bottom:\s*(\d+)\s+Width:\s*(\d+)\s+Height:\s*(\d+)',
+                        content,
+                        re.DOTALL
+                    )
+                    
+                    for match in text_blocks:
+                        text, left, top, right, bottom, width, height = match
+                        text_elements.append({
+                            'text': text.strip(),
+                            'left': int(left),
+                            'top': int(top),
+                            'right': int(right),
+                            'bottom': int(bottom),
+                            'width': int(width),
+                            'height': int(height)
+                        })
+                    
+                    if text_elements:
+                        print(f"✅ [VISION] Parsed {len(text_elements)} text elements from text format")
+                
+                if text_elements:
+                    print(f"📊 [VISION] TOTAL: {len(text_elements)} text elements parsed")
+        except Exception as e:
+            print(f"⚠️ [VISION] Error reading screen_content.text: {e}")
+        
+        return text_elements
+
+    # ============================================
+    # MODAL DISMISSAL MECHANISM
+    # ============================================
+    
+    def dismiss_download_modal_if_present(hwnd):
+        """
+        Check if download modal is present by looking for downloads icon.
+        Searches in the upper half of the screen.
+        If found, click on it to dismiss the modal.
+        """
+        check_for_termination()
+        print(f"🔍 [MODAL] Checking for download modal using icon recognition...")
+        
+        # Define paths to download icon images
+        downloads_icon1_path = os.path.join(GUI_IMAGES, "downloads_icon1.png")
+        downloads_icon2_path = os.path.join(GUI_IMAGES, "downloads_icon2.png")
+        
+        # Check if image files exist
+        if not os.path.exists(downloads_icon1_path) and not os.path.exists(downloads_icon2_path):
+            print("ℹ️ [MODAL] No download icon images found - skipping modal check")
+            return hwnd
+        
+        # Get current monitor bounds
+        current_monitor = get_current_monitor()
+        monitor_left, monitor_top, monitor_right, monitor_bottom = current_monitor
+        monitor_width = monitor_right - monitor_left
+        monitor_height = monitor_bottom - monitor_top
+        
+        # Search only in the upper half of the screen
+        region_left = monitor_left
+        region_top = monitor_top
+        region_width = monitor_width
+        region_height = monitor_height // 2
+        
+        region = (region_left, region_top, region_width, region_height)
+        
+        print(f"📐 [MODAL] Searching for downloads icon in upper half: {region}")
+        
+        # Try to find the icon
+        icon_found = False
+        
+        # Try downloads_icon1.png first
+        if os.path.exists(downloads_icon1_path):
+            try:
+                found_location = pyautogui.locateCenterOnScreen(
+                    downloads_icon1_path,
+                    region=region,
+                    confidence=0.8,
+                    grayscale=False
+                )
+                
+                if found_location:
+                    x, y = found_location
+                    print(f"✅ [MODAL] Found downloads_icon1.png at position ({x}, {y})")
+                    icon_found = True
+                    
+                    # Click the icon
+                    enforce_window_focus(hwnd)
+                    pyautogui.moveTo(x, y, duration=0.2)
+                    pyautogui.click()
+                    time.sleep(0.3)
+                    
+                    print(f"✅ [MODAL] Clicked downloads icon to dismiss modal")
+                    hud.print("✅ Modal dismissed", "success")
+                    update_operation_status(f"Dismissed download modal")
+                    return hwnd
+            except Exception as e:
+                print(f"⚠️ [MODAL] Error searching for downloads_icon1.png: {e}")
+        
+        # Try downloads_icon2.png if first wasn't found
+        if not icon_found and os.path.exists(downloads_icon2_path):
+            try:
+                found_location = pyautogui.locateCenterOnScreen(
+                    downloads_icon2_path,
+                    region=region,
+                    confidence=0.8,
+                    grayscale=False
+                )
+                
+                if found_location:
+                    x, y = found_location
+                    print(f"✅ [MODAL] Found downloads_icon2.png at position ({x}, {y})")
+                    icon_found = True
+                    
+                    # Click the icon
+                    enforce_window_focus(hwnd)
+                    pyautogui.moveTo(x, y, duration=0.2)
+                    pyautogui.click()
+                    time.sleep(0.3)
+                    
+                    print(f"✅ [MODAL] Clicked downloads icon to dismiss modal")
+                    hud.print("✅ Modal dismissed", "success")
+                    update_operation_status(f"Dismissed download modal")
+                    return hwnd
+            except Exception as e:
+                print(f"⚠️ [MODAL] Error searching for downloads_icon2.png: {e}")
+        
+        if not icon_found:
+            print(f"ℹ️ [MODAL] No downloads icon found - no modal to dismiss")
+        
+        return hwnd
+
+    # ============================================
+    # TURBOSCRIBE SPECIFIC HELPERS
+    # ============================================
+    
+    def check_for_project_title_with_vision(hwnd, project_title, timeout_seconds=30, check_interval=0.5):
+        """
+        Check for project title on the page using case-insensitive normalized matching.
+        Returns: (found, click_coordinates, text_elements)
+        """
+        print(f"🔍 [TURBOSCRIBE] Checking for project title '{project_title}' in screen content...")
+        update_operation_status(f"Checking for project title '{project_title}'...")
+        
+        # Normalize project title for comparison
+        normalized_target = normalize_text_for_comparison(project_title)
+        print(f"🔍 [TURBOSCRIBE] Normalized target: '{normalized_target}'")
+        
+        start_time = time.time()
+        attempts = 0
+        
+        while time.time() - start_time < timeout_seconds:
+            check_for_termination()
+            enforce_window_focus(hwnd)
+            attempts += 1
+            
+            print(f"📝 [TURBOSCRIBE] Attempt {attempts}: Writing '{project_title}' to text target...")
+            
+            try:
+                text_target_data = {"value": project_title}
+                with open(TEXT_TARGET, 'w', encoding='utf-8') as file:
+                    json.dump(text_target_data, file, indent=4)
+                print(f"✅ [TURBOSCRIBE] Wrote '{project_title}' to {TEXT_TARGET}")
+            except Exception as e:
+                print(f"⚠️ [TURBOSCRIBE] Error writing to text_target.json: {e}")
+            
+            time.sleep(0.3)
+            
+            current_texts = safe_vision()
+            
+            if current_texts:
+                print(f"🔍 [TURBOSCRIBE] Found {len(current_texts)} text elements on screen")
+                
+                for element in current_texts:
+                    element_text = element['text'].strip()
+                    
+                    if text_contains_normalized(element_text, project_title):
+                        print(f"✅ [TURBOSCRIBE] Found project title in screen content: '{element_text}'")
+                        
+                        click_x = int(element['left'] + element['width'] / 2)
+                        click_y = int(element['top'] + element['height'] / 2)
+                        
+                        print(f"🎯 [TURBOSCRIBE] Click position: ({click_x}, {click_y})")
+                        update_operation_status(f"Found project title: {project_title}")
+                        return True, (click_x, click_y), current_texts
+            else:
+                print(f"⏳ [TURBOSCRIBE] No text found on screen (attempt {attempts})")
+            
+            if attempts > 10 and attempts % 3 == 0:
+                print(f"🔄 [TURBOSCRIBE] Attempt {attempts}: project title not found, reloading page...")
+                hud.print("🔄 Reloading page...", "warning")
+                update_operation_status(f"Reloading page (attempt {attempts})...")
+                enforce_window_focus(hwnd)
+                pyautogui.hotkey('ctrl', 'r')
+                time.sleep(2)
+                hwnd = ensure_window_ready_and_focused()
+                continue
+            
+            time.sleep(check_interval)
+        
+        print(f"❌ [TURBOSCRIBE] Project title '{project_title}' not found within {timeout_seconds} seconds")
+        hud.print(f"❌ Project title not found", "error")
+        error_msg = f"Project title '{project_title}' not found within {timeout_seconds} seconds"
+        update_operation_status(error_msg, is_error=True)
+        return False, None, None
+
+    def click_on_project_title(hwnd, click_coords):
+        """
+        Click on the project title to focus/select it.
+        """
+        check_for_termination()
+        print(f"🎯 [TURBOSCRIBE] Clicking on project title at ({click_coords[0]}, {click_coords[1]})")
+        hud.print("🎯 Selecting project title...", "clicking")
+        update_operation_status("Clicking on project title...")
+        
+        enforce_window_focus(hwnd)
+        pyautogui.moveTo(click_coords[0], click_coords[1], duration=0.2)
+        pyautogui.click()
+        time.sleep(0.3)
+        
+        print(f"✅ [TURBOSCRIBE] Clicked on project title")
+        return True
+
+    def copy_all_text_from_page(hwnd):
+        """
+        Select all text on the page (Ctrl+A) and copy it (Ctrl+C).
+        Returns: (success, copied_text)
+        """
+        check_for_termination()
+        print(f"📋 [TURBOSCRIBE] Selecting all text and copying...")
+        hud.print("📋 Copying transcript text...", "typing")
+        update_operation_status("Copying transcript text...")
+        
+        try:
+            # Ensure window has focus
+            enforce_window_focus(hwnd)
+            time.sleep(0.2)
+            
+            # Click on the page to ensure focus
+            current_monitor = get_current_monitor()
+            monitor_left, monitor_top, monitor_right, monitor_bottom = current_monitor
+            center_x = monitor_left + (monitor_right - monitor_left) // 2
+            center_y = monitor_top + (monitor_bottom - monitor_top) // 2
+            pyautogui.click(center_x, center_y)
+            time.sleep(0.2)
+            
+            # Select all (Ctrl+A)
+            pyautogui.hotkey('ctrl', 'a')
+            time.sleep(0.3)
+            
+            # Copy (Ctrl+C)
+            pyautogui.hotkey('ctrl', 'c')
+            time.sleep(0.3)
+            
+            # Get clipboard content
+            copied_text = pyperclip.paste()
+            
+            if copied_text and len(copied_text) > 100:  # Ensure we got substantial text
+                print(f"✅ [TURBOSCRIBE] Copied {len(copied_text)} characters")
+                update_operation_status(f"Copied {len(copied_text)} characters of transcript")
+                return True, copied_text
+            else:
+                print(f"⚠️ [TURBOSCRIBE] Copied text is too short or empty: {len(copied_text) if copied_text else 0} chars")
+                hud.print("⚠️ Could not copy transcript text", "warning")
+                error_msg = "Copied text is too short or empty"
+                update_operation_status(error_msg, is_error=True)
+                return False, None
+                
+        except Exception as e:
+            print(f"❌ [TURBOSCRIBE] Failed to copy text: {e}")
+            error_msg = f"Failed to copy transcript text: {str(e)}"
+            update_operation_status(error_msg, is_error=True)
+            return False, None
+
+    def clean_transcript_text(raw_text):
+        """
+        Clean the transcript text by:
+        1. Finding "Speaker 1" and removing everything before it
+        2. Finding "Ready to Go Unlimited?" and removing everything after it
+        """
+        print(f"🧹 [TURBOSCRIBE] Cleaning transcript text...")
+        
+        if not raw_text:
+            return ""
+        
+        cleaned_text = raw_text
+        
+        # Find "Speaker 1" and remove everything before it
+        speaker_pattern = r'(Speaker\s*1\s*\n?.*?\(0:00\))'
+        speaker_match = re.search(speaker_pattern, cleaned_text, re.IGNORECASE | re.DOTALL)
+        
+        if speaker_match:
+            start_index = speaker_match.start()
+            print(f"   Found 'Speaker 1' at position {start_index}")
+            cleaned_text = cleaned_text[start_index:]
+            print(f"   Removed {start_index} characters before 'Speaker 1'")
+        else:
+            # Try alternative pattern without newline
+            alt_pattern = r'(Speaker\s*1.*?\(0:00\))'
+            alt_match = re.search(alt_pattern, cleaned_text, re.IGNORECASE | re.DOTALL)
+            if alt_match:
+                start_index = alt_match.start()
+                print(f"   Found 'Speaker 1' (alt pattern) at position {start_index}")
+                cleaned_text = cleaned_text[start_index:]
+                print(f"   Removed {start_index} characters before 'Speaker 1'")
+            else:
+                print(f"   ⚠️ Could not find 'Speaker 1' pattern in text")
+        
+        # Find "Ready to Go Unlimited?" and remove everything after it
+        end_pattern = r'(Ready to Go Unlimited\??)'
+        end_match = re.search(end_pattern, cleaned_text, re.IGNORECASE | re.DOTALL)
+        
+        if end_match:
+            end_index = end_match.start()
+            print(f"   Found 'Ready to Go Unlimited?' at position {end_index}")
+            cleaned_text = cleaned_text[:end_index]
+            print(f"   Removed {len(raw_text) - end_index} characters after 'Ready to Go Unlimited?'")
+        else:
+            print(f"   ⚠️ Could not find 'Ready to Go Unlimited?' pattern in text")
+        
+        # Clean up any extra whitespace at the end
+        cleaned_text = cleaned_text.rstrip()
+        
+        print(f"✅ [TURBOSCRIBE] Cleaned text: {len(cleaned_text)} characters")
+        return cleaned_text
+
+    def save_transcript_to_audio_folder(cleaned_text, project_title):
+        """
+        Save the cleaned transcript text to the project's audio folder.
+        """
+        check_for_termination()
+        print(f"💾 [TURBOSCRIBE] Saving transcript to audio folder for {project_title}...")
+        hud.print("💾 Saving transcript...", "processing")
+        update_operation_status(f"Saving transcript to audio folder for {project_title}...")
+        
+        def normalize_project_title(name):
+            if not name:
+                return "unnamed_project"
+            normalized = re.sub(r'[^a-zA-Z0-9\s_]', '', name)
+            normalized = re.sub(r'\s+', '_', normalized)
+            normalized = re.sub(r'_+', '_', normalized)
+            normalized = normalized.strip('_')
+            return normalized if normalized else "unnamed_project"
+        
+        normalized_project_title = normalize_project_title(project_title)
+        print(f"📝 [TURBOSCRIBE] Normalized project name: '{normalized_project_title}'")
+        
+        project_folder = os.path.join(IMAGES_PATH, normalized_project_title)
+        audio_folder = os.path.join(project_folder, "audio")
+        
+        if not os.path.exists(audio_folder):
+            try:
+                os.makedirs(audio_folder)
+                print(f"📁 [TURBOSCRIBE] Created audio folder: {audio_folder}")
+            except Exception as e:
+                print(f"❌ [TURBOSCRIBE] Failed to create audio folder: {e}")
+                error_msg = f"Failed to create audio folder: {e}"
+                update_operation_status(error_msg, is_error=True)
+                return False
+        
+        # Create filename with project title
+        filename = f"{normalized_project_title}.txt"
+        file_path = os.path.join(audio_folder, filename)
+        
+        # Handle duplicate filenames
+        if os.path.exists(file_path):
+            name_without_ext = os.path.splitext(filename)[0]
+            counter = 1
+            while os.path.exists(file_path):
+                new_name = f"{name_without_ext}_{counter}.txt"
+                file_path = os.path.join(audio_folder, new_name)
+                counter += 1
+            print(f"📝 [TURBOSCRIBE] Renaming to avoid conflict: {os.path.basename(file_path)}")
+        
+        try:
+            with open(file_path, 'w', encoding='utf-8') as file:
+                file.write(cleaned_text)
+            print(f"✅ [TURBOSCRIBE] Transcript saved to: {file_path}")
+            hud.print("✅ Transcript saved!", "success")
+            update_operation_status(f"Transcript saved to audio folder for {project_title}")
+            return True
+        except Exception as e:
+            print(f"❌ [TURBOSCRIBE] Failed to save transcript: {e}")
+            error_msg = f"Failed to save transcript: {str(e)}"
+            update_operation_status(error_msg, is_error=True)
+            return False
+
+    def check_for_download_button_with_vision(hwnd, target_text_list, timeout_seconds=15, check_interval=0.3):
+        """
+        Check for any download button from a list of target texts.
+        Returns: (found, click_coordinates, text_elements, matched_text)
+        """
+        print(f"🔍 [TURBOSCRIBE] Looking for any of these download buttons: {target_text_list}")
+        update_operation_status(f"Looking for download buttons...")
+        
+        # Normalize all target texts
+        normalized_targets = {}
+        for target in target_text_list:
+            normalized_targets[target] = normalize_text_for_comparison(target)
+        
+        print(f"🔍 [TURBOSCRIBE] Normalized targets: {normalized_targets}")
+        
+        start_time = time.time()
+        attempts = 0
+        
+        while time.time() - start_time < timeout_seconds:
+            check_for_termination()
+            enforce_window_focus(hwnd)
+            attempts += 1
+            
+            # Write all targets to text target
+            try:
+                text_target_data = {"value": ", ".join(target_text_list)}
+                with open(TEXT_TARGET, 'w', encoding='utf-8') as file:
+                    json.dump(text_target_data, file, indent=4)
+                print(f"✅ [TURBOSCRIBE] Wrote '{', '.join(target_text_list)}' to {TEXT_TARGET}")
+            except Exception as e:
+                print(f"⚠️ [TURBOSCRIBE] Error writing to text_target.json: {e}")
+            
+            time.sleep(0.3)
+            
+            current_texts = safe_vision()
+            
+            if current_texts:
+                print(f"🔍 [TURBOSCRIBE] Found {len(current_texts)} text elements on screen")
+                
+                for element in current_texts:
+                    element_text = element['text'].strip()
+                    normalized_element = normalize_text_for_comparison(element_text)
+                    
+                    # Check each target
+                    for target, normalized_target in normalized_targets.items():
+                        if normalized_target in normalized_element:
+                            print(f"✅ [TURBOSCRIBE] Found '{target}' in screen content: '{element_text}'")
+                            
+                            click_x = int(element['left'] + element['width'] / 2)
+                            click_y = int(element['top'] + element['height'] / 2)
+                            
+                            print(f"🎯 [TURBOSCRIBE] Click position: ({click_x}, {click_y})")
+                            update_operation_status(f"Found {target} button")
+                            return True, (click_x, click_y), current_texts, target
+            
+            print(f"⏳ [TURBOSCRIBE] No download buttons found (attempt {attempts})")
+            time.sleep(check_interval)
+        
+        print(f"❌ [TURBOSCRIBE] No download buttons found within {timeout_seconds} seconds")
+        hud.print(f"❌ No download buttons found", "error")
+        error_msg = f"No download buttons found within {timeout_seconds} seconds"
+        update_operation_status(error_msg, is_error=True)
+        return False, None, None, None
+
+    def move_mouse_to_button(hwnd, click_coords):
+        """
+        Move the mouse to the button coordinates but DON'T click.
+        """
+        check_for_termination()
+        print(f"🖱️ [TURBOSCRIBE] Moving mouse to button at ({click_coords[0]}, {click_coords[1]}) - NOT clicking")
+        hud.print("🖱️ Moving to button...", "navigating")
+        update_operation_status("Moving mouse to download button...")
+        
+        enforce_window_focus(hwnd)
+        pyautogui.moveTo(click_coords[0], click_coords[1], duration=0.2)
+        time.sleep(0.3)
+        
+        print(f"✅ [TURBOSCRIBE] Mouse moved to button position")
+        return True
+
+    def scroll_down_after_download(hwnd, download_click_coords):
+        """
+        Scroll down after a download is clicked to reveal content below.
+        Moves mouse back to the download region, then scrolls.
+        """
+        check_for_termination()
+        print(f"📜 [TURBOSCRIBE] Scrolling down after download...")
+        hud.print("📜 Scrolling down...", "navigating")
+        update_operation_status("Scrolling down to reveal more content...")
+        
+        try:
+            # Focus the window
+            enforce_window_focus(hwnd)
+            
+            # Move mouse back to the download region if coordinates are available
+            if download_click_coords:
+                click_x, click_y = download_click_coords
+                print(f"🔄 [TURBOSCRIBE] Moving mouse back to download region: ({click_x}, {click_y})")
+                pyautogui.moveTo(click_x, click_y, duration=0.2)
+                time.sleep(0.3)
+            else:
+                # If no coordinates, move to center of screen
+                current_monitor = get_current_monitor()
+                monitor_left, monitor_top, monitor_right, monitor_bottom = current_monitor
+                center_x = monitor_left + (monitor_right - monitor_left) // 2
+                center_y = monitor_top + (monitor_bottom - monitor_top) // 2
+                print(f"🔄 [TURBOSCRIBE] Moving mouse to center of screen: ({center_x}, {center_y})")
+                pyautogui.moveTo(center_x, center_y, duration=0.2)
+                time.sleep(0.3)
+            
+            # Scroll down hard (large scroll amount)
+            print(f"📜 [TURBOSCRIBE] Scrolling down hard...")
+            pyautogui.scroll(-500)  # Large scroll down
+            time.sleep(1)
+            
+            # Scroll again to ensure we've gone far enough
+            pyautogui.scroll(-300)
+            time.sleep(0.5)
+            
+            print(f"✅ [TURBOSCRIBE] Scroll down completed")
+            hud.print("✅ Scroll down complete", "info")
+            update_operation_status("Scrolled down successfully")
+            return True
+            
+        except Exception as e:
+            print(f"⚠️ [TURBOSCRIBE] Error during scroll: {e}")
+            return False
+
+    def check_for_specific_download_button_with_vision(hwnd, target_text, timeout_seconds=15, check_interval=0.3):
+        """
+        Find a specific download button with the given target text.
+        Returns: (found, click_coordinates, text_elements)
+        """
+        print(f"🔍 [TURBOSCRIBE] Looking for '{target_text}' in screen content...")
+        update_operation_status(f"Looking for {target_text} button...")
+        
+        normalized_target = normalize_text_for_comparison(target_text)
+        print(f"🔍 [TURBOSCRIBE] Normalized target: '{normalized_target}'")
+        
+        start_time = time.time()
+        attempts = 0
+        
+        while time.time() - start_time < timeout_seconds:
+            check_for_termination()
+            enforce_window_focus(hwnd)
+            attempts += 1
+            
+            print(f"📝 [TURBOSCRIBE] Attempt {attempts}: Writing '{target_text}' to text target...")
+            
+            try:
+                text_target_data = {"value": target_text}
+                with open(TEXT_TARGET, 'w', encoding='utf-8') as file:
+                    json.dump(text_target_data, file, indent=4)
+                print(f"✅ [TURBOSCRIBE] Wrote '{target_text}' to {TEXT_TARGET}")
+            except Exception as e:
+                print(f"⚠️ [TURBOSCRIBE] Error writing to text_target.json: {e}")
+            
+            time.sleep(0.3)
+            
+            current_texts = safe_vision()
+            
+            if current_texts:
+                print(f"🔍 [TURBOSCRIBE] Found {len(current_texts)} text elements on screen")
+                
+                for element in current_texts:
+                    element_text = element['text'].strip()
+                    
+                    # Try various forms of the target text
+                    normalized_element = normalize_text_for_comparison(element_text)
+                    if text_contains_normalized(element_text, target_text) or \
+                       normalized_target in normalized_element:
+                        print(f"✅ [TURBOSCRIBE] Found '{target_text}' in screen content: '{element_text}'")
+                        
+                        click_x = int(element['left'] + element['width'] / 2)
+                        click_y = int(element['top'] + element['height'] / 2)
+                        
+                        print(f"🎯 [TURBOSCRIBE] Click position: ({click_x}, {click_y})")
+                        update_operation_status(f"Found {target_text} button")
+                        return True, (click_x, click_y), current_texts
+            
+            print(f"⏳ [TURBOSCRIBE] '{target_text}' not found (attempt {attempts})")
+            time.sleep(check_interval)
+        
+        print(f"❌ [TURBOSCRIBE] '{target_text}' not found within {timeout_seconds} seconds")
+        hud.print(f"❌ {target_text} button not found", "error")
+        error_msg = f"'{target_text}' not found within {timeout_seconds} seconds"
+        update_operation_status(error_msg, is_error=True)
+        return False, None, None
+
+    # ============================================
+    # FILE MANAGEMENT HELPERS
+    # ============================================
+    
+    def delete_existing_audio_files(project_title):
+        """
+        Delete all existing audio files in the project's audio folder.
+        """
+        check_for_termination()
+        print(f"🗑️ [TURBOSCRIBE] Checking for existing audio files to delete...")
+        hud.print("🗑️ Removing existing audio files...", "warning")
+        update_operation_status(f"Removing existing audio files for {project_title}...")
+        
+        def normalize_project_title(name):
+            if not name:
+                return "unnamed_project"
+            normalized = re.sub(r'[^a-zA-Z0-9\s_]', '', name)
+            normalized = re.sub(r'\s+', '_', normalized)
+            normalized = re.sub(r'_+', '_', normalized)
+            normalized = normalized.strip('_')
+            return normalized if normalized else "unnamed_project"
+        
+        normalized_project_title = normalize_project_title(project_title)
+        project_folder = os.path.join(IMAGES_PATH, normalized_project_title)
+        audio_folder = os.path.join(project_folder, "audio")
+        
+        # Check if audio folder exists
+        if not os.path.exists(audio_folder):
+            print(f"ℹ️ [TURBOSCRIBE] Audio folder doesn't exist yet: {audio_folder}")
+            return True
+        
+        # Count files before deletion
+        try:
+            files = os.listdir(audio_folder)
+            if not files:
+                print(f"ℹ️ [TURBOSCRIBE] Audio folder is empty: {audio_folder}")
+                return True
+            
+            print(f"📁 [TURBOSCRIBE] Found {len(files)} file(s) in audio folder")
+            
+            # Delete all files in the audio folder
+            deleted_count = 0
+            for filename in files:
+                file_path = os.path.join(audio_folder, filename)
+                try:
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                        deleted_count += 1
+                        print(f"   🗑️ Deleted: {filename}")
+                except Exception as e:
+                    print(f"   ⚠️ Could not delete {filename}: {e}")
+            
+            print(f"✅ [TURBOSCRIBE] Deleted {deleted_count} existing audio file(s)")
+            
+            # Check if folder is empty now
+            remaining = os.listdir(audio_folder)
+            if remaining:
+                print(f"⚠️ [TURBOSCRIBE] {len(remaining)} file(s) remain in audio folder")
+            else:
+                print(f"✅ [TURBOSCRIBE] Audio folder is now empty")
+            
+            update_operation_status(f"Removed {deleted_count} existing audio files for {project_title}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ [TURBOSCRIBE] Failed to delete audio files: {e}")
+            error_msg = f"Failed to delete existing audio files: {str(e)}"
+            update_operation_status(error_msg, is_error=True)
+            return False
+
+    def move_file_to_audio_folder(file_path, filename, project_title, file_type="file"):
+        """
+        Move a downloaded file to the project's audio folder.
+        """
+        check_for_termination()
+        print(f"📁 [TURBOSCRIBE] Moving {file_type} to audio folder for {project_title}...")
+        hud.print(f"📁 Organizing {file_type}...", "processing")
+        update_operation_status(f"Moving {file_type} to audio folder for {project_title}...")
+        
+        def normalize_project_title(name):
+            if not name:
+                return "unnamed_project"
+            normalized = re.sub(r'[^a-zA-Z0-9\s_]', '', name)
+            normalized = re.sub(r'\s+', '_', normalized)
+            normalized = re.sub(r'_+', '_', normalized)
+            normalized = normalized.strip('_')
+            return normalized if normalized else "unnamed_project"
+        
+        normalized_project_title = normalize_project_title(project_title)
+        print(f"📝 [TURBOSCRIBE] Normalized project name: '{normalized_project_title}'")
+        
+        project_folder = os.path.join(IMAGES_PATH, normalized_project_title)
+        audio_folder = os.path.join(project_folder, "audio")
+        
+        if not os.path.exists(audio_folder):
+            try:
+                os.makedirs(audio_folder)
+                print(f"📁 [TURBOSCRIBE] Created audio folder: {audio_folder}")
+            except Exception as e:
+                print(f"❌ [TURBOSCRIBE] Failed to create audio folder: {e}")
+                error_msg = f"Failed to create audio folder: {e}"
+                update_operation_status(error_msg, is_error=True)
+                return False
+        
+        if not os.path.exists(file_path):
+            print(f"❌ [TURBOSCRIBE] File not found: {file_path}")
+            error_msg = f"File not found: {filename}"
+            update_operation_status(error_msg, is_error=True)
+            return False
+        
+        dest_path = os.path.join(audio_folder, filename)
+        
+        # Handle duplicate filenames
+        if os.path.exists(dest_path):
+            name_without_ext = os.path.splitext(filename)[0]
+            ext = os.path.splitext(filename)[1]
+            counter = 1
+            while os.path.exists(dest_path):
+                new_name = f"{name_without_ext}_{counter}{ext}"
+                dest_path = os.path.join(audio_folder, new_name)
+                counter += 1
+            print(f"📝 [TURBOSCRIBE] Renaming to avoid conflict: {os.path.basename(dest_path)}")
+        
+        try:
+            import shutil
+            shutil.move(file_path, dest_path)
+            print(f"✅ [TURBOSCRIBE] {file_type.capitalize()} moved to: {dest_path}")
+            hud.print(f"✅ {file_type.capitalize()} organized!", "success")
+            update_operation_status(f"{file_type.capitalize()} saved to audio folder for {project_title}")
+            return True
+        except Exception as e:
+            print(f"❌ [TURBOSCRIBE] Failed to move {file_type}: {e}")
+            error_msg = f"Failed to move {file_type}: {str(e)}"
+            update_operation_status(error_msg, is_error=True)
+            return False
+
+    # ============================================
+    # DOWNLOAD MONITORING (Generic)
+    # ============================================
+    
+    def check_download_status_generic(hwnd, project_title, file_extension, timeout_seconds=180, check_interval=0.1):
+        """
+        Generic download monitor for any file type.
+        Returns: (success, file_path, filename)
+        """
+        check_for_termination()
+        print(f"📊 [TURBOSCRIBE_DOWNLOAD] Starting download status monitor for {file_extension} file...")
+        hud.print(f"📊 Monitoring {file_extension} download...", "waiting")
+        update_operation_status(f"Monitoring {file_extension} download for {project_title}...")
+        
+        start_time = time.time()
+        downloads_folder = os.path.expanduser("~/Downloads")
+        
+        # Track existing files
+        existing_files = {}
+        if os.path.exists(downloads_folder):
+            try:
+                with os.scandir(downloads_folder) as entries:
+                    for entry in entries:
+                        if entry.is_file() and entry.name.endswith(file_extension):
+                            try:
+                                stat = entry.stat()
+                                if os.name == 'nt':
+                                    file_time = stat.st_ctime
+                                else:
+                                    file_time = stat.st_mtime
+                                existing_files[entry.name] = {
+                                    'path': entry.path,
+                                    'time': file_time,
+                                    'size': stat.st_size
+                                }
+                            except Exception:
+                                existing_files[entry.name] = {
+                                    'path': entry.path,
+                                    'time': 0,
+                                    'size': 0
+                                }
+                print(f"📁 [TURBOSCRIBE_DOWNLOAD] Found {len(existing_files)} existing {file_extension} files")
+            except Exception as e:
+                print(f"⚠️ [TURBOSCRIBE_DOWNLOAD] Error scanning existing files: {e}")
+        
+        # Track latest known file
+        latest_known_file = None
+        latest_known_time = 0
+        
+        if existing_files:
+            for name, info in existing_files.items():
+                if info['time'] > latest_known_time:
+                    latest_known_time = info['time']
+                    latest_known_file = name
+            print(f"📁 [TURBOSCRIBE_DOWNLOAD] Latest existing {file_extension}: {latest_known_file}")
+        
+        # Monitoring loop
+        last_modal_check = 0
+        modal_check_interval = 10
+        
+        while time.time() - start_time < timeout_seconds:
+            try:
+                check_for_termination()
+                
+                # Periodic modal check
+                elapsed = int(time.time() - start_time)
+                if elapsed - last_modal_check >= modal_check_interval:
+                    try:
+                        print(f"🔍 [TURBOSCRIBE_DOWNLOAD] Checking for download modal...")
+                        hwnd = dismiss_download_modal_if_present(hwnd)
+                        last_modal_check = elapsed
+                    except Exception as e:
+                        print(f"⚠️ [TURBOSCRIBE_DOWNLOAD] Error checking modal: {e}")
+                
+                # Check for new files
+                if os.path.exists(downloads_folder):
+                    with os.scandir(downloads_folder) as entries:
+                        for entry in entries:
+                            if entry.is_file() and entry.name.endswith(file_extension):
+                                if entry.name not in existing_files:
+                                    try:
+                                        stat = entry.stat()
+                                        if os.name == 'nt':
+                                            file_time = stat.st_ctime
+                                        else:
+                                            file_time = stat.st_mtime
+                                        file_size = stat.st_size
+                                    except Exception:
+                                        file_time = time.time()
+                                        file_size = 0
+                                    
+                                    # Check if different from latest known
+                                    is_different = True
+                                    if latest_known_file and latest_known_file == entry.name:
+                                        try:
+                                            latest_path = os.path.join(downloads_folder, latest_known_file)
+                                            if os.path.exists(latest_path):
+                                                latest_stat = os.stat(latest_path)
+                                                if os.name == 'nt':
+                                                    latest_time = latest_stat.st_ctime
+                                                else:
+                                                    latest_time = latest_stat.st_mtime
+                                                if abs(file_time - latest_time) < 1.0:
+                                                    is_different = False
+                                        except Exception:
+                                            pass
+                                    
+                                    if is_different:
+                                        print(f"🆕 [TURBOSCRIBE_DOWNLOAD] New {file_extension} file detected: {entry.name}")
+                                        hud.print(f"🆕 {file_extension.upper()} download detected!", "info")
+                                        update_operation_status(f"{file_extension.upper()} download detected: {entry.name}")
+                                        
+                                        # Wait for file to stabilize
+                                        stable_count = 0
+                                        stable_size = 0
+                                        max_stable_checks = 5
+                                        
+                                        print(f"⏳ [TURBOSCRIBE_DOWNLOAD] Waiting for file to stabilize...")
+                                        while stable_count < 3 and stable_count < max_stable_checks:
+                                            try:
+                                                current_size = os.path.getsize(entry.path)
+                                                if current_size == stable_size and current_size > 0:
+                                                    stable_count += 1
+                                                    print(f"✅ [TURBOSCRIBE_DOWNLOAD] File stable ({stable_count}/3), size: {current_size} bytes")
+                                                else:
+                                                    stable_count = 0
+                                                    stable_size = current_size
+                                                    print(f"⏳ [TURBOSCRIBE_DOWNLOAD] File size changing: {current_size} bytes")
+                                            except Exception:
+                                                pass
+                                            time.sleep(0.5)
+                                        
+                                        # One final modal check before completing
+                                        try:
+                                            hwnd = dismiss_download_modal_if_present(hwnd)
+                                        except Exception:
+                                            pass
+                                        
+                                        print(f"✅ [TURBOSCRIBE_DOWNLOAD] Download complete! File ready: {entry.name}")
+                                        hud.print(f"✅ {file_extension.upper()} download complete!", "success")
+                                        update_operation_status(f"{file_extension.upper()} download complete: {entry.name}")
+                                        
+                                        return True, entry.path, entry.name
+                                    
+                time.sleep(check_interval)
+                
+            except KeyboardInterrupt:
+                print(f"🛑 [TURBOSCRIBE_DOWNLOAD] Download monitoring interrupted")
+                raise
+            except Exception as e:
+                print(f"⚠️ [TURBOSCRIBE_DOWNLOAD] Error in monitoring loop: {e}")
+                time.sleep(check_interval)
+                continue
+        
+        print(f"⏰ [TURBOSCRIBE_DOWNLOAD] Timeout reached after {timeout_seconds} seconds")
+        error_msg = f"{file_extension.upper()} download timed out after {timeout_seconds} seconds"
+        hud.print(f"⏰ Download monitoring timed out", "error")
+        update_operation_status(error_msg, is_error=True)
+        return False, None, None
+
+    # ============================================
+    # MAIN TURBOSCRIBE WORKFLOW
+    # ============================================
+    
+    def main_turboscribe_workflow_with_restart(hwnd=None, turboscribe_url=None, depth=0):
+        try:
+            if not os.path.exists(PANEL_PATH):
+                print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
+                update_operation_status("panel.json not found", is_error=True)
+                return False
+            
+            with open(PANEL_PATH, 'r', encoding='utf-8') as file:
+                panel_data = json.load(file)
+            
+            turboscribe_config = panel_data.get('turboscribe_config', {})
+            operate_turboscribe = turboscribe_config.get('operate_turboscribe', False)
+            
+            if not operate_turboscribe:
+                print("ℹ️ Turboscribe operation is disabled in config")
+                hud.print("ℹ️ Turboscribe operation disabled", "info")
+                update_operation_status("Turboscribe operation is disabled in configuration")
+                return False
+            
+            if turboscribe_url is None:
+                turboscribe_url = turboscribe_config.get('turboscribe_project_url')
+                if not turboscribe_url or not turboscribe_url.strip():
+                    print("❌ Error: 'turboscribe_project_url' not configured")
+                    hud.print("❌ No Turboscribe URL configured", "error")
+                    error_msg = "No Turboscribe URL configured in turboscribe_config"
+                    update_operation_status(error_msg, is_error=True)
+                    return False
+            
+            project_title = panel_data.get('project_title', 'turboscribe_project')
+            
+            if hwnd is None:
+                hwnd = ensure_window_ready_and_focused()
+                print(f"🪟 [TURBOSCRIBE] Browser ready (HWND: {hwnd})")
+            
+            print(f"🎬 [TURBOSCRIBE] Starting Turboscribe workflow (depth {depth})...")
+            print(f"🌐 [TURBOSCRIBE] URL: {turboscribe_url}")
+            print(f"📁 [TURBOSCRIBE] Project: '{project_title}'")
+            update_operation_status(f"Starting Turboscribe workflow for {project_title}")
+            
+            # Step 1: Load the Turboscribe URL
+            print(f"🔍 [TURBOSCRIBE] Step 1: Loading Turboscribe URL...")
+            hud.print("📋 Loading Turboscribe...", "navigating")
+            fast_paste_url(hwnd, turboscribe_url)
+            time.sleep(3)
+            hwnd = ensure_window_ready_and_focused()
+            
+            # Step 2: Confirm page loaded by detecting project title
+            print(f"🔍 [TURBOSCRIBE] Step 2: Confirming page loaded by finding project title: '{project_title}'...")
+            success, click_coords, text_elements = check_for_project_title_with_vision(
+                hwnd, project_title, timeout_seconds=30
+            )
+            
+            if not success or not click_coords:
+                print(f"❌ [TURBOSCRIBE] Page verification failed - project title not found")
+                error_msg = f"Page verification failed - project title '{project_title}' not found"
+                update_operation_status(error_msg, is_error=True)
+                
+                if depth == 0:
+                    print("🔄 [TURBOSCRIBE] Retrying page load...")
+                    time.sleep(2)
+                    return main_turboscribe_workflow_with_restart(hwnd, turboscribe_url, depth + 1)
+                return False
+            
+            print(f"✅ [TURBOSCRIBE] Page loaded and verified! Found project title.")
+            update_operation_status(f"Page verified for {project_title}")
+            
+            # Step 3: Click on the project title to focus it
+            print(f"🎯 [TURBOSCRIBE] Step 3: Clicking on project title...")
+            click_success = click_on_project_title(hwnd, click_coords)
+            if not click_success:
+                print(f"⚠️ [TURBOSCRIBE] Could not click on project title, but continuing...")
+                hud.print("⚠️ Could not click on project title", "warning")
+            
+            # Step 4: Copy all text from the page (Ctrl+A, Ctrl+C)
+            print(f"📋 [TURBOSCRIBE] Step 4: Copying all text from page...")
+            copy_success, raw_text = copy_all_text_from_page(hwnd)
+            
+            if not copy_success or not raw_text:
+                print(f"❌ [TURBOSCRIBE] Failed to copy text from page")
+                error_msg = "Failed to copy transcript text"
+                update_operation_status(error_msg, is_error=True)
+                return False
+            
+            print(f"✅ [TURBOSCRIBE] Copied {len(raw_text)} characters of raw text")
+            
+            # Step 5: Clean the transcript text
+            print(f"🧹 [TURBOSCRIBE] Step 5: Cleaning transcript text...")
+            cleaned_text = clean_transcript_text(raw_text)
+            
+            if not cleaned_text:
+                print(f"⚠️ [TURBOSCRIBE] Cleaned text is empty!")
+                hud.print("⚠️ Cleaned text is empty", "warning")
+                # Use raw text as fallback
+                cleaned_text = raw_text
+            
+            print(f"✅ [TURBOSCRIBE] Cleaned text: {len(cleaned_text)} characters")
+            
+            # Step 6: Delete existing audio files before saving new ones
+            print(f"🗑️ [TURBOSCRIBE] Step 6: Deleting existing audio files...")
+            delete_success = delete_existing_audio_files(project_title)
+            if not delete_success:
+                print(f"⚠️ [TURBOSCRIBE] Could not delete existing audio files, but continuing...")
+                hud.print("⚠️ Could not delete existing audio files", "warning")
+            
+            # Step 7: Save the cleaned transcript to audio folder
+            print(f"💾 [TURBOSCRIBE] Step 7: Saving transcript to audio folder...")
+            save_success = save_transcript_to_audio_folder(cleaned_text, project_title)
+            
+            if not save_success:
+                print(f"⚠️ [TURBOSCRIBE] Could not save transcript, but continuing...")
+                hud.print("⚠️ Could not save transcript", "warning")
+            
+            # ============================================
+            # STEP 8: LOOK FOR DOWNLOAD BUTTONS AND MOVE MOUSE (NO CLICK)
+            # ============================================
+            print(f"🔍 [TURBOSCRIBE] Step 8: Looking for download buttons (txt, pdf, srt, docx)...")
+            download_buttons = ["download txt", "download pdf", "download srt", "download docx", "download docs"]
+            
+            success, button_coords, text_elements, matched_text = check_for_download_button_with_vision(
+                hwnd, download_buttons, timeout_seconds=15
+            )
+            
+            if success and button_coords:
+                print(f"✅ [TURBOSCRIBE] Found '{matched_text}' - moving mouse to it (NOT clicking)")
+                
+                # Move mouse to the button but DON'T click
+                move_success = move_mouse_to_button(hwnd, button_coords)
+                if not move_success:
+                    print(f"⚠️ [TURBOSCRIBE] Could not move mouse to button, but continuing...")
+                    hud.print("⚠️ Could not move to button", "warning")
+            else:
+                print(f"⚠️ [TURBOSCRIBE] No download buttons found, but continuing...")
+                hud.print("⚠️ No download buttons found", "warning")
+            
+            # ============================================
+            # STEP 9: SCROLL DOWN TO REVEAL "DOWNLOAD AUDIO"
+            # ============================================
+            print(f"📜 [TURBOSCRIBE] Step 9: Scrolling down to reveal 'download audio' button...")
+            scroll_success = scroll_down_after_download(hwnd, button_coords if button_coords else None)
+            
+            if not scroll_success:
+                print(f"⚠️ [TURBOSCRIBE] Could not scroll down, but continuing...")
+                hud.print("⚠️ Could not scroll down", "warning")
+            
+            # Wait a moment after scrolling
+            time.sleep(2)
+            
+            # ============================================
+            # STEP 10: FIND AND CLICK "DOWNLOAD AUDIO"
+            # ============================================
+            print(f"🔍 [TURBOSCRIBE] Step 10: Finding 'download audio' button...")
+            success, audio_click_coords, text_elements = check_for_specific_download_button_with_vision(
+                hwnd, "download audio", timeout_seconds=15
+            )
+            
+            if not success or not audio_click_coords:
+                print(f"❌ [TURBOSCRIBE] Could not find 'download audio' button")
+                error_msg = "Could not find 'download audio' button"
+                update_operation_status(error_msg, is_error=True)
+                return False
+            
+            # Click the download audio button
+            audio_click_x, audio_click_y = audio_click_coords
+            print(f"🎯 [TURBOSCRIBE] Clicking 'download audio' at ({audio_click_x}, {audio_click_y})")
+            hud.print("📥 Clicking download audio button...", "clicking")
+            update_operation_status(f"Clicking download audio button for {project_title}...")
+            
+            enforce_window_focus(hwnd)
+            pyautogui.moveTo(audio_click_x, audio_click_y, duration=0.2)
+            pyautogui.click()
+            time.sleep(0.5)
+            
+            # Step 11: Monitor audio download
+            print(f"📊 [TURBOSCRIBE] Step 11: Monitoring audio download...")
+            audio_download_successful, audio_file_path, audio_filename = check_download_status_generic(
+                hwnd, project_title, ".mp3", timeout_seconds=180, check_interval=0.1
+            )
+            
+            # Also check for other audio formats if mp3 not found
+            if not audio_download_successful:
+                print(f"ℹ️ [TURBOSCRIBE] No MP3 found, checking for other audio formats...")
+                for ext in [".wav", ".m4a", ".aac", ".flac", ".ogg"]:
+                    audio_download_successful, audio_file_path, audio_filename = check_download_status_generic(
+                        hwnd, project_title, ext, timeout_seconds=30, check_interval=0.1
+                    )
+                    if audio_download_successful:
+                        print(f"✅ [TURBOSCRIBE] Found audio file with extension: {ext}")
+                        break
+            
+            if not audio_download_successful or not audio_file_path or not audio_filename:
+                print(f"❌ [TURBOSCRIBE] Audio download failed")
+                error_msg = "Audio download failed"
+                update_operation_status(error_msg, is_error=True)
+                return False
+            
+            print(f"✅ [TURBOSCRIBE] Audio download complete: {audio_filename}")
+            update_operation_status(f"Audio download complete: {audio_filename}")
+            
+            # Step 12: Move audio file to audio folder
+            print(f"📁 [TURBOSCRIBE] Step 12: Moving audio file to audio folder...")
+            audio_move_successful = move_file_to_audio_folder(
+                audio_file_path, audio_filename, project_title, "audio file"
+            )
+            
+            if not audio_move_successful:
+                print(f"⚠️ [TURBOSCRIBE] Could not move audio file")
+                hud.print("⚠️ Could not move audio file", "warning")
+            
+            print("🎉 [TURBOSCRIBE] Operation fully completed!")
+            hud.print("✅ Turboscribe complete!", "success")
+            update_operation_status(f"Turboscribe operation for {project_title} completed successfully", is_success=True)
+            return True
+            
+        except KeyboardInterrupt as ki:
+            update_operation_status("Turboscribe operation manually terminated by user", is_abort=True)
+            hud.show_summary("🛑 Program Halted")
+            print(f"\n✅ Program successfully halted: {ki}")
+            return False
+        except SystemExit as se:
+            print(f"🛑 System exit: {se}")
+            return False
+        except Exception as e:
+            print(f"❌ [TURBOSCRIBE] Error: {e}")
+            error_msg = f"Error in Turboscribe workflow: {str(e)}"
+            update_operation_status(error_msg, is_error=True)
+            hud.print("❌ Error occurred", "error")
+            return False
+        finally:
+            try:
+                keyboard.remove_hotkey('alt+/')
+                print("🧹 Cleaned up hotkey")
+            except Exception:
+                pass
+
+    def main_turboscribe_workflow():
+        try:
+            if not os.path.exists(PANEL_PATH):
+                print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
+                update_operation_status("panel.json not found", is_error=True)
+                return
+            
+            with open(PANEL_PATH, 'r', encoding='utf-8') as file:
+                panel_data = json.load(file)
+            
+            turboscribe_config = panel_data.get('turboscribe_config', {})
+            operate_turboscribe = turboscribe_config.get('operate_turboscribe', False)
+            
+            if not operate_turboscribe:
+                print("ℹ️ Turboscribe operation is disabled in config")
+                hud.print("ℹ️ Turboscribe operation disabled", "info")
+                update_operation_status("Turboscribe operation is disabled in configuration")
+                return
+            
+            turboscribe_url = turboscribe_config.get('turboscribe_project_url')
+            if not turboscribe_url or not turboscribe_url.strip():
+                print("❌ Error: 'turboscribe_project_url' not configured")
+                hud.print("❌ No Turboscribe URL configured", "error")
+                error_msg = "No Turboscribe URL configured in turboscribe_config"
+                update_operation_status(error_msg, is_error=True)
+                return
+            
+            hwnd = ensure_window_ready_and_focused()
+            print(f"🪟 [MAIN] Browser ready (HWND: {hwnd})")
+            update_operation_status("Browser initialized for Turboscribe operation")
+            
+            success = main_turboscribe_workflow_with_restart(
+                hwnd=hwnd,
+                turboscribe_url=turboscribe_url,
+                depth=0
+            )
+            
+            if success:
+                print("✅ [MAIN] Turboscribe workflow completed successfully!")
+                update_operation_status("Turboscribe workflow completed successfully", is_success=True)
+            else:
+                print("❌ [MAIN] Turboscribe workflow failed")
+                error_msg = "Turboscribe workflow failed"
+                update_operation_status(error_msg, is_error=True)
+                
+        except KeyboardInterrupt as ki:
+            update_operation_status("Turboscribe operation manually terminated by user", is_abort=True)
+            hud.show_summary("🛑 Program Halted")
+            print(f"\n✅ Program successfully halted: {ki}")
+        except SystemExit as se:
+            print(f"🛑 System exit: {se}")
+        except Exception as e:
+            print(f"❌ [MAIN] Error: {e}")
+            error_msg = f"Unexpected error in Turboscribe operation: {str(e)}"
+            update_operation_status(error_msg, is_error=True)
+            hud.print("❌ Error occurred", "error")
+        finally:
+            try:
+                keyboard.remove_hotkey('alt+/')
+                print("🧹 Cleaned up hotkey")
+            except Exception:
+                pass
+    
+    main_turboscribe_workflow()
 
 def operate_grok_browser():
     """
@@ -3289,17 +4851,35 @@ def operate_grok_browser():
         if not check_operation_status():
             raise SystemExit("Operation status invalid")
 
-    def safe_ocr():
+    def safe_vision():
         """Capture screen without hiding the HUD (HUD is click-through)"""
         check_for_termination()
-        return ocr()
+        return vision()
 
     def clean_string_completely(text):
-        """Normalize text by removing special characters and spaces for comparison"""
-        if not text: 
+        """
+        Clean a string for comparison by:
+        1. Converting to lowercase
+        2. Removing all non-alphanumeric characters
+        3. Removing common URL prefixes
+        4. Normalizing spaces and special characters
+        
+        This ensures that "iamkennyking's project_1" and "iamkennyking'sproject_1" 
+        both become "iamkennykingsproject1"
+        """
+        if not text:
             return ""
-        t = text.lower().replace("https", "").replace("http", "").replace("www", "")
+        
+        # Convert to lowercase
+        t = text.lower()
+        
+        # Remove common URL prefixes
+        t = t.replace("https://", "").replace("http://", "").replace("www.", "")
+        
+        # Remove all non-alphanumeric characters (this handles apostrophes, spaces, underscores, etc.)
+        # This is the key change - it removes ALL non-alphanumeric characters
         t = re.sub(r'[^a-z0-9]', '', t)
+        
         return t
 
     def normalize_text_for_comparison(text):
@@ -3544,7 +5124,7 @@ def operate_grok_browser():
         """
         print(f"🔍 [URL_CHECK] Checking if current page contains target URL: {target_url}")
         
-        current_texts = safe_ocr()
+        current_texts = safe_vision()
         if not current_texts:
             return False, None
         
@@ -3588,7 +5168,7 @@ def operate_grok_browser():
             check_for_termination()
             enforce_window_focus(hwnd)
             
-            current_texts = safe_ocr()
+            current_texts = safe_vision()
             if current_texts:
                 for element in current_texts:
                     element_text = element['text'].strip()
@@ -3615,7 +5195,7 @@ def operate_grok_browser():
             check_for_termination()
             enforce_window_focus(hwnd)
             
-            current_texts = safe_ocr()
+            current_texts = safe_vision()
             if current_texts:
                 for element in current_texts:
                     element_text = element['text'].strip()
@@ -3656,7 +5236,7 @@ def operate_grok_browser():
             # Step 2: Verify page is still loaded by checking for indicators
             print(f"🔍 [CTRL+B] Verifying page is still loaded...")
             
-            page_loaded, indicator = check_for_page_load_indicators(safe_ocr())
+            page_loaded, indicator = check_for_page_load_indicators(safe_vision())
             
             if not page_loaded:
                 print(f"⚠️ [CTRL+B] Page not loaded (attempt {attempt + 1}) - reloading...")
@@ -3710,7 +5290,7 @@ def operate_grok_browser():
             abort_operation(error_msg)
             return False, hwnd
         
-        current_texts = safe_ocr()
+        current_texts = safe_vision()
         
         if not current_texts:
             print("⚠️ [HISTORY] No text found on screen")
@@ -3781,7 +5361,7 @@ def operate_grok_browser():
             check_for_termination()
             enforce_window_focus(hwnd)
             
-            current_texts = safe_ocr()
+            current_texts = safe_vision()
             attempts += 1
             
             if not current_texts:
@@ -3838,7 +5418,7 @@ def operate_grok_browser():
     
     def extract_video_id_from_text(text_elements):
         """
-        Extract video ID from OCR text elements.
+        Extract video ID from vision text elements.
         Looks for the pattern: /post/ or /imagine/ followed by ID
         Returns the video ID string or None.
         """
@@ -3868,7 +5448,7 @@ def operate_grok_browser():
 
     def get_current_video_id(hwnd, timeout_seconds=5):
         """
-        Get the current video ID from the browser using OCR.
+        Get the current video ID from the browser using vision.
         Returns the video ID string or None.
         """
         print(f"🔍 [CURRENT_ID] Getting current video ID...")
@@ -3881,7 +5461,7 @@ def operate_grok_browser():
             check_for_termination()
             enforce_window_focus(hwnd)
             
-            current_texts = safe_ocr()
+            current_texts = safe_vision()
             if current_texts:
                 video_id = extract_video_id_from_text(current_texts)
                 if video_id:
@@ -3935,7 +5515,7 @@ def operate_grok_browser():
             check_for_termination()
             enforce_window_focus(hwnd)
             
-            current_texts = safe_ocr()
+            current_texts = safe_vision()
             if current_texts:
                 for element in current_texts:
                     element_text = element['text'].strip()
@@ -3970,7 +5550,7 @@ def operate_grok_browser():
         # Check for 'regenerate' or 'extend' before looking for download button
         print(f"🔍 [DOWNLOAD_BTN] Checking for 'regenerate' or 'extend'...")
         
-        current_texts = safe_ocr()
+        current_texts = safe_vision()
         found_indicator = False
         
         if current_texts:
@@ -3989,12 +5569,12 @@ def operate_grok_browser():
             print(f"✅ [DOWNLOAD_BTN] Ctrl+/ activated")
         
         # Define paths to download button images
-        download_btn1_path = os.path.join(GUI_IMAGE_PATH, "download_btn1.png")
-        download_btn2_path = os.path.join(GUI_IMAGE_PATH, "download_btn2.png")
+        download_btn1_path = os.path.join(GUI_IMAGES, "download_btn1.png")
+        download_btn2_path = os.path.join(GUI_IMAGES, "download_btn2.png")
         
         # Check if image files exist
         if not os.path.exists(download_btn1_path) and not os.path.exists(download_btn2_path):
-            print("❌ [DOWNLOAD_BTN] No download button images found in GUI_IMAGE_PATH")
+            print("❌ [DOWNLOAD_BTN] No download button images found in GUI_IMAGES")
             hud.print("❌ Download images missing", "error")
             error_msg = "Download button images not found"
             update_operation_status(error_msg, is_error=True)
@@ -4704,7 +6284,7 @@ def operate_grok_browser():
             check_for_termination()
             
             # Check for page load indicators
-            current_texts = safe_ocr()
+            current_texts = safe_vision()
             if current_texts:
                 page_loaded, indicator = check_for_page_load_indicators(current_texts)
                 
@@ -4722,7 +6302,7 @@ def operate_grok_browser():
                 time.sleep(1.5)
                 
                 # Check again after Ctrl+B
-                current_texts = safe_ocr()
+                current_texts = safe_vision()
                 if current_texts:
                     page_loaded, indicator = check_for_page_load_indicators(current_texts)
                     if page_loaded:
@@ -4748,8 +6328,8 @@ def operate_grok_browser():
         print(f"🔍 [MODAL] Checking for download modal using icon recognition...")
         
         # Define paths to download icon images
-        downloads_icon1_path = os.path.join(GUI_IMAGE_PATH, "downloads_icon1.png")
-        downloads_icon2_path = os.path.join(GUI_IMAGE_PATH, "downloads_icon2.png")
+        downloads_icon1_path = os.path.join(GUI_IMAGES, "downloads_icon1.png")
+        downloads_icon2_path = os.path.join(GUI_IMAGES, "downloads_icon2.png")
         
         # Check if image files exist
         if not os.path.exists(downloads_icon1_path) and not os.path.exists(downloads_icon2_path):
@@ -5349,7 +6929,7 @@ def operate_grok_browser():
             
             while reload_attempts < max_reloads and not page_loaded:
                 # Check for page load indicators (excluding time values)
-                current_texts = safe_ocr()
+                current_texts = safe_vision()
                 if current_texts:
                     page_loaded, load_indicator = check_for_page_load_indicators(current_texts)
                     
@@ -5388,7 +6968,7 @@ def operate_grok_browser():
             print(f"🔍 [VIDEO] Step 3: Checking for time value...")
             update_operation_status("Checking for video content...")
             
-            current_texts = safe_ocr()
+            current_texts = safe_vision()
             has_timevalue, time_element = check_for_timevalue(current_texts)
             
             if has_timevalue and time_element:
@@ -5642,10 +7222,13 @@ def operate_grok_browser():
 
 def operate_capcut():
     """
-    Launches/uses CapCut for video operations.
-    Features: Live HUD tracking, click-through overlay,
-    global hotkey interception, and CapCut-specific workflow.
-    Currently: Opens CapCut, finds and clicks "Create new project" text, stops there.
+    Launches/uses CapCut for project operations.
+    Workflow:
+    1. Write "create project, media, audio, import" to text_target.json
+    2. Call vision() to capture screen
+    3. If "create project" is found - click it (HIGHEST PRIORITY - always click if found)
+    4. If "create project" not found but "media", "audio", or "import" found - we're already in edit interface
+    5. If neither found - keep trying or report that CapCut isn't ready
     """
     # --- SPEED TUNING PARAMETERS ---
     pyautogui.PAUSE = 0.0
@@ -5665,23 +7248,12 @@ def operate_capcut():
     operation_aborted = False
 
     def update_operation_status(message, is_error=False, is_abort=False, is_success=False):
-        """
-        Update the operation status in panel.json with a professional message.
-        
-        Args:
-            message: The status message to write
-            is_error: Whether this is an error state
-            is_abort: Whether this is an abortion state
-            is_success: Whether this is a success state
-        """
         nonlocal operation_status_message, operation_status_flag, operation_aborted
         
         try:
-            # Read current panel data
             with open(PANEL_PATH, 'r', encoding='utf-8') as file:
                 current_panel = json.load(file)
             
-            # Format the status message professionally
             if is_abort:
                 operation_status_message = f"❌ ABORTED: {message}"
                 operation_status_flag = False
@@ -5695,14 +7267,11 @@ def operate_capcut():
             else:
                 operation_status_message = f"ℹ️ {message}"
             
-            # Update the operation_status field
             current_panel['operation_status'] = operation_status_message
             
-            # Write back to file
             with open(PANEL_PATH, 'w', encoding='utf-8') as file:
                 json.dump(current_panel, file, indent=4, ensure_ascii=False)
             
-            # If aborted, we should stop the program
             if is_abort:
                 print(f"🛑 [STATUS] Operation aborted: {message}")
                 raise SystemExit(f"Operation aborted: {message}")
@@ -5711,12 +7280,10 @@ def operate_capcut():
             print(f"⚠️ [STATUS] Failed to update operation status: {e}")
 
     def abort_operation(reason):
-        """Abort the operation with a specific reason."""
         print(f"🛑 [ABORT] Aborting operation: {reason}")
         update_operation_status(f"Aborting CapCut operation: {reason}", is_abort=True)
 
     def check_operation_status():
-        """Check if operation status is still valid (not aborted/errored)."""
         if not operation_status_flag or operation_aborted:
             print("🛑 [STATUS] Operation status is invalid - aborting")
             update_operation_status("Operation status invalid - aborting CapCut operation", is_abort=True)
@@ -5739,21 +7306,8 @@ def operate_capcut():
         if not check_operation_status():
             raise SystemExit("Operation status invalid")
 
-    def safe_ocr():
-        """Capture screen without hiding the HUD (HUD is click-through)"""
-        check_for_termination()
-        return ocr()
-
-    def normalize_text_for_comparison(text):
-        """More aggressive normalization for text matching"""
-        if not text:
-            return ""
-        t = text.lower()
-        t = re.sub(r'[^a-z0-9]', '', t)
-        return t
-
     # ============================================
-    # SECTION 1: WINDOW MANAGEMENT HELPERS
+    # WINDOW MANAGEMENT HELPERS
     # ============================================
     
     def get_current_monitor():
@@ -5766,7 +7320,6 @@ def operate_capcut():
                    win32api.GetSystemMetrics(win32con.SM_CYSCREEN))
     
     def get_capcut_window_on_monitor(monitor_bounds):
-        """Get CapCut window on specified monitor"""
         monitor_left, monitor_top, monitor_right, monitor_bottom = monitor_bounds
         capcut_windows = []
         capcut_process_names = ["capcut.exe", "CapCut.exe"]
@@ -5776,7 +7329,7 @@ def operate_capcut():
                 try:
                     _, pid = win32process.GetWindowThreadProcessId(hwnd)
                     process = psutil.Process(pid)
-                    if process.name().lower() in [p.lower() for p in capcut_process_names]:
+                    if process.name().lower() in [name.lower() for name in capcut_process_names]:
                         rect = win32gui.GetWindowRect(hwnd)
                         left, top, right, bottom = rect
                         width, height = right - left, bottom - top
@@ -5797,245 +7350,8 @@ def operate_capcut():
         capcut_windows.sort(key=lambda w: w['width'] * w['height'], reverse=True)
         return capcut_windows
 
-    def find_latest_capcut_path():
-        """
-        Dynamically find the latest CapCut executable path.
-        Searches in common locations and returns the path with the highest version number.
-        """
-        print(f"🔍 [CAPCUT] Searching for CapCut executable...")
-        
-        # Define base search paths
-        search_paths = [
-            os.path.join(os.environ.get('USERPROFILE', ''), 'CapCut'),
-            r"C:\Program Files\CapCut",
-            r"C:\Program Files (x86)\CapCut",
-            os.path.join(os.environ.get('LOCALAPPDATA', ''), 'CapCut'),
-            os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs', 'CapCut'),
-            os.path.join(os.environ.get('APPDATA', ''), 'CapCut'),
-        ]
-        
-        found_versions = []
-        
-        # Search for CapCut.exe in all possible locations
-        for search_path in search_paths:
-            if not os.path.exists(search_path):
-                continue
-            
-            print(f"🔍 [CAPCUT] Searching in: {search_path}")
-            
-            # Check if CapCut.exe exists directly in this path
-            direct_path = os.path.join(search_path, 'CapCut.exe')
-            if os.path.exists(direct_path):
-                # Try to extract version from parent directory name
-                version = os.path.basename(search_path)
-                # If the directory name doesn't look like a version, use a default
-                if not re.match(r'^\d+\.\d+\.\d+\.\d+$', version):
-                    version = '0.0.0.0'
-                found_versions.append((version, direct_path))
-                print(f"   ✅ Found: {direct_path} (version: {version})")
-            
-            # Check for version subdirectories
-            try:
-                for item in os.listdir(search_path):
-                    item_path = os.path.join(search_path, item)
-                    if os.path.isdir(item_path):
-                        # Check if this directory contains CapCut.exe
-                        exe_path = os.path.join(item_path, 'CapCut.exe')
-                        if os.path.exists(exe_path):
-                            # Try to extract version from directory name
-                            version = item
-                            if not re.match(r'^\d+\.\d+\.\d+\.\d+$', version):
-                                # Try to extract version from directory name with pattern
-                                version_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', item)
-                                if version_match:
-                                    version = version_match.group(1)
-                                else:
-                                    version = '0.0.0.0'
-                            found_versions.append((version, exe_path))
-                            print(f"   ✅ Found: {exe_path} (version: {version})")
-            except Exception as e:
-                print(f"   ⚠️ Error scanning {search_path}: {e}")
-        
-        # If no versions found, try a more aggressive search
-        if not found_versions:
-            print(f"🔍 [CAPCUT] No CapCut found in common locations, performing deep search...")
-            
-            # Search in user's home directory
-            home_dir = os.environ.get('USERPROFILE', '')
-            if home_dir:
-                for root, dirs, files in os.walk(home_dir):
-                    if 'CapCut.exe' in files:
-                        exe_path = os.path.join(root, 'CapCut.exe')
-                        # Try to extract version from path
-                        version_match = re.search(r'(\d+\.\d+\.\d+\.\d+)', root)
-                        if version_match:
-                            version = version_match.group(1)
-                        else:
-                            # Try to get version from file properties
-                            try:
-                                import win32api
-                                info = win32api.GetFileVersionInfo(exe_path, "\\")
-                                version = f"{info['FileVersionMS'] >> 16}.{info['FileVersionMS'] & 0xFFFF}.{info['FileVersionLS'] >> 16}.{info['FileVersionLS'] & 0xFFFF}"
-                            except:
-                                version = '0.0.0.0'
-                        found_versions.append((version, exe_path))
-                        print(f"   ✅ Found: {exe_path} (version: {version})")
-                        break  # Stop after finding first one to avoid too many results
-        
-        if not found_versions:
-            print(f"❌ [CAPCUT] No CapCut executable found")
-            return None
-        
-        # Sort by version and return the latest
-        def parse_version(version_str):
-            try:
-                return tuple(map(int, version_str.split('.')))
-            except:
-                return (0, 0, 0, 0)
-        
-        found_versions.sort(key=lambda x: parse_version(x[0]), reverse=True)
-        latest_version, latest_path = found_versions[0]
-        
-        print(f"✅ [CAPCUT] Latest version found: {latest_version} at {latest_path}")
-        return latest_path
-
-    def handle_capcut_loading(hwnd, timeout_seconds=60, check_interval=0.5):
-        """
-        Handle CapCut's loading process including:
-        - "Running environment" screen
-        - "Confirm" button clicks
-        - Wait for main window to fully appear
-        """
-        print(f"⏳ [CAPCUT] Handling CapCut loading process...")
-        hud.print("⏳ CapCut is loading...", "waiting")
-        update_operation_status("CapCut loading, please wait...")
-        
-        start_time = time.time()
-        confirm_clicked = False
-        main_window_detected = False
-        
-        # First, wait for any window to appear
-        while time.time() - start_time < timeout_seconds:
-            check_for_termination()
-            
-            # Check if CapCut main window exists
-            current_monitor = get_current_monitor()
-            capcut_windows = get_capcut_window_on_monitor(current_monitor)
-            
-            if capcut_windows:
-                hwnd = capcut_windows[0]['hwnd']
-                print(f"🪟 [CAPCUT] Found CapCut window: {hwnd}")
-                
-                # Try to bring it to focus
-                try:
-                    if win32gui.IsIconic(hwnd):
-                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                        time.sleep(0.3)
-                    win32gui.SetForegroundWindow(hwnd)
-                    time.sleep(0.2)
-                except:
-                    pass
-                
-                # Check for "Confirm" button or similar text
-                print(f"🔍 [CAPCUT] Checking for Confirm button...")
-                current_texts = safe_ocr()
-                
-                if current_texts:
-                    confirm_found = False
-                    confirm_element = None
-                    
-                    # Look for "Confirm", "Continue", "OK", "Yes" buttons
-                    confirm_variations = ["confirm", "continue", "ok", "yes", "accept"]
-                    
-                    for element in current_texts:
-                        element_text = element['text'].strip().lower()
-                        normalized_element = normalize_text_for_comparison(element_text)
-                        
-                        for variation in confirm_variations:
-                            if variation in normalized_element or variation == normalized_element:
-                                confirm_found = True
-                                confirm_element = element
-                                print(f"✅ [CAPCUT] Found '{element_text}' button")
-                                break
-                        
-                        if confirm_found:
-                            break
-                    
-                    if confirm_found and confirm_element and not confirm_clicked:
-                        # Click the confirm button
-                        click_x = int(confirm_element['left'] + (confirm_element['width'] / 2))
-                        click_y = int(confirm_element['top'] + (confirm_element['height'] / 2))
-                        
-                        print(f"🎯 [CAPCUT] Clicking Confirm at position ({click_x}, {click_y})")
-                        hud.print("✅ Clicking Confirm...", "success")
-                        update_operation_status("Clicking Confirm button...")
-                        
-                        pyautogui.moveTo(click_x, click_y, duration=0.2)
-                        pyautogui.click()
-                        time.sleep(0.5)
-                        
-                        confirm_clicked = True
-                        print(f"✅ [CAPCUT] Confirm button clicked")
-                        
-                        # Wait for main window after clicking
-                        time.sleep(3)
-                        continue
-                    
-                    # Check if main window has loaded (look for typical CapCut UI elements)
-                    main_indicators = ["timeline", "video", "audio", "media", "export", "project"]
-                    for indicator in main_indicators:
-                        for element in current_texts:
-                            element_text = element['text'].strip().lower()
-                            normalized_element = normalize_text_for_comparison(element_text)
-                            if indicator in normalized_element:
-                                main_window_detected = True
-                                print(f"✅ [CAPCUT] Main window detected - found '{indicator}'")
-                                update_operation_status("CapCut main window loaded")
-                                return True, hwnd
-                
-                # If we clicked confirm but main window not detected yet, keep waiting
-                if confirm_clicked:
-                    print(f"⏳ [CAPCUT] Waiting for main window...")
-                    time.sleep(check_interval)
-                    continue
-                
-                # Check if window size is large enough (might be loaded)
-                if capcut_windows:
-                    window = capcut_windows[0]
-                    if window['width'] > 800 and window['height'] > 600:
-                        print(f"✅ [CAPCUT] Large window detected - assuming loaded")
-                        update_operation_status("CapCut window loaded")
-                        return True, hwnd
-            
-            # If no window found yet, wait and try again
-            time.sleep(check_interval)
-            
-            # Show progress every 10 seconds
-            elapsed = int(time.time() - start_time)
-            if elapsed > 0 and elapsed % 10 == 0:
-                print(f"⏳ [CAPCUT] Still loading... ({elapsed}s)")
-                hud.print(f"⏳ Loading CapCut... ({elapsed}s)", "waiting")
-                update_operation_status(f"CapCut loading... ({elapsed}s)")
-        
-        print(f"❌ [CAPCUT] Timeout waiting for CapCut to load")
-        return False, hwnd
-
     def ensure_capcut_window_ready():
-        """Ensure CapCut window exists and is maximized/focused"""
         check_for_termination()
-        
-        # Get CapCut executable path dynamically
-        capcut_path = find_latest_capcut_path()
-        
-        if not capcut_path:
-            error_msg = "CapCut executable not found on system"
-            print(f"❌ [CAPCUT] {error_msg}")
-            hud.print("❌ CapCut not found", "error")
-            update_operation_status(error_msg, is_error=True)
-            abort_operation(error_msg)
-            raise RuntimeError(error_msg)
-        
-        print(f"✅ [CAPCUT] Using CapCut at: {capcut_path}")
         
         current_monitor = get_current_monitor()
         monitor_left, monitor_top, monitor_right, monitor_bottom = current_monitor
@@ -6063,31 +7379,33 @@ def operate_capcut():
                 time.sleep(0.2)
                 
                 print("✅ [WINDOW] Window ready - maximized and focused")
-                update_operation_status("CapCut window ready")
-                
-                # Handle loading process if needed
-                success, hwnd = handle_capcut_loading(hwnd)
-                if success:
-                    return hwnd
-                else:
-                    print(f"⚠️ [CAPCUT] Loading handling failed, but continuing...")
-                    return hwnd
-                    
+                update_operation_status("CapCut window ready for operation")
+                return hwnd
             except Exception as e:
                 print(f"⚠️ [WINDOW] Error preparing existing window: {e}")
                 pass
         
-        # No CapCut window found, launch new instance
-        print(f"💻 [WINDOW] No CapCut window found, launching new instance...")
-        print(f"🚀 [WINDOW] Launching: {capcut_path}")
-        update_operation_status("Launching CapCut...")
-        subprocess.Popen([capcut_path])
+        print("💻 [WINDOW] No CapCut window found, launching new instance...")
+        update_operation_status("Launching CapCut for operation...")
         
-        # Wait for the window to appear with loading handling
-        print(f"⏳ [WINDOW] Waiting for CapCut to launch and load...")
-        hud.print("⏳ Launching CapCut...", "waiting")
+        capcut_paths = [
+            r"C:\Program Files\CapCut\CapCut.exe",
+            r"C:\Program Files (x86)\CapCut\CapCut.exe",
+            r"C:\Users\{}\AppData\Local\CapCut\CapCut.exe".format(os.getlogin()),
+        ]
         
-        for attempt in range(60):  # Wait up to 30 seconds for initial window
+        capcut_exe = None
+        for path in capcut_paths:
+            if os.path.exists(path):
+                capcut_exe = path
+                break
+        
+        if capcut_exe:
+            subprocess.Popen([capcut_exe])
+        else:
+            subprocess.Popen(["start", "CapCut"], shell=True)
+        
+        for attempt in range(30):
             check_for_termination()
             time.sleep(0.5)
             capcut_windows = get_capcut_window_on_monitor(current_monitor)
@@ -6104,26 +7422,13 @@ def operate_capcut():
                     win32gui.SetForegroundWindow(hwnd)
                     time.sleep(0.2)
                     print("✅ [WINDOW] New window ready - maximized and focused")
-                    update_operation_status("CapCut window ready")
-                    
-                    # Handle loading process
-                    success, hwnd = handle_capcut_loading(hwnd)
-                    if success:
-                        return hwnd
-                    else:
-                        print(f"⚠️ [CAPCUT] Loading handling failed, but continuing...")
-                        return hwnd
-                        
+                    update_operation_status("CapCut launched successfully")
+                    return hwnd
                 except Exception as e:
                     print(f"⚠️ [WINDOW] Error preparing new window: {e}")
                     continue
-            
-            # Show progress every 10 seconds
-            if attempt > 0 and attempt % 20 == 0:
-                print(f"⏳ [WINDOW] Still waiting for CapCut... ({attempt/2}s)")
-                hud.print(f"⏳ Waiting for CapCut... ({attempt/2}s)", "waiting")
         
-        error_msg = "Failed to get or launch CapCut window"
+        error_msg = "Failed to get or launch CapCut window for operation"
         update_operation_status(error_msg, is_error=True)
         abort_operation(error_msg)
         raise RuntimeError(error_msg)
@@ -6164,178 +7469,248 @@ def operate_capcut():
         except Exception as e:
             print(f"⚠️ [FOCUS] Focus correction exception: {e}")
             return False
+    
+    def ensure_window_ready_and_focused():
+        check_for_termination()
+        hwnd = ensure_capcut_window_ready()
+        enforce_window_focus(hwnd)
+        return hwnd
 
     # ============================================
-    # SECTION 2: CAPCUT-SPECIFIC HELPERS
+    # CHECK INTERFACE STATE
     # ============================================
     
-    def wait_for_text_on_screen(target_text, timeout_seconds=15, check_interval=0.2):
+    def check_interface_state():
         """
-        Wait for specific text to appear on screen using OCR.
-        Returns: (found, text_elements)
+        Checks the screen_content.text file to determine the current CapCut interface state.
+        Returns:
+            dict: {
+                'has_create_project': bool,
+                'has_edit_interface': bool,
+                'create_project_coords': dict or None,
+                'found_values': list
+            }
         """
-        print(f"🔍 [OCR] Waiting for text: '{target_text}'")
+        print("🔍 [CAPCUT_STATE] Analyzing CapCut interface state...")
         
-        normalized_target = normalize_text_for_comparison(target_text)
-        start_time = time.time()
+        result = {
+            'has_create_project': False,
+            'has_edit_interface': False,
+            'create_project_coords': None,
+            'found_values': []
+        }
         
-        while time.time() - start_time < timeout_seconds:
-            check_for_termination()
+        try:
+            if not os.path.exists(SCREEN_TEXT_CONTENT):
+                print(f"❌ [CAPCUT_STATE] screen_content.text not found at: {SCREEN_TEXT_CONTENT}")
+                return result
             
-            current_texts = safe_ocr()
-            if current_texts:
-                for element in current_texts:
-                    element_text = element['text'].strip()
-                    normalized_element = normalize_text_for_comparison(element_text)
-                    
-                    if normalized_target in normalized_element:
-                        print(f"✅ [OCR] Found text: '{element_text}'")
-                        return True, current_texts
+            with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
+                content = file.read()
             
-            time.sleep(check_interval)
-        
-        print(f"❌ [OCR] Text not found within {timeout_seconds}s: '{target_text}'")
-        return False, None
-
-    def click_text_on_screen(hwnd, target_text, timeout_seconds=15, check_interval=0.2):
-        """
-        Find text using OCR and click it.
-        Returns: (success, hwnd)
-        """
-        print(f"🎯 [CLICK] Looking for text to click: '{target_text}'")
-        hud.print(f"🔍 Finding: {target_text}...", "searching")
-        update_operation_status(f"Looking for '{target_text}'...")
-        
-        normalized_target = normalize_text_for_comparison(target_text)
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout_seconds:
-            check_for_termination()
-            enforce_window_focus(hwnd)
+            # ============================================
+            # Check for "Create project" with coordinates
+            # ============================================
+            create_project_pattern = r'"text_\d+":\s*"([^"]*Create[Pp]roject[^"]*)"\s*,\s*"coordinates":\s*\{\s*"top":\s*(\d+)\s*,\s*"right":\s*(\d+)\s*,\s*"left":\s*(\d+)\s*,\s*"bottom":\s*(\d+)\s*\}'
             
-            current_texts = safe_ocr()
-            if current_texts:
-                for element in current_texts:
-                    element_text = element['text'].strip()
-                    normalized_element = normalize_text_for_comparison(element_text)
-                    
-                    if normalized_target in normalized_element:
-                        click_x = int(element['left'] + (element['width'] / 2))
-                        click_y = int(element['top'] + (element['height'] / 2))
-                        
-                        print(f"🎯 [CLICK] Found '{target_text}' at position ({click_x}, {click_y})")
-                        print(f"🎯 [CLICK] Text: '{element_text}'")
-                        
-                        enforce_window_focus(hwnd)
-                        pyautogui.moveTo(click_x, click_y, duration=0.2)
-                        pyautogui.click()
-                        time.sleep(0.5)
-                        
-                        print(f"✅ [CLICK] Successfully clicked '{target_text}'")
-                        hud.print(f"✅ Clicked: {target_text}", "success")
-                        update_operation_status(f"Clicked '{target_text}' successfully")
-                        return True, hwnd
+            create_match = re.search(create_project_pattern, content, re.DOTALL | re.IGNORECASE)
             
-            time.sleep(check_interval)
-        
-        print(f"❌ [CLICK] Could not find text within {timeout_seconds}s: '{target_text}'")
-        hud.print(f"❌ Not found: {target_text}", "error")
-        error_msg = f"Could not find '{target_text}' on screen within {timeout_seconds} seconds"
-        update_operation_status(error_msg, is_error=True)
-        return False, hwnd
-
-    def capcut_create_new_project_workflow(hwnd):
-        """
-        CapCut workflow: Find and click "Create new project" text.
-        Stops after clicking and waits for the project window to appear.
-        """
-        print("🎬 [CAPCUT] Starting CapCut workflow...")
-        update_operation_status("Starting CapCut workflow...")
-        
-        # Step 1: Wait for CapCut to fully load
-        print(f"⏳ [CAPCUT] Waiting for CapCut interface to load...")
-        hud.print("⏳ Waiting for CapCut...", "waiting")
-        time.sleep(3)
-        
-        # Step 2: Look for "Create new project" text
-        print(f"🔍 [CAPCUT] Looking for 'Create new project'...")
-        hud.print("🔍 Looking for Create new project...", "searching")
-        update_operation_status("Searching for 'Create new project'...")
-        
-        # Try multiple variations of the text
-        text_variations = [
-            "Create new project",
-            "New project",
-            "Create project",
-            "Create"
-        ]
-        
-        found = False
-        for variation in text_variations:
-            print(f"🔍 [CAPCUT] Trying variation: '{variation}'")
-            success, hwnd = click_text_on_screen(
-                hwnd, 
-                variation, 
-                timeout_seconds=5, 
-                check_interval=0.2
-            )
+            if create_match:
+                text_value = create_match.group(1)
+                top = int(create_match.group(2))
+                right = int(create_match.group(3))
+                left = int(create_match.group(4))
+                bottom = int(create_match.group(5))
+                
+                result['has_create_project'] = True
+                result['create_project_coords'] = {
+                    'left': left,
+                    'top': top,
+                    'right': right,
+                    'bottom': bottom,
+                    'text': text_value
+                }
+                result['found_values'].append('create_project')
+                print(f"✅ [CAPCUT_STATE] Found 'Create project' at ({left}, {top}) -> ({right}, {bottom})")
             
-            if success:
-                found = True
-                print(f"✅ [CAPCUT] Successfully clicked '{variation}'")
-                update_operation_status(f"Clicked '{variation}' successfully")
-                break
-        
-        if not found:
-            print(f"❌ [CAPCUT] Could not find 'Create new project' button")
-            hud.print("❌ Create new project not found", "error")
-            error_msg = "Could not find 'Create new project' button in CapCut"
-            update_operation_status(error_msg, is_error=True)
-            return False, hwnd
-        
-        # Step 3: Wait for the project window to appear
-        print(f"⏳ [CAPCUT] Waiting for project window to appear...")
-        hud.print("⏳ Waiting for project window...", "waiting")
-        update_operation_status("Waiting for CapCut project window...")
-        time.sleep(3)
-        
-        # Step 4: Verify the project window loaded by checking for common elements
-        print(f"🔍 [CAPCUT] Verifying project window is loaded...")
-        
-        # Look for common CapCut project window indicators
-        project_indicators = [
-            "timeline",
-            "video",
-            "audio",
-            "media",
-            "export"
-        ]
-        
-        found_indicator = False
-        for indicator in project_indicators:
-            success, _ = wait_for_text_on_screen(indicator, timeout_seconds=3, check_interval=0.3)
-            if success:
-                found_indicator = True
-                print(f"✅ [CAPCUT] Project window verified - found '{indicator}'")
-                update_operation_status(f"CapCut project window loaded - found '{indicator}'")
-                break
-        
-        if not found_indicator:
-            print(f"ℹ️ [CAPCUT] Project window appears to be loaded (no specific indicator found)")
-            update_operation_status("CapCut project window loaded")
-        
-        print(f"✅ [CAPCUT] CapCut workflow completed - stopped at project window")
-        hud.print("✅ CapCut ready at project window", "success")
-        update_operation_status("CapCut workflow completed - ready at project window", is_success=True)
-        
-        return True, hwnd
+            # ============================================
+            # Check for edit interface values (media, audio, import)
+            # ============================================
+            # Search in JSON format
+            json_pattern = r'"text_\d+":\s*"([^"]+)"'
+            json_matches = re.findall(json_pattern, content, re.IGNORECASE)
+            
+            edit_keywords = ["media", "audio", "import"]
+            
+            for text in json_matches:
+                text_lower = text.lower()
+                for keyword in edit_keywords:
+                    if keyword in text_lower and keyword not in result['found_values']:
+                        result['found_values'].append(keyword)
+                        print(f"✅ [CAPCUT_STATE] Found '{keyword}' in text: '{text[:50]}...'")
+            
+            # Search in compact format
+            compact_pattern = r',\s*[\'"]([^\'"]+)[\'"]'
+            compact_matches = re.findall(compact_pattern, content, re.IGNORECASE)
+            
+            for text in compact_matches:
+                text_lower = text.lower()
+                for keyword in edit_keywords:
+                    if keyword in text_lower and keyword not in result['found_values']:
+                        result['found_values'].append(keyword)
+                        print(f"✅ [CAPCUT_STATE] Found '{keyword}' in compact format: '{text[:50]}...'")
+            
+            # Search in text format
+            text_pattern = r'•\s*([^\n]+)'
+            text_matches = re.findall(text_pattern, content)
+            
+            for text in text_matches:
+                text_lower = text.lower()
+                for keyword in edit_keywords:
+                    if keyword in text_lower and keyword not in result['found_values']:
+                        result['found_values'].append(keyword)
+                        print(f"✅ [CAPCUT_STATE] Found '{keyword}' in text format: '{text[:50]}...'")
+            
+            # Determine if we have edit interface
+            edit_interface_values = ["media", "audio", "import"]
+            has_edit_values = any(val in result['found_values'] for val in edit_interface_values)
+            
+            if has_edit_values:
+                result['has_edit_interface'] = True
+                print(f"✅ [CAPCUT_STATE] Edit interface detected! Found: {', '.join([v for v in result['found_values'] if v in edit_interface_values])}")
+            
+            return result
+            
+        except Exception as e:
+            print(f"❌ [CAPCUT_STATE] Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return result
 
     # ============================================
-    # SECTION 3: MAIN CAPCUT WORKFLOW
+    # CLICK CREATE PROJECT - DIRECT FILE READ
+    # ============================================
+    
+    def click_create_project():
+        """
+        Directly reads the screen_content.text file, finds "Createproject" in the JSON format,
+        extracts the coordinates, and clicks on the center of the region.
+        Does NOT call safe_vision() - just reads the file and clicks.
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        print("🔍 [CAPCUT_CLICK] Looking for 'Createproject' in screen_content.text...")
+        
+        try:
+            if not os.path.exists(SCREEN_TEXT_CONTENT):
+                print(f"❌ [CAPCUT_CLICK] screen_content.text not found at: {SCREEN_TEXT_CONTENT}")
+                return False
+            
+            with open(SCREEN_TEXT_CONTENT, 'r', encoding='utf-8') as file:
+                content = file.read()
+            
+            # ============================================
+            # METHOD 1: Find "Createproject" in JSON format
+            # ============================================
+            json_pattern = r'"text_\d+":\s*"([^"]*Create[Pp]roject[^"]*)"\s*,\s*"coordinates":\s*\{\s*"top":\s*(\d+)\s*,\s*"right":\s*(\d+)\s*,\s*"left":\s*(\d+)\s*,\s*"bottom":\s*(\d+)\s*\}'
+            
+            match = re.search(json_pattern, content, re.DOTALL | re.IGNORECASE)
+            
+            if match:
+                text_value = match.group(1)
+                top = int(match.group(2))
+                right = int(match.group(3))
+                left = int(match.group(4))
+                bottom = int(match.group(5))
+                
+                print(f"✅ [CAPCUT_CLICK] Found 'Createproject' in JSON:")
+                print(f"   Text: '{text_value}'")
+                print(f"   Coordinates: Left={left}, Top={top}, Right={right}, Bottom={bottom}")
+                
+                click_x = left + ((right - left) // 2)
+                click_y = top + ((bottom - top) // 2)
+                
+                print(f"🎯 [CAPCUT_CLICK] Click position: ({click_x}, {click_y})")
+                
+                pyautogui.moveTo(click_x, click_y, duration=0.2)
+                pyautogui.click()
+                
+                print(f"✅ [CAPCUT_CLICK] Clicked 'Createproject' at ({click_x}, {click_y})")
+                return True
+            
+            # ============================================
+            # METHOD 2: Look for "Createproject" in compact format
+            # ============================================
+            compact_pattern = r'(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*[\'"]([^\'"]*Create[Pp]roject[^\'"]*)[\'"]'
+            
+            compact_match = re.search(compact_pattern, content, re.IGNORECASE)
+            
+            if compact_match:
+                left = int(compact_match.group(1))
+                top = int(compact_match.group(2))
+                right = int(compact_match.group(3))
+                bottom = int(compact_match.group(4))
+                text_value = compact_match.group(5)
+                
+                print(f"✅ [CAPCUT_CLICK] Found 'Createproject' in compact format:")
+                print(f"   Text: '{text_value}'")
+                print(f"   Coordinates: Left={left}, Top={top}, Right={right}, Bottom={bottom}")
+                
+                click_x = left + ((right - left) // 2)
+                click_y = top + ((bottom - top) // 2)
+                
+                print(f"🎯 [CAPCUT_CLICK] Click position: ({click_x}, {click_y})")
+                
+                pyautogui.moveTo(click_x, click_y, duration=0.2)
+                pyautogui.click()
+                
+                print(f"✅ [CAPCUT_CLICK] Clicked 'Createproject' at ({click_x}, {click_y})")
+                return True
+            
+            # ============================================
+            # METHOD 3: Look for "Createproject" in text format
+            # ============================================
+            text_pattern = r'TEXT BLOCK #\d+:\s*•\s*(.+?Create[Pp]roject.+?)\s+Left:\s*(\d+)\s+Top:\s*(\d+)\s+Right:\s*(\d+)\s+Bottom:\s*(\d+)'
+            
+            text_match = re.search(text_pattern, content, re.DOTALL | re.IGNORECASE)
+            
+            if text_match:
+                text_value = text_match.group(1).strip()
+                left = int(text_match.group(2))
+                top = int(text_match.group(3))
+                right = int(text_match.group(4))
+                bottom = int(text_match.group(5))
+                
+                print(f"✅ [CAPCUT_CLICK] Found 'Createproject' in text format:")
+                print(f"   Text: '{text_value}'")
+                print(f"   Coordinates: Left={left}, Top={top}, Right={right}, Bottom={bottom}")
+                
+                click_x = left + ((right - left) // 2)
+                click_y = top + ((bottom - top) // 2)
+                
+                print(f"🎯 [CAPCUT_CLICK] Click position: ({click_x}, {click_y})")
+                
+                pyautogui.moveTo(click_x, click_y, duration=0.2)
+                pyautogui.click()
+                
+                print(f"✅ [CAPCUT_CLICK] Clicked 'Createproject' at ({click_x}, {click_y})")
+                return True
+            
+            print(f"❌ [CAPCUT_CLICK] Could not find 'Createproject' in screen_content.text")
+            return False
+            
+        except Exception as e:
+            print(f"❌ [CAPCUT_CLICK] Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    # ============================================
+    # MAIN CAPCUT WORKFLOW
     # ============================================
     
     def main_capcut_workflow():
-        """Main CapCut workflow execution."""
         try:
             if not os.path.exists(PANEL_PATH):
                 print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
@@ -6345,7 +7720,6 @@ def operate_capcut():
             with open(PANEL_PATH, 'r', encoding='utf-8') as file:
                 panel_data = json.load(file)
             
-            # Navigate to capcut_config
             capcut_config = panel_data.get('capcut_config', {})
             operate_capcut = capcut_config.get('operate_capcut', False)
             
@@ -6355,25 +7729,103 @@ def operate_capcut():
                 update_operation_status("CapCut operation is disabled in configuration")
                 return
             
-            print("🎬 [MAIN] Starting CapCut operation...")
-            hud.print("🎬 Starting CapCut...", "info")
-            update_operation_status("Starting CapCut operation...")
+            project_title = panel_data.get('project_title', 'capcut_project')
             
-            # Initialize CapCut window
-            hwnd = ensure_capcut_window_ready()
+            # Ensure CapCut window is ready
+            hwnd = ensure_window_ready_and_focused()
             print(f"🪟 [MAIN] CapCut ready (HWND: {hwnd})")
-            update_operation_status("CapCut initialized")
+            update_operation_status(f"Starting CapCut workflow for {project_title}")
             
-            # Run the CapCut workflow
-            success, hwnd = capcut_create_new_project_workflow(hwnd)
+            # ============================================
+            # STEP 1: Write all targets and capture screen
+            # ============================================
+            print("📝 [CAPCUT] Analyzing current CapCut interface state...")
             
-            if success:
-                print("✅ [MAIN] CapCut workflow completed successfully!")
-                update_operation_status("CapCut workflow completed successfully", is_success=True)
+            # Write all target values to text_target.json
+            try:
+                text_target_data = {"value": "create project, media, audio, import"}
+                with open(TEXT_TARGET, 'w', encoding='utf-8') as file:
+                    json.dump(text_target_data, file, indent=4)
+                print(f"✅ [CAPCUT] Wrote 'create project, media, audio, import' to {TEXT_TARGET}")
+            except Exception as e:
+                print(f"⚠️ [CAPCUT] Error writing to text_target.json: {e}")
+            
+            # Wait a moment
+            time.sleep(0.5)
+            
+            # Call vision() to capture the current screen
+            print(f"📸 [CAPCUT] Calling vision() to capture screen...")
+            vision()
+            
+            # Wait for file to be written
+            time.sleep(0.5)
+            
+            # ============================================
+            # STEP 2: Check interface state
+            # ============================================
+            interface_state = check_interface_state()
+            
+            print("\n" + "="*60)
+            print("📊 [CAPCUT] Interface State Summary:")
+            print(f"   Has 'Create Project': {interface_state['has_create_project']}")
+            print(f"   Has Edit Interface: {interface_state['has_edit_interface']}")
+            print(f"   Found Values: {', '.join(interface_state['found_values']) if interface_state['found_values'] else 'None'}")
+            print("="*60 + "\n")
+            
+            # ============================================
+            # STEP 3: Decision logic - CLEAR AND SIMPLE
+            # ============================================
+            if interface_state['has_create_project']:
+                # HIGHEST PRIORITY: If Create Project exists, ALWAYS click it
+                print("🎯 [CAPCUT] 'Create Project' detected - clicking it to create project...")
+                click_success = click_create_project()
+                
+                if click_success:
+                    print("✅ [CAPCUT] 'Create project' clicked successfully!")
+                    update_operation_status(f"CapCut project creation clicked successfully", is_success=True)
+                    
+                    # Wait for project to create
+                    print(f"⏳ [CAPCUT] Waiting for project to create...")
+                    time.sleep(3)
+                    
+                    # Re-check interface after clicking create project
+                    print("📸 [CAPCUT] Re-checking interface after clicking create project...")
+                    vision()
+                    time.sleep(0.5)
+                    
+                    # Check if we're now in edit interface
+                    new_state = check_interface_state()
+                    if new_state['has_edit_interface']:
+                        print("🎉 [CAPCUT] Successfully created project and entered edit interface!")
+                        hud.print("✅ CapCut project created successfully!", "success")
+                        update_operation_status(f"CapCut project for {project_title} created and in edit interface", is_success=True)
+                    else:
+                        print("⚠️ [CAPCUT] Project created but edit interface not detected yet")
+                        hud.print("⚠️ CapCut project created, but edit interface pending", "warning")
+                        update_operation_status(f"CapCut project created, edit interface not confirmed", is_error=True)
+                else:
+                    print(f"❌ [CAPCUT] Failed to click 'create project'")
+                    error_msg = f"Failed to click 'create project' in CapCut"
+                    update_operation_status(error_msg, is_error=True)
+                    
+            elif interface_state['has_edit_interface']:
+                # We're already in edit interface - no need to click anything
+                print("✅ [CAPCUT] Already in edit interface! No action needed.")
+                hud.print("✅ CapCut edit interface ready!", "success")
+                update_operation_status(f"CapCut already in edit interface for {project_title}", is_success=True)
+                
             else:
-                print("❌ [MAIN] CapCut workflow failed")
-                error_msg = "CapCut workflow failed"
-                update_operation_status(error_msg, is_error=True)
+                # Neither create project nor edit interface found - CapCut is in an unknown state
+                # This means CapCut might be on a different screen or still loading
+                print("❌ [CAPCUT] Neither 'Create Project' nor edit interface detected.")
+                print("   This means CapCut is in an UNKNOWN state (not on create project screen, not in edit interface)")
+                print("   Possible reasons:")
+                print("   1. CapCut is still loading")
+                print("   2. A different dialog/window is showing")
+                print("   3. Vision detection failed to capture the text")
+                print("   4. CapCut is minimized or not focused")
+                update_operation_status("CapCut in UNKNOWN state - neither create project nor edit interface detected", is_error=True)
+                hud.print("❌ CapCut in unknown state", "error")
             
         except KeyboardInterrupt as ki:
             update_operation_status("CapCut operation manually terminated by user", is_abort=True)
@@ -6393,13 +7845,471 @@ def operate_capcut():
             except Exception:
                 pass
     
-    # Execute the main workflow
     main_capcut_workflow()
-       
-def run_operation():
-    operate_google_flow_browser()
-    operate_grok_browser()
+
+def extend_images():
+    """
+    Extends images in the project's images folder based on transcript timestamps.
+    
+    Workflow:
+    1. Read the transcript text from project's audio folder
+    2. Extract all timestamps from the transcript
+    3. Calculate duration for each image based on timestamp differences
+    4. Calculate how many images are needed (based on timestamp count)
+    5. Match images by number (1.jpeg → timestamp index 0, 2.jpeg → timestamp index 1, etc.)
+    6. Only extend images that have a corresponding timestamp
+    7. Move extended .mp4 files to a new 'extended_images' folder
+    8. Leave original images untouched in the 'images' folder
+    """
+    
+    # ============================================
+    # CONFIGURATION
+    # ============================================
+    
+    # Get project title from panel.json
+    if not os.path.exists(PANEL_PATH):
+        print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
+        return None
+    
+    with open(PANEL_PATH, 'r', encoding='utf-8') as file:
+        panel_data = json.load(file)
+    
+    project_title = panel_data.get('project_title')
+    
+    if not project_title:
+        print(f"❌ Error: project_title not found in panel.json")
+        return None
+    
+    print(f"📁 [EXTEND_IMAGES] Processing project: {project_title}")
+    
+    # Define paths
+    def normalize_project_title(name):
+        if not name:
+            return "unnamed_project"
+        normalized = re.sub(r'[^a-zA-Z0-9\s_]', '', name)
+        normalized = re.sub(r'\s+', '_', normalized)
+        normalized = re.sub(r'_+', '_', normalized)
+        normalized = normalized.strip('_')
+        return normalized if normalized else "unnamed_project"
+    
+    normalized_project_title = normalize_project_title(project_title)
+    project_folder = os.path.join(IMAGES_PATH, normalized_project_title)
+    audio_folder = os.path.join(project_folder, "audio")
+    images_folder = os.path.join(project_folder, "images")
+    extended_images_folder = os.path.join(project_folder, "extended_images")
+    
+    # Find the transcript file
+    transcript_file = None
+    if os.path.exists(audio_folder):
+        for file in os.listdir(audio_folder):
+            if file.endswith('.txt') and normalized_project_title in file:
+                transcript_file = os.path.join(audio_folder, file)
+                break
+    
+    if not transcript_file:
+        # Try to find any txt file in audio folder
+        if os.path.exists(audio_folder):
+            for file in os.listdir(audio_folder):
+                if file.endswith('.txt'):
+                    transcript_file = os.path.join(audio_folder, file)
+                    break
+        
+        if not transcript_file:
+            print(f"❌ [EXTEND_IMAGES] Transcript file not found in: {audio_folder}")
+            return None
+    
+    print(f"📄 [EXTEND_IMAGES] Found transcript: {transcript_file}")
+    
+    # Create extended_images folder if it doesn't exist
+    if not os.path.exists(extended_images_folder):
+        try:
+            os.makedirs(extended_images_folder)
+            print(f"📁 [EXTEND_IMAGES] Created extended_images folder: {extended_images_folder}")
+        except Exception as e:
+            print(f"❌ [EXTEND_IMAGES] Failed to create extended_images folder: {e}")
+            return None
+    else:
+        print(f"📁 [EXTEND_IMAGES] Using existing extended_images folder: {extended_images_folder}")
+        
+        # Clean up any existing .mp4 files in extended_images folder
+        existing_mp4s = [f for f in os.listdir(extended_images_folder) if f.endswith('.mp4')]
+        if existing_mp4s:
+            print(f"🗑️ [EXTEND_IMAGES] Cleaning {len(existing_mp4s)} existing .mp4 files from extended_images folder...")
+            for f in existing_mp4s:
+                try:
+                    os.remove(os.path.join(extended_images_folder, f))
+                except Exception as e:
+                    print(f"   ⚠️ Could not remove {f}: {e}")
+    
+    # ============================================
+    # STEP 1: READ AND PARSE TRANSCRIPT
+    # ============================================
+    
+    def parse_timestamps_from_transcript(file_path):
+        """
+        Parse the transcript file to extract all timestamps and their corresponding text.
+        Returns: list of tuples (timestamp_seconds, text)
+        """
+        print(f"🔍 [EXTEND_IMAGES] Parsing timestamps from transcript...")
+        
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                content = file.read()
+            
+            # Find all timestamps in format (MM:SS) or (H:MM:SS)
+            timestamp_pattern = r'\((\d+):(\d+)\)'
+            
+            # Find all matches with their positions
+            matches = list(re.finditer(timestamp_pattern, content))
+            
+            if not matches:
+                print(f"❌ [EXTEND_IMAGES] No timestamps found in transcript")
+                return []
+            
+            timestamps = []
+            for i, match in enumerate(matches):
+                minutes = int(match.group(1))
+                seconds = int(match.group(2))
+                total_seconds = minutes * 60 + seconds
+                
+                # Get the text following this timestamp until the next timestamp
+                start_pos = match.end()
+                end_pos = matches[i+1].start() if i+1 < len(matches) else len(content)
+                text_segment = content[start_pos:end_pos].strip()
+                
+                timestamps.append({
+                    'timestamp': match.group(0),
+                    'minutes': minutes,
+                    'seconds': seconds,
+                    'total_seconds': total_seconds,
+                    'text': text_segment[:100] + '...' if len(text_segment) > 100 else text_segment
+                })
+            
+            print(f"✅ [EXTEND_IMAGES] Found {len(timestamps)} timestamps")
+            
+            # Print first few for debugging
+            for i, ts in enumerate(timestamps[:5]):
+                print(f"   [{i}] {ts['timestamp']} = {ts['total_seconds']}s - {ts['text'][:50]}...")
+            
+            return timestamps
+            
+        except Exception as e:
+            print(f"❌ [EXTEND_IMAGES] Error parsing transcript: {e}")
+            return []
+    
+    timestamps = parse_timestamps_from_transcript(transcript_file)
+    
+    if not timestamps:
+        print(f"❌ [EXTEND_IMAGES] No timestamps extracted")
+        return None
+    
+    # ============================================
+    # STEP 2: CALCULATE DURATIONS FOR EACH IMAGE
+    # ============================================
+    
+    def calculate_image_durations(timestamps):
+        """
+        Calculate the duration for each image based on timestamp differences.
+        The first image duration is from timestamp 0 to timestamp 1.
+        The last image duration is from last timestamp to end (default 5 seconds).
+        """
+        print(f"📊 [EXTEND_IMAGES] Calculating durations for {len(timestamps)} images...")
+        
+        durations = []
+        total_timestamps = len(timestamps)
+        
+        for i in range(total_timestamps):
+            current_time = timestamps[i]['total_seconds']
+            
+            if i + 1 < total_timestamps:
+                # Duration is the difference between current and next timestamp
+                next_time = timestamps[i+1]['total_seconds']
+                duration = next_time - current_time
+            else:
+                # Last timestamp: use 5 seconds as default duration
+                duration = 5.0
+            
+            # Ensure minimum duration of 1 second
+            if duration < 1.0:
+                duration = 1.0
+            
+            durations.append(duration)
+        
+        # Print duration summary
+        print(f"📊 [EXTEND_IMAGES] Duration summary (first 10):")
+        for i, duration in enumerate(durations[:10]):
+            print(f"   Image {i+1}: {duration:.2f}s (from {timestamps[i]['timestamp']})")
+        if len(durations) > 10:
+            print(f"   ... and {len(durations) - 10} more images")
+        
+        return durations
+    
+    durations = calculate_image_durations(timestamps)
+    
+    # ============================================
+    # STEP 3: GET IMAGES FROM IMAGES FOLDER
+    # ============================================
+    
+    def get_sorted_images(folder_path):
+        """
+        Get all image files from the folder, sorted by number.
+        Supports: .jpg, .jpeg, .png, .gif, .bmp, .webp
+        """
+        if not os.path.exists(folder_path):
+            print(f"❌ [EXTEND_IMAGES] Images folder not found: {folder_path}")
+            return []
+        
+        # Get all image files
+        image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+        image_files = []
+        
+        for file in os.listdir(folder_path):
+            file_lower = file.lower()
+            # Check if it's an image
+            if any(file_lower.endswith(ext) for ext in image_extensions):
+                # Extract number from filename
+                match = re.match(r'^(\d+)', file)
+                if match:
+                    num = int(match.group(1))
+                    image_files.append({
+                        'number': num,
+                        'filename': file,
+                        'path': os.path.join(folder_path, file)
+                    })
+                else:
+                    # For files without a number at the start, try to find any number
+                    match = re.search(r'(\d+)', file)
+                    if match:
+                        num = int(match.group(1))
+                        image_files.append({
+                            'number': num,
+                            'filename': file,
+                            'path': os.path.join(folder_path, file)
+                        })
+        
+        # Sort by number
+        image_files.sort(key=lambda x: x['number'])
+        
+        print(f"📁 [EXTEND_IMAGES] Found {len(image_files)} images in folder")
+        for img in image_files[:5]:
+            print(f"   Image {img['number']}: {img['filename']}")
+        if len(image_files) > 5:
+            print(f"   ... and {len(image_files) - 5} more images")
+        
+        return image_files
+    
+    image_files = get_sorted_images(images_folder)
+    
+    if not image_files:
+        print(f"❌ [EXTEND_IMAGES] No images found in: {images_folder}")
+        return None
+    
+    # ============================================
+    # STEP 4: CALCULATE HOW MANY IMAGES ARE NEEDED
+    # ============================================
+    
+    num_timestamps = len(timestamps)
+    num_images_available = len(image_files)
+    
+    # IMPORTANT: We need images numbered 1 through num_timestamps
+    # Check which images we have that match the needed numbers
+    image_number_map = {}
+    for img in image_files:
+        image_number_map[img['number']] = img
+    
+    # Determine which images we need (1 through num_timestamps)
+    needed_image_numbers = set(range(1, num_timestamps + 1))
+    available_image_numbers = set(image_number_map.keys())
+    
+    # Find which images we have vs need
+    have_images = available_image_numbers & needed_image_numbers
+    missing_images = needed_image_numbers - available_image_numbers
+    extra_images = available_image_numbers - needed_image_numbers
+    
+    num_images_needed = len(have_images)
+    
+    print(f"\n📊 [EXTEND_IMAGES] Image Requirements:")
+    print(f"   Timestamps found: {num_timestamps}")
+    print(f"   Images available: {num_images_available}")
+    print(f"   Images needed (1 to {num_timestamps}): {num_timestamps}")
+    print(f"   Images we have that match: {len(have_images)}")
+    
+    if missing_images:
+        print(f"   ⚠️ Missing images: {sorted(missing_images)[:10]}{'...' if len(missing_images) > 10 else ''}")
+        print(f"   These images will be skipped (no corresponding image file)")
+    
+    if extra_images:
+        print(f"   ℹ️ Extra images (beyond needed range): {sorted(extra_images)[:10]}{'...' if len(extra_images) > 10 else ''}")
+        print(f"   These images will be left untouched")
+    
+    # ============================================
+    # STEP 5: EXTEND IMAGES AND MOVE TO EXTENDED_IMAGES FOLDER
+    # ============================================
+    
+    def extend_single_image(image_path, duration_seconds, output_path):
+        """
+        Extends a single image to the specified duration.
+        """
+        try:
+            # Create the image clip with specified duration
+            clip = ImageClip(image_path).with_duration(duration_seconds)
+            
+            # Save as video file
+            clip.write_videofile(
+                output_path,
+                fps=1,  # 1 frame per second for still images
+                logger=None  # Suppress output
+            )
+            
+            return True
+        except Exception as e:
+            print(f"❌ [EXTEND_IMAGES] Error extending {image_path}: {e}")
+            return False
+    
+    def extend_and_move_images(image_files, durations, images_folder, extended_images_folder, num_timestamps):
+        """
+        Extend images that have corresponding timestamps.
+        Match image number to timestamp index (image 1 → timestamp index 0).
+        """
+        print(f"\n🎬 [EXTEND_IMAGES] Extending images...")
+        print(f"   (Extended files will be saved to: {extended_images_folder})")
+        print(f"   (Original images remain in: {images_folder})")
+        print(f"   (Only images 1 through {num_timestamps} will be processed)\n")
+        
+        # Create a lookup for image by number
+        image_by_number = {}
+        for img in image_files:
+            image_by_number[img['number']] = img
+        
+        extended_count = 0
+        failed_count = 0
+        skipped_count = 0
+        created_files = []
+        
+        # Process images 1 through num_timestamps
+        for i in range(num_timestamps):
+            image_number = i + 1  # 1-indexed for image numbers
+            duration = durations[i] if i < len(durations) else 5.0
+            
+            # Check if we have this image
+            if image_number not in image_by_number:
+                print(f"⏭️ [EXTEND_IMAGES] Skipping image {image_number} (file not found)")
+                skipped_count += 1
+                continue
+            
+            image_info = image_by_number[image_number]
+            
+            # Create output filename
+            output_filename = f"{image_number}_duration_{int(duration)}s.mp4"
+            temp_output_path = os.path.join(images_folder, output_filename)
+            final_output_path = os.path.join(extended_images_folder, output_filename)
+            
+            print(f"🎬 [EXTEND_IMAGES] Extending image {image_number} ({image_info['filename']}) to {duration:.2f}s")
+            
+            # Extend the image (save temporarily in images folder)
+            success = extend_single_image(image_info['path'], duration, temp_output_path)
+            
+            if success:
+                # Move the file to extended_images folder
+                try:
+                    shutil.move(temp_output_path, final_output_path)
+                    extended_count += 1
+                    created_files.append(final_output_path)
+                    print(f"   ✅ Created and moved: {output_filename}")
+                except Exception as e:
+                    print(f"   ⚠️ Created but failed to move: {e}")
+                    # Keep it in the images folder if move fails
+                    extended_count += 1
+                    created_files.append(temp_output_path)
+                    print(f"   ✅ Created (kept in images folder): {output_filename}")
+            else:
+                failed_count += 1
+                print(f"   ❌ Failed to extend: {image_info['filename']}")
+        
+        print(f"\n📊 [EXTEND_IMAGES] Results: {extended_count} extended, {failed_count} failed, {skipped_count} skipped")
+        print(f"   Extended files are in: {extended_images_folder}")
+        
+        return extended_count, failed_count, skipped_count, created_files
+    
+    extended_count, failed_count, skipped_count, created_files = extend_and_move_images(
+        image_files, 
+        durations, 
+        images_folder, 
+        extended_images_folder, 
+        num_timestamps
+    )
+    
+    # ============================================
+    # STEP 6: VERIFY FILES IN EXTENDED_IMAGES FOLDER
+    # ============================================
+    
+    def verify_extended_files(extended_images_folder, expected_count):
+        """
+        Verify that the expected number of .mp4 files are in the extended_images folder.
+        """
+        if not os.path.exists(extended_images_folder):
+            return 0
+        
+        mp4_files = [f for f in os.listdir(extended_images_folder) if f.endswith('.mp4')]
+        mp4_files.sort()
+        
+        print(f"\n📁 [EXTEND_IMAGES] Extended Images Folder Contents:")
+        print(f"   Location: {extended_images_folder}")
+        print(f"   Total .mp4 files: {len(mp4_files)}")
+        
+        if len(mp4_files) > 0:
+            print(f"   First 5 files:")
+            for f in mp4_files[:5]:
+                file_size = os.path.getsize(os.path.join(extended_images_folder, f)) / 1024
+                print(f"      - {f} ({file_size:.1f} KB)")
+            if len(mp4_files) > 5:
+                print(f"      ... and {len(mp4_files) - 5} more")
+        
+        if len(mp4_files) != expected_count:
+            print(f"   ⚠️ Warning: Expected {expected_count} files but found {len(mp4_files)}")
+        
+        return len(mp4_files)
+    
+    actual_mp4_count = verify_extended_files(extended_images_folder, extended_count)
+    
+    # ============================================
+    # STEP 7: SUMMARY
+    # ============================================
+    
+    print("\n" + "="*60)
+    print("📊 [EXTEND_IMAGES] SUMMARY")
+    print("="*60)
+    print(f"   Project: {project_title}")
+    print(f"   Transcript: {os.path.basename(transcript_file)}")
+    print(f"   Timestamps found: {num_timestamps}")
+    print(f"   Images available: {num_images_available}")
+    print(f"   Images that matched: {len(have_images)}")
+    print(f"   Images extended: {extended_count}")
+    print(f"   Images failed: {failed_count}")
+    print(f"   Images skipped (missing): {skipped_count}")
+    print(f"   Original images: KEPT in {images_folder}")
+    print(f"   Extended files: SAVED in {extended_images_folder}")
+    print(f"   .mp4 files in extended_images folder: {actual_mp4_count}")
+    print("="*60)
+    print("✅ [EXTEND_IMAGES] Complete!")
+    
+    return {
+        'project_title': project_title,
+        'timestamps_count': num_timestamps,
+        'images_available': num_images_available,
+        'images_matched': len(have_images),
+        'images_extended': extended_count,
+        'images_failed': failed_count,
+        'images_skipped': skipped_count,
+        'images_folder': images_folder,
+        'extended_images_folder': extended_images_folder,
+        'mp4_files_created': actual_mp4_count,
+        'original_images_kept': num_images_available,
+        'extended_files_list': [os.path.basename(f) for f in created_files]
+    }
+
+
 
 if __name__ == "__main__":
-   operate_capcut()
+   extend_images()
     
