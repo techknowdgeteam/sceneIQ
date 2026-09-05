@@ -1,0 +1,599 @@
+{
+  "metadata": {
+    "processed_on": "2026-09-04 21:45:33",
+    "total_text_regions": 39,
+    "total_ocr_results": 39,
+    "failed_regions": 0,
+    "empty_results": 0,
+    "vision_method": "google-lens-api",
+    "image_dimensions": "auto-detected"
+  },
+  "text_regions": [],
+  "ocr_results": {
+    "region_1": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "operate google flow f X"
+      ],
+      "Left": 10,
+      "Top": 10,
+      "Right": 194,
+      "Bottom": 35,
+      "Width": 184,
+      "Height": 25,
+      "Area": 4600,
+      "Confidence": 90,
+      "Region_ID": 1
+    },
+    "region_2": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Audio Generation and X"
+      ],
+      "Left": 10,
+      "Top": 45,
+      "Right": 186,
+      "Bottom": 70,
+      "Width": 176,
+      "Height": 25,
+      "Area": 4400,
+      "Confidence": 90,
+      "Region_ID": 2
+    },
+    "region_3": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Google Flow - Al Crea X"
+      ],
+      "Left": 10,
+      "Top": 80,
+      "Right": 194,
+      "Bottom": 105,
+      "Width": 184,
+      "Height": 25,
+      "Area": 4600,
+      "Confidence": 90,
+      "Region_ID": 3
+    },
+    "region_4": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "54ee2733-983e-4b92 X"
+      ],
+      "Left": 10,
+      "Top": 115,
+      "Right": 170,
+      "Bottom": 140,
+      "Width": 160,
+      "Height": 25,
+      "Area": 4000,
+      "Confidence": 90,
+      "Region_ID": 4
+    },
+    "region_5": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Voice Studio | GenAIP ×"
+      ],
+      "Left": 10,
+      "Top": 150,
+      "Right": 194,
+      "Bottom": 175,
+      "Width": 184,
+      "Height": 25,
+      "Area": 4600,
+      "Confidence": 90,
+      "Region_ID": 5
+    },
+    "region_6": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Simplify vision functio X"
+      ],
+      "Left": 10,
+      "Top": 185,
+      "Right": 210,
+      "Bottom": 210,
+      "Width": 200,
+      "Height": 25,
+      "Area": 5000,
+      "Confidence": 90,
+      "Region_ID": 6
+    },
+    "region_7": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "+"
+      ],
+      "Left": 10,
+      "Top": 220,
+      "Right": 18,
+      "Bottom": 245,
+      "Width": 8,
+      "Height": 25,
+      "Area": 200,
+      "Confidence": 90,
+      "Region_ID": 7
+    },
+    "region_8": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Update"
+      ],
+      "Left": 10,
+      "Top": 255,
+      "Right": 58,
+      "Bottom": 280,
+      "Width": 48,
+      "Height": 25,
+      "Area": 1200,
+      "Confidence": 90,
+      "Region_ID": 8
+    },
+    "region_9": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Chat"
+      ],
+      "Left": 10,
+      "Top": 290,
+      "Right": 42,
+      "Bottom": 315,
+      "Width": 32,
+      "Height": 25,
+      "Area": 800,
+      "Confidence": 90,
+      "Region_ID": 9
+    },
+    "region_10": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "https://flow.google.com"
+      ],
+      "Left": 10,
+      "Top": 325,
+      "Right": 194,
+      "Bottom": 350,
+      "Width": 184,
+      "Height": 25,
+      "Area": 4600,
+      "Confidence": 90,
+      "Region_ID": 10
+    },
+    "region_11": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Flow Music"
+      ],
+      "Left": 10,
+      "Top": 360,
+      "Right": 90,
+      "Bottom": 385,
+      "Width": 80,
+      "Height": 25,
+      "Area": 2000,
+      "Confidence": 90,
+      "Region_ID": 11
+    },
+    "region_12": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Flow TV"
+      ],
+      "Left": 10,
+      "Top": 395,
+      "Right": 66,
+      "Bottom": 420,
+      "Width": 56,
+      "Height": 25,
+      "Area": 1400,
+      "Confidence": 90,
+      "Region_ID": 12
+    },
+    "region_13": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Google Flow"
+      ],
+      "Left": 10,
+      "Top": 430,
+      "Right": 98,
+      "Bottom": 455,
+      "Width": 88,
+      "Height": 25,
+      "Area": 2200,
+      "Confidence": 90,
+      "Region_ID": 13
+    },
+    "region_14": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Google Flow"
+      ],
+      "Left": 10,
+      "Top": 465,
+      "Right": 98,
+      "Bottom": 490,
+      "Width": 88,
+      "Height": 25,
+      "Area": 2200,
+      "Confidence": 90,
+      "Region_ID": 14
+    },
+    "region_15": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Take Google Flow onding conte"
+      ],
+      "Left": 10,
+      "Top": 500,
+      "Right": 242,
+      "Bottom": 525,
+      "Width": 232,
+      "Height": 25,
+      "Area": 5800,
+      "Confidence": 90,
+      "Region_ID": 15
+    },
+    "region_16": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "the road."
+      ],
+      "Left": 10,
+      "Top": 535,
+      "Right": 82,
+      "Bottom": 560,
+      "Width": 72,
+      "Height": 25,
+      "Area": 1800,
+      "Confidence": 90,
+      "Region_ID": 16
+    },
+    "region_17": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Create, manage, and share your creations with the new Flow App. Available"
+      ],
+      "Left": 10,
+      "Top": 570,
+      "Right": 594,
+      "Bottom": 595,
+      "Width": 584,
+      "Height": 25,
+      "Area": 14600,
+      "Confidence": 90,
+      "Region_ID": 17
+    },
+    "region_18": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "first for Android; click 'Learn More' to download."
+      ],
+      "Left": 10,
+      "Top": 605,
+      "Right": 410,
+      "Bottom": 630,
+      "Width": 400,
+      "Height": 25,
+      "Area": 10000,
+      "Confidence": 90,
+      "Region_ID": 18
+    },
+    "region_19": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Edit video"
+      ],
+      "Left": 10,
+      "Top": 640,
+      "Right": 90,
+      "Bottom": 665,
+      "Width": 80,
+      "Height": 25,
+      "Area": 2000,
+      "Confidence": 90,
+      "Region_ID": 19
+    },
+    "region_20": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Projects"
+      ],
+      "Left": 10,
+      "Top": 675,
+      "Right": 74,
+      "Bottom": 700,
+      "Width": 64,
+      "Height": 25,
+      "Area": 1600,
+      "Confidence": 90,
+      "Region_ID": 20
+    },
+    "region_21": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Edit photo"
+      ],
+      "Left": 10,
+      "Top": 710,
+      "Right": 90,
+      "Bottom": 735,
+      "Width": 80,
+      "Height": 25,
+      "Area": 2000,
+      "Confidence": 90,
+      "Region_ID": 21
+    },
+    "region_22": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Animate photo"
+      ],
+      "Left": 10,
+      "Top": 745,
+      "Right": 114,
+      "Bottom": 770,
+      "Width": 104,
+      "Height": 25,
+      "Area": 2600,
+      "Confidence": 90,
+      "Region_ID": 22
+    },
+    "region_23": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "+"
+      ],
+      "Left": 10,
+      "Top": 780,
+      "Right": 18,
+      "Bottom": 805,
+      "Width": 8,
+      "Height": 25,
+      "Area": 200,
+      "Confidence": 90,
+      "Region_ID": 23
+    },
+    "region_24": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "X"
+      ],
+      "Left": 10,
+      "Top": 815,
+      "Right": 18,
+      "Bottom": 840,
+      "Width": 8,
+      "Height": 25,
+      "Area": 200,
+      "Confidence": 90,
+      "Region_ID": 24
+    },
+    "region_25": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "X"
+      ],
+      "Left": 10,
+      "Top": 850,
+      "Right": 18,
+      "Bottom": 875,
+      "Width": 8,
+      "Height": 25,
+      "Area": 200,
+      "Confidence": 90,
+      "Region_ID": 25
+    },
+    "region_26": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Ethereal scenes"
+      ],
+      "Left": 10,
+      "Top": 885,
+      "Right": 130,
+      "Bottom": 910,
+      "Width": 120,
+      "Height": 25,
+      "Area": 3000,
+      "Confidence": 90,
+      "Region_ID": 26
+    },
+    "region_27": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Learn More"
+      ],
+      "Left": 10,
+      "Top": 920,
+      "Right": 90,
+      "Bottom": 945,
+      "Width": 80,
+      "Height": 25,
+      "Area": 2000,
+      "Confidence": 90,
+      "Region_ID": 27
+    },
+    "region_28": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "79°F"
+      ],
+      "Left": 10,
+      "Top": 955,
+      "Right": 42,
+      "Bottom": 980,
+      "Width": 32,
+      "Height": 25,
+      "Area": 800,
+      "Confidence": 90,
+      "Region_ID": 28
+    },
+    "region_29": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "New project"
+      ],
+      "Left": 10,
+      "Top": 990,
+      "Right": 98,
+      "Bottom": 1015,
+      "Width": 88,
+      "Height": 25,
+      "Area": 2200,
+      "Confidence": 90,
+      "Region_ID": 29
+    },
+    "region_30": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "9:30"
+      ],
+      "Left": 10,
+      "Top": 1025,
+      "Right": 42,
+      "Bottom": 1050,
+      "Width": 32,
+      "Height": 25,
+      "Area": 800,
+      "Confidence": 90,
+      "Region_ID": 30
+    },
+    "region_31": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Activate Windows"
+      ],
+      "Left": 10,
+      "Top": 1060,
+      "Right": 138,
+      "Bottom": 1085,
+      "Width": 128,
+      "Height": 25,
+      "Area": 3200,
+      "Confidence": 90,
+      "Region_ID": 31
+    },
+    "region_32": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Go to Settings to activate Windows."
+      ],
+      "Left": 10,
+      "Top": 1095,
+      "Right": 290,
+      "Bottom": 1120,
+      "Width": 280,
+      "Height": 25,
+      "Area": 7000,
+      "Confidence": 90,
+      "Region_ID": 32
+    },
+    "region_33": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Partly cloudy"
+      ],
+      "Left": 10,
+      "Top": 1130,
+      "Right": 114,
+      "Bottom": 1155,
+      "Width": 104,
+      "Height": 25,
+      "Area": 2600,
+      "Confidence": 90,
+      "Region_ID": 33
+    },
+    "region_34": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "Q Search"
+      ],
+      "Left": 10,
+      "Top": 1165,
+      "Right": 74,
+      "Bottom": 1190,
+      "Width": 64,
+      "Height": 25,
+      "Area": 1600,
+      "Confidence": 90,
+      "Region_ID": 34
+    },
+    "region_35": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "ENG"
+      ],
+      "Left": 10,
+      "Top": 1200,
+      "Right": 34,
+      "Bottom": 1225,
+      "Width": 24,
+      "Height": 25,
+      "Area": 600,
+      "Confidence": 90,
+      "Region_ID": 35
+    },
+    "region_36": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "US"
+      ],
+      "Left": 10,
+      "Top": 1235,
+      "Right": 26,
+      "Bottom": 1260,
+      "Width": 16,
+      "Height": 25,
+      "Area": 400,
+      "Confidence": 90,
+      "Region_ID": 36
+    },
+    "region_37": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "85%"
+      ],
+      "Left": 10,
+      "Top": 1270,
+      "Right": 34,
+      "Bottom": 1295,
+      "Width": 24,
+      "Height": 25,
+      "Area": 600,
+      "Confidence": 90,
+      "Region_ID": 37
+    },
+    "region_38": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "9:44 PM"
+      ],
+      "Left": 10,
+      "Top": 1305,
+      "Right": 66,
+      "Bottom": 1330,
+      "Width": 56,
+      "Height": 25,
+      "Area": 1400,
+      "Confidence": 90,
+      "Region_ID": 38
+    },
+    "region_39": {
+      "search_engine": "google-lens-vision",
+      "text_value_found": [
+        "9/4/2026"
+      ],
+      "Left": 10,
+      "Top": 1340,
+      "Right": 74,
+      "Bottom": 1365,
+      "Width": 64,
+      "Height": 25,
+      "Area": 1600,
+      "Confidence": 90,
+      "Region_ID": 39
+    }
+  }
+}

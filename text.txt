@@ -1,0 +1,80 @@
+I want you to look at each dialogue entries, carefully study the whole story or script and ask questions for example if a dialogue says 'i didn't know' generate a question of who didn't know and answer it like 
+
+"dialogue":"i didn't know it yet"
+
+your debug as AI study the script and generate debug like
+
+who is the 'i' Who was it, who didn't know and then answer it yourself after studying the script with example if Jane was the recent speaker or whatever say Jane so add this field of 
+
+"Questions" what the dialogue value says debug the question "
+
+"answer":
+
+for example
+dialogue": Jane yelled at him I didn't know it yet!, she said"
+"question": who didn't know it yet? who was she yelling at ? if you study the whole script you will know the answer and it would  be
+"answer": Jane didn't know it yet, and she was yelling at micheal (micheal may have been in the picture before this dialogue all you have to do is study); Summary for the expression she said she didn't know but the main verb is she yelled, the view focus should be Jane yelling at micheal, the expression is a voice 'i didn't know it yet'
+"all_characters_involved_in_dialogue":"Jane and Micheal"
+view_focus": Jane yelling at micheal
+audio_focus": I didn't know it yet, she said
+
+scene_pov_prompt": Generate Jane...details yelling at micheal ... ensure the characters are not represented with 'woman, man, brother, sister, uncle.. and so on, they must be explicitly mentioned so their name would be looked up to in the entry for their facial details, and always start with the word 'Generate' and then the rest of the details, you must be the one to provide it, it is about view focus displaying the visible characters not the fictional, illusion, imagined, past ones but the visual ones as the view focus would say, so this should be the prompt, Safety & Harassment: Content involving violence, self-harm, or harassment.
+Sensitive Topics: Portrayals of real-world prominent people or minors in certain contexts.
+Policy Restrictions: Content that is sexually explicit or depicts illegal acts.
+Intellectual Property: Requests that might trigger copyright or third-party content filters.
+Sometimes, a prompt for a benign scene (like your character looking contemplative) can accidentally trigger one of these automated filters if certain words or descriptions are flagged. So to avoid this ensure the scene pov prompt twists the word into safe or twist the prompt to something safeif any of the restricted words from the list [blood, sex, killed, murdered, attacked, gun, bomb, died, suicide, scam, drugs] appear, do not write them directly back to the this scene pov prompt even if the dialogue and audio focus writes it plainly, this prompt must replace the words; instead, use the indirect alternatives and substitute them appropriately (such as blood with stain, sex with intimate, killed with eliminated, murdered with taken down, attacked with impacted, gun with hardware, bomb with device, died with passed away, suicide with self-harm crisis, scam with financial hardship, and drugs with substances). Add this default sentence of "Do not write any texts on top, bottom, center, left and right of the image, it must be pure and clean image with no text! if descriptive terms is blocked by content filters or prompt violates policies, automatically translate to a different prompt or sense a sentence that doesn't violate and use for the generation similar" at the end of prompt details example Generate... the details then at the end add the default sentence. Sometimes a full-body image of the character isn't necessary; the dialogue might require a POV of a hand, a first-person view, a low-angle shot, a wide shot, a side-view angle, and so on. Treat this `scene_pov_prompt` field value as the camera man capturing actions from any creative angle, positioning objects, and creating cool cinematic views. If character talked about past as debugged in the answer, let the prompt detail show the past detail point instead (to make it interesting) instead of showing the character having conversation show the past point instead, this ensures the story is well detailed, gluing and interesting, i want every little point about pasts to be the pov not all is conversation or discussion, any discussion about pasts must be the pov of the past point, so to really know the past track words of the past tense or past participle eg had, went, did, came... and so on
+view_focus_characters":"name of those that should be in picture only, even 8 might be debugged in the dialogue while 2 would be the only present, others may be illusions, past, imagination, expression and so on. The most important is weather, time and location description for example if story line is changing or switching days or time you must add details that (its evening) or (its morning), (its night {if night describe location and lights like its night but inside the room then describe the lights and where they are, ensure these details are added it is very important} adding this time, weather like sunset, warm, winter, rain you must indicate the time like generate image of ...details at night ... and then proceed with the details, if in hall, room, house, anywhere must be detailed. no detail is too small, but ensure time and weather matches and add the detail, it is very very important, if scene point of presence throughout the story happens at a particular time then it must be indicated in each but if all present isnt then it must be indicated also, it is very important!!!!!)"
+"scene_point":"referencing the past/ the present/ the future"
+
+example 2 grief, illusions and imaginations
+dialogue: didnt know she died, i was with her killer, i screamed her name into hallway
+question: who died? who didnt know, who is 'her', who is the killer, who screamed and whose name was screamed, and who is screaming into hallway
+answer: {name of the person} (family/relative/friend...) died, {name of the person} didn't know, ..
+view focus": the view focus will entirely be different, like she was with the killer and screamed the deceased name into hallway that means the view will be about her with the killer but screaming into hallway, the deceased may be involved in this dialogue but it is now an illusion in this dialogue so the view focus will be the name of the person with the killer name in hallway screaming, the deceased is not present in the view, and dont include anybody that isn't present in the view to this value at all, this field should only contain the view of the present character only!
+view_focus_characters": name of those that should be in picture only, even 8 might be debugged in the dialogue while 2 would be the only present, others may be illusions, past, imagination, expression and so on 
+
+example 3, characters conversations about pasts
+dialogue: then when you had Nothing, i went to the bank for a loan but aren't aware!
+answer: who had nothing, who wen't to the bank, who wasn't aware!
+view_focus_characters": name of those that should be in picture only, 
+scene_pov_prompt": this should also be used to points of pasts, in cases like this i dont want you to add details generation of the the conversation talking about the pasts but instead show the point of the pasts, eg when john had nothing then picture of when john was broke, she went to the bank then details of her at the bank getting loan, i want representation of point if pasts are discussed instead of focusing on the characters discussing the past provide the details of that reference in the past instead 
+
+do you understand, so provide the result in exactly Json too but add the new fields to the existing Json structure data and provide the complete. 
+
+Don't assume, don't use probablity words of 'or' 'maybe' 'might' 'uncertain'... and so on, you must be certain, sure and correct, point at who it belongs to, so study the entire script, you will know who it is. You must not use any of these probability words at all
+Don't change the json structure! the entire data must be provided just add this new fields
+
+the Provided Json format will now be exactly like this 
+{
+  "characters_visual_prompts": {
+    "{Character_name}": {
+      "relation": "",
+      "character_details": "."
+    }
+  },
+  "script": {
+    "batch_1-20": {
+      "1-20_characters_referenced": [ ],
+      "entries": [
+        {
+          "id": {numberorpositionoftheentryeg 1}
+          "start": "0:00",
+          "stop": "0:05",
+          "duration": "5 seconds"
+          "dialogue": "",
+          "scene_pov_prompt": "",
+          "scene_point":"referencing the past/ the present/ the future"
+          "image_generation_instruction": "", exclude this field from what you will provide, exclude the feature attachement too
+          "questions": "",
+          "answers": "",
+          "all_characters_involved_in_dialogue": "{character_a_name (role in dialogue)}, {character_b_name (role in dialogue)}"
+          view_focus": Jane yelling at micheal
+          view_focus_characters":"if solo it should be {name of character} if more than one use the word 'and' instead of comma so it will be like {character name 1} and {character name 1} instead of '{character name 1}, {charactername2}'
+          audio_focus": I didn't know it yet, she said,
+          // this means the view focus characters will now look at the "characters_visual_prompts" write and bring the details of such character here
+        
+        },
+
+  "batch_{number}-{the last entry number}": {
+
+YOU MUST PROVIDE THE COMPLETE ENTIRE RECORD FROM THE BEGINNING TO THE LAST ENTRY, COMPLETE ENTIRE RECORD
