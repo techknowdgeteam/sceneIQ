@@ -68,6 +68,7 @@ PHPSQLURL = "https://fhdrikxsirudr.fwh.is/phpmyadmintemplate.php"
 IMAGE_GENERATION_URL = "https://gemini.google.com/app"
 GUI_IMAGES = r"C:\xampp\htdocs\AI automation\scenIQ\gui_images"
 PANEL_PATH = r"C:\xampp\htdocs\AI automation\scenIQ\panel.json"
+GUI_REGION_SAVER = r"C:\xampp\htdocs\AI automation\scenIQ\gui.json"
 
 class AutomationHUD:
     def __init__(self):
@@ -1075,6 +1076,177 @@ def fetch_settings():
             pass
         return False
 
+def distribute_characters():
+    """
+    Distributes character visual prompts from characters_visual_prompts to each entry
+    based on the view_focus_characters field.
+    
+    For each entry, it extracts character names from view_focus_characters,
+    normalizes them (removes special characters, handles "and" separator),
+    looks up each character in characters_visual_prompts, and adds them
+    as new fields in the entry.
+    """
+    # Load panel.json
+    if not os.path.exists(PANEL_PATH):
+        print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
+        return
+
+    try:
+        with open(PANEL_PATH, 'r', encoding='utf-8') as file:
+            panel_data = json.load(file)
+    except json.JSONDecodeError as e:
+        print(f"❌ Error: panel.json is not valid JSON: {e}")
+        return
+    except Exception as e:
+        print(f"❌ Error reading panel.json: {e}")
+        return
+
+    # Get characters_visual_prompts - FIXED: Correct path to the data
+    # The characters_visual_prompts is inside project_name.script_json
+    script_json = panel_data.get('project_name', {}).get('script_json', {})
+    characters_visual_prompts = script_json.get('characters_visual_prompts', {})
+    
+    if not characters_visual_prompts:
+        print("⚠️ No characters_visual_prompts found in panel.json")
+        print("   Tried path: project_name.script_json.characters_visual_prompts")
+        return
+
+    # Get script entries - FIXED: Use the correct path
+    script_data = script_json.get('script', {})
+    
+    if not script_data:
+        print("⚠️ No script data found in panel.json")
+        return
+
+    print(f"📊 [DISTRIBUTE] Found {len(characters_visual_prompts)} characters in lookup")
+
+    # Create a normalized lookup dictionary for characters
+    def normalize_name(name):
+        """Normalize character name for lookup."""
+        if not name:
+            return ""
+        # Remove extra whitespace
+        name = ' '.join(name.split())
+        # Convert to lowercase for case-insensitive matching
+        return name.lower().strip()
+
+    # Build character lookup dictionary with normalized keys
+    character_lookup = {}
+    for char_name, char_data in characters_visual_prompts.items():
+        normalized = normalize_name(char_name)
+        if normalized:
+            character_lookup[normalized] = {
+                'original_name': char_name,
+                'data': char_data
+            }
+    
+    print(f"📊 [DISTRIBUTE] Character lookup built with {len(character_lookup)} entries")
+
+    # Track statistics
+    entries_processed = 0
+    total_characters_added = 0
+    batches_processed = 0
+    
+    # Function to extract character names from view_focus_characters
+    def extract_character_names(view_focus_string):
+        """Extract character names from view_focus_string."""
+        if not view_focus_string:
+            return []
+        
+        # Handle " and " as a separator
+        normalized = view_focus_string.replace(' and ', ', ')
+        normalized = normalized.replace(' and', ',')
+        normalized = normalized.replace('and ', ',')
+        
+        # Split by comma and clean up
+        raw_names = [name.strip() for name in normalized.split(',') if name.strip()]
+        
+        return raw_names
+
+    # Process each batch
+    for batch_key, batch_data in script_data.items():
+        if not isinstance(batch_data, dict):
+            continue
+            
+        entries = batch_data.get('entries', [])
+        if not entries:
+            continue
+        
+        batches_processed += 1
+        print(f"\n📁 [DISTRIBUTE] Processing batch: {batch_key} ({len(entries)} entries)")
+        
+        for entry_idx, entry in enumerate(entries):
+            # Skip if no view_focus_characters
+            view_focus = entry.get('view_focus_characters', '')
+            if not view_focus:
+                print(f"  ⏭️ Entry {entry_idx + 1}: No view_focus_characters, skipping")
+                continue
+            
+            # Extract character names from view_focus
+            raw_names = extract_character_names(view_focus)
+            
+            if not raw_names:
+                print(f"  ⏭️ Entry {entry_idx + 1}: No names extracted from '{view_focus}'")
+                continue
+            
+            print(f"  📝 Entry {entry_idx + 1}: Extracted names: {raw_names}")
+            
+            # Process each character
+            characters_added = 0
+            for raw_name in raw_names:
+                # Try to find the character in the lookup
+                normalized_raw = normalize_name(raw_name)
+                
+                # Try exact match
+                matched_char = None
+                if normalized_raw in character_lookup:
+                    matched_char = character_lookup[normalized_raw]
+                else:
+                    # Try partial match (in case of slight variations)
+                    for lookup_key, lookup_data in character_lookup.items():
+                        # Check if either contains the other
+                        if normalized_raw in lookup_key or lookup_key in normalized_raw:
+                            matched_char = lookup_data
+                            print(f"    🔍 Partial match: '{raw_name}' -> '{lookup_key}'")
+                            break
+                
+                if matched_char:
+                    char_name = matched_char['original_name']
+                    char_data = matched_char['data']
+                    
+                    # Add character data to entry as a nested object
+                    entry[char_name] = char_data
+                    characters_added += 1
+                    total_characters_added += 1
+                    print(f"    ✅ Added character: {char_name}")
+                else:
+                    print(f"    ⚠️ Character not found in lookup: '{raw_name}'")
+                    print(f"       Available characters: {list(character_lookup.keys())}")
+            
+            if characters_added > 0:
+                entries_processed += 1
+                print(f"  ✅ Entry {entry_idx + 1}: Added {characters_added} characters")
+
+    print(f"\n{'='*50}")
+    print(f"📊 [DISTRIBUTE] Summary:")
+    print(f"   - Batches processed: {batches_processed}")
+    print(f"   - Entries with characters distributed: {entries_processed}")
+    print(f"   - Total character references added: {total_characters_added}")
+    print(f"{'='*50}")
+
+    # Save updated panel.json
+    try:
+        with open(PANEL_PATH, 'w', encoding='utf-8') as file:
+            json.dump(panel_data, file, indent=4, ensure_ascii=False)
+        print(f"✅ [DISTRIBUTE] Successfully updated panel.json")
+    except Exception as e:
+        print(f"❌ Error saving panel.json: {e}")
+        import traceback
+        traceback.print_exc()
+        return
+
+    return entries_processed, total_characters_added
+
 def generate_gemini_images():
     """
     Generates images using Gemini via GUI automation with pyautogui image recognition.
@@ -1096,6 +1268,8 @@ def generate_gemini_images():
     - Moves to images folder in project title directory
     - Validates entry order and handles missing entries
     - No JSON tracking for entries
+    - Dynamic fallback support: checks for image_name{number}.png variants
+    - Enhanced upload detection: waits indefinitely for upload button if text is already pasted
     """
     # --- SPEED TUNING PARAMETERS ---
     pyautogui.PAUSE = 0.0
@@ -1217,6 +1391,156 @@ def generate_gemini_images():
             raise KeyboardInterrupt("User forced exit via shortcut key.")
         if not check_operation_status():
             raise SystemExit("Operation status invalid")
+
+    # --- DYNAMIC FALLBACK HELPERS ---
+    def get_image_variants(base_name):
+        """
+        Get all available variants of an image file.
+        For example, for 'ask_gemini.png', it will find:
+        - ask_gemini.png (original)
+        - ask_gemini1.png, ask_gemini2.png, ask_gemini3.png, etc.
+        
+        Returns a list of full paths in order: original first, then numbered variants.
+        """
+        variants = []
+        base_name_without_ext = os.path.splitext(base_name)[0]
+        ext = os.path.splitext(base_name)[1]
+        
+        # First, check if the original file exists
+        original_path = os.path.join(GUI_IMAGES, base_name)
+        if os.path.exists(original_path):
+            variants.append(original_path)
+        
+        # Then, look for numbered variants
+        # Pattern: base_name{number}.ext (e.g., ask_gemini1.png)
+        pattern = re.compile(rf'^{re.escape(base_name_without_ext)}(\d+)\.{re.escape(ext[1:])}$', re.IGNORECASE)
+        
+        try:
+            files = os.listdir(GUI_IMAGES)
+            numbered_variants = []
+            
+            for filename in files:
+                match = pattern.match(filename)
+                if match:
+                    number = int(match.group(1))
+                    full_path = os.path.join(GUI_IMAGES, filename)
+                    numbered_variants.append((number, full_path))
+            
+            # Sort by number and add to variants
+            numbered_variants.sort(key=lambda x: x[0])
+            for _, full_path in numbered_variants:
+                variants.append(full_path)
+                
+        except Exception as e:
+            print(f"⚠️ [FALLBACK] Error scanning for variants of {base_name}: {e}")
+        
+        return variants
+
+    def find_image_with_fallback(image_name, confidence=0.8, region=None):
+        """
+        Find an image on screen, trying all available variants (numbered fallbacks).
+        Returns the location (x, y) if found, None otherwise.
+        Also returns the path of the matched image for logging purposes.
+        """
+        variants = get_image_variants(image_name)
+        
+        if not variants:
+            print(f"❌ [FALLBACK] No variants found for {image_name}")
+            return None, None
+        
+        print(f"🔍 [FALLBACK] Searching for {image_name} with {len(variants)} variant(s)...")
+        
+        for variant_path in variants:
+            variant_name = os.path.basename(variant_path)
+            try:
+                location = pyautogui.locateCenterOnScreen(
+                    variant_path,
+                    confidence=confidence,
+                    grayscale=False
+                )
+                if location:
+                    print(f"✅ [FALLBACK] Found {variant_name} at ({location.x}, {location.y})")
+                    return location, variant_path
+            except Exception as e:
+                # Suppress the verbose error output to avoid log spam
+                pass
+        
+        return None, None
+
+    def wait_for_image_with_fallback(image_name, timeout_seconds=60, confidence=0.8, region=None):
+        """
+        Wait for an image to appear on screen, trying all available variants (numbered fallbacks).
+        Returns the location (x, y) if found, None otherwise.
+        Also returns the path of the matched image for logging purposes.
+        """
+        variants = get_image_variants(image_name)
+        
+        if not variants:
+            print(f"❌ [FALLBACK] No variants found for {image_name}")
+            return None, None
+        
+        print(f"🔍 [FALLBACK] Waiting for {image_name} with {len(variants)} variant(s)...")
+        start_time = time.time()
+        last_status_time = 0
+        
+        while time.time() - start_time < timeout_seconds:
+            check_for_termination()
+            
+            for variant_path in variants:
+                variant_name = os.path.basename(variant_path)
+                try:
+                    location = pyautogui.locateCenterOnScreen(
+                        variant_path,
+                        confidence=confidence,
+                        grayscale=False
+                    )
+                    if location:
+                        print(f"✅ [FALLBACK] Found {variant_name} at ({location.x}, {location.y})")
+                        return location, variant_path
+                except Exception as e:
+                    # Suppress the verbose error output
+                    pass
+            
+            # Print status every 5 seconds
+            current_time = time.time()
+            if current_time - last_status_time > 5:
+                elapsed = int(current_time - start_time)
+                print(f"⏳ [FALLBACK] Still waiting for {image_name}... ({elapsed}s elapsed)")
+                last_status_time = current_time
+            
+            time.sleep(0.3)
+        
+        print(f"❌ [FALLBACK] {image_name} not found in any variant within {timeout_seconds} seconds")
+        return None, None
+
+    def find_image_location_with_fallback(image_name, confidence=0.8, region=None):
+        """
+        Find an image on screen using fallback variants, returning the full bounding box.
+        Returns the location object if found, None otherwise.
+        Also returns the path of the matched image.
+        """
+        variants = get_image_variants(image_name)
+        
+        if not variants:
+            print(f"❌ [FALLBACK] No variants found for {image_name}")
+            return None, None
+        
+        for variant_path in variants:
+            variant_name = os.path.basename(variant_path)
+            try:
+                location = pyautogui.locateOnScreen(
+                    variant_path,
+                    confidence=confidence,
+                    grayscale=False
+                )
+                if location:
+                    print(f"✅ [FALLBACK] Found {variant_name} at ({location.left}, {location.top})")
+                    return location, variant_path
+            except Exception as e:
+                # Suppress verbose error
+                pass
+        
+        return None, None
 
     # --- WINDOW MANAGEMENT HELPERS ---
     def get_current_monitor():
@@ -1383,68 +1707,25 @@ def generate_gemini_images():
         pyautogui.press('enter')
         update_operation_status(f"Navigating to Gemini URL...")
 
-    # --- IMAGE RECOGNITION HELPERS ---
+    # --- IMAGE RECOGNITION HELPERS (UPDATED WITH FALLBACKS) ---
     def wait_for_image(image_name, timeout_seconds=60, confidence=0.8, region=None):
         """
-        Wait for an image to appear on screen.
+        Wait for an image to appear on screen using fallback variants.
         Returns the location (x, y) if found, None otherwise.
         """
-        image_path = os.path.join(GUI_IMAGES, image_name)
-        
-        if not os.path.exists(image_path):
-            print(f"❌ [IMAGE] Image not found: {image_path}")
-            return None
-        
-        print(f"🔍 [IMAGE] Waiting for {image_name}...")
-        start_time = time.time()
-        
-        while time.time() - start_time < timeout_seconds:
-            check_for_termination()
-            
-            try:
-                location = pyautogui.locateCenterOnScreen(
-                    image_path,
-                    confidence=confidence,
-                    grayscale=False
-                )
-                if location:
-                    print(f"✅ [IMAGE] Found {image_name} at ({location.x}, {location.y})")
-                    return location
-            except Exception as e:
-                print(f"⚠️ [IMAGE] Error searching for {image_name}: {e}")
-            
-            time.sleep(0.3)
-        
-        print(f"❌ [IMAGE] {image_name} not found within {timeout_seconds} seconds")
-        return None
+        location, _ = wait_for_image_with_fallback(image_name, timeout_seconds, confidence, region)
+        return location
 
     def find_image(image_name, confidence=0.8, region=None):
         """
-        Find an image on screen without waiting.
+        Find an image on screen without waiting, using fallback variants.
         Returns the location (x, y) if found, None otherwise.
         """
-        image_path = os.path.join(GUI_IMAGES, image_name)
-        
-        if not os.path.exists(image_path):
-            print(f"❌ [IMAGE] Image not found: {image_path}")
-            return None
-        
-        try:
-            location = pyautogui.locateCenterOnScreen(
-                image_path,
-                confidence=confidence,
-                grayscale=False
-            )
-            if location:
-                print(f"✅ [IMAGE] Found {image_name} at ({location.x}, {location.y})")
-                return location
-        except Exception as e:
-            print(f"⚠️ [IMAGE] Error searching for {image_name}: {e}")
-        
-        return None
+        location, _ = find_image_with_fallback(image_name, confidence, region)
+        return location
 
     def click_image_center(image_name, confidence=0.8, wait_time=0.3):
-        """Find and click the center of an image."""
+        """Find and click the center of an image using fallback variants."""
         location = find_image(image_name, confidence)
         if location:
             pyautogui.moveTo(location.x, location.y, duration=0.1)
@@ -1455,33 +1736,37 @@ def generate_gemini_images():
 
     def click_image_right(image_name, confidence=0.8, wait_time=0.3):
         """
-        Find an image and click on its right side (not center).
+        Find an image using fallback variants and click on its right side (not center).
         """
-        image_path = os.path.join(GUI_IMAGES, image_name)
+        variants = get_image_variants(image_name)
         
-        if not os.path.exists(image_path):
-            print(f"❌ [IMAGE] Image not found: {image_path}")
+        if not variants:
+            print(f"❌ [IMAGE] No variants found for {image_name}")
             return False
         
-        try:
-            # Get the bounding box of the image
-            location = pyautogui.locateOnScreen(
-                image_path,
-                confidence=confidence,
-                grayscale=False
-            )
-            if location:
-                # Click on the right side (75% of the width from the left)
-                click_x = location.left + int(location.width * 0.75)
-                click_y = location.top + int(location.height / 2)
-                print(f"✅ [IMAGE] Found {image_name}, clicking right side at ({click_x}, {click_y})")
-                pyautogui.moveTo(click_x, click_y, duration=0.1)
-                pyautogui.click()
-                time.sleep(wait_time)
-                return True
-        except Exception as e:
-            print(f"⚠️ [IMAGE] Error searching for {image_name}: {e}")
+        for variant_path in variants:
+            variant_name = os.path.basename(variant_path)
+            try:
+                # Get the bounding box of the image
+                location = pyautogui.locateOnScreen(
+                    variant_path,
+                    confidence=confidence,
+                    grayscale=False
+                )
+                if location:
+                    # Click on the right side (75% of the width from the left)
+                    click_x = location.left + int(location.width * 0.75)
+                    click_y = location.top + int(location.height / 2)
+                    print(f"✅ [IMAGE] Found {variant_name}, clicking right side at ({click_x}, {click_y})")
+                    pyautogui.moveTo(click_x, click_y, duration=0.1)
+                    pyautogui.click()
+                    time.sleep(wait_time)
+                    return True
+            except Exception as e:
+                # Suppress verbose error
+                pass
         
+        print(f"❌ [IMAGE] {image_name} not found in any variant")
         return False
 
     def scroll_up_multiple(times=3):
@@ -1733,24 +2018,23 @@ def generate_gemini_images():
             scroll_up_multiple(3)
             time.sleep(0.5)
             
-            # Look for more.png
-            more_location = find_image("more.png", confidence=0.8)
+            # Look for more.png with fallback
+            more_location, more_path = find_image_with_fallback("more.png", confidence=0.8)
             
-            if more_location:
+            if more_location and more_path:
                 # Click the right side of more.png
-                image_path = os.path.join(GUI_IMAGES, "more.png")
                 try:
-                    location = pyautogui.locateOnScreen(image_path, confidence=0.8)
+                    location = pyautogui.locateOnScreen(more_path, confidence=0.8)
                     if location:
                         click_x = location.left + int(location.width * 0.75)
                         click_y = location.top + int(location.height / 2)
-                        print(f"🎯 [RETRY] Clicking more.png right side at ({click_x}, {click_y}) (attempt {attempt+1})")
+                        print(f"🎯 [RETRY] Clicking {os.path.basename(more_path)} right side at ({click_x}, {click_y}) (attempt {attempt+1})")
                         pyautogui.moveTo(click_x, click_y, duration=0.1)
                         pyautogui.click()
                         time.sleep(0.5)
                         print(f"✅ [RETRY] Clicked more.png right side")
                     else:
-                        print(f"⚠️ [RETRY] Could not get bounds for more.png")
+                        print(f"⚠️ [RETRY] Could not get bounds for {os.path.basename(more_path)}")
                         scroll_up_multiple(2)
                         time.sleep(0.3)
                         continue
@@ -1926,7 +2210,7 @@ def generate_gemini_images():
                 update_operation_status(f"Generation limit reached for {entry_name}", is_error=True)
                 return False, "limit_reached"
             
-            # Check for generating_image.png
+            # Check for generating_image.png with fallback
             generating_location = find_image("generating_image.png", confidence=0.7)
             if generating_location:
                 print(f"✅ [ENTRY] Found generating_image.png - work has started!")
@@ -1957,7 +2241,7 @@ def generate_gemini_images():
         
         # PHASE 2: Now that generating_image.png was found, wait for gemini_microphone.png
         print(f"🔍 [ENTRY] Phase 2: Work confirmed, waiting for gemini_microphone.png (generation complete)...")
-        hud.print("⏳ Waiting for completion...", "processing")
+        hud.print("⏳ Generating image...", "processing")
         update_operation_status(f"Generation in progress, waiting for completion...")
         
         # Reset timer for phase 2
@@ -1981,7 +2265,7 @@ def generate_gemini_images():
                 update_operation_status(f"Generation limit reached for {entry_name}", is_error=True)
                 return False, "limit_reached"
             
-            # Check for gemini_microphone.png (indicates image is ready)
+            # Check for gemini_microphone.png (indicates image is ready) with fallback
             microphone_location = find_image("gemini_microphone.png", confidence=0.7)
             if microphone_location:
                 print(f"✅ [ENTRY] Found gemini_microphone.png - image is ready!")
@@ -2010,7 +2294,7 @@ def generate_gemini_images():
                 # This could mean the generation finished and we're waiting for UI update
                 print(f"⚠️ [ENTRY] generating_image.png disappeared, checking for microphone...")
                 time.sleep(0.5)
-                # Re-check for microphone
+                # Re-check for microphone with fallback
                 microphone_location = find_image("gemini_microphone.png", confidence=0.7)
                 if microphone_location:
                     print(f"✅ [ENTRY] Found gemini_microphone.png - image is ready!")
@@ -2022,20 +2306,69 @@ def generate_gemini_images():
         print(f"⏰ [ENTRY] Generation timeout after {max_wait_seconds} seconds")
         return False, "timeout"
 
+    def wait_for_upload_button_indefinitely(hwnd, entry_name, check_interval=0.5):
+        """
+        Wait for upload_to_gemini.png button to appear INDEFINITELY.
+        This is used when we've already pasted the text and just need to wait for the upload button.
+        Only stops when button is found or user manually terminates.
+        """
+        print(f"⏳ [UPLOAD] Waiting indefinitely for upload_to_gemini.png button...")
+        hud.print("⏳ Waiting for upload button...", "waiting")
+        update_operation_status(f"Waiting for upload button to appear...")
+        
+        last_status_time = 0
+        elapsed = 0
+        start_time = time.time()
+        
+        while True:
+            check_for_termination()
+            enforce_window_focus(hwnd)
+            
+            # Check for upload_to_gemini.png with fallback
+            upload_location = find_image("upload_to_gemini.png", confidence=0.7)
+            if upload_location:
+                print(f"✅ [UPLOAD] Found upload_to_gemini.png after waiting!")
+                return upload_location
+            
+            # Check for limit message (abort condition)
+            limit_location = find_image("gemini_generation_limit_message.png", confidence=0.7)
+            if limit_location:
+                print(f"❌ [UPLOAD] Generation limit reached while waiting for upload button!")
+                hud.print("❌ Generation limit reached!", "error")
+                update_operation_status(f"Generation limit reached while waiting for upload for {entry_name}", is_error=True)
+                return None
+            
+            # Print status every 5 seconds
+            current_time = time.time()
+            if current_time - last_status_time > 5:
+                elapsed = int(current_time - start_time)
+                print(f"⏳ [UPLOAD] Still waiting for upload button... ({elapsed}s elapsed)")
+                hud.print(f"⏳ Waiting for upload... ({elapsed}s)", "waiting")
+                update_operation_status(f"Waiting for upload button for {entry_name}... ({elapsed}s)")
+                last_status_time = current_time
+            
+            # Scroll up periodically to make sure button is visible
+            if elapsed % 10 == 0 and elapsed > 0:
+                scroll_up_multiple(2)
+            
+            time.sleep(check_interval)
+
     def process_single_entry(hwnd, entry_index, entry_data, images_folder):
         """
         Process a single entry:
         1. Wait for ask_gemini.png and click
         2. Paste the full entry JSON
         3. Wait for upload_to_gemini.png (confirm paste), click on RIGHT side (NO Enter key)
-        4. If upload_to_gemini.png not found, retry paste
-        5. Wait for generating_image.png, gemini_microphone.png, or gemini_generation_limit_message.png
-        6. If limit message found, abort operation
-        7. When gemini_microphone.png found, check limit message FIRST
-        8. If limit message found, abort; otherwise scroll up and click more.png right side
-        9. Click download_gemini_image.png
-        10. Monitor download with retry if not found after 30 seconds
-        11. Rename and save
+        4. If upload_to_gemini.png not found, check if text was pasted (Ctrl+C verification)
+        5. If text is pasted, wait INDEFINITELY for upload button
+        6. If upload button appears, click it
+        7. Wait for generating_image.png, gemini_microphone.png, or gemini_generation_limit_message.png
+        8. If limit message found, abort operation
+        9. When gemini_microphone.png found, check limit message FIRST
+        10. If limit message found, abort; otherwise scroll up and click more.png right side
+        11. Click download_gemini_image.png
+        12. Monitor download with retry if not found after 30 seconds
+        13. Rename and save
         """
         entry_name = f"entry_{entry_index + 1}"
         entry_json = format_entry_json(entry_data)
@@ -2049,12 +2382,12 @@ def generate_gemini_images():
         print(f"{'='*50}")
         update_operation_status(f"Processing {entry_name}...")
         
-        # Step 1: Wait for ask_gemini.png and click it
-        print(f"🔍 [ENTRY] Step 1: Looking for ask_gemini.png...")
+        # Step 1: Wait for ask_gemini.png and click it (with fallback support)
+        print(f"🔍 [ENTRY] Step 1: Looking for ask_gemini.png with fallback support...")
         ask_location = wait_for_image("ask_gemini.png", timeout_seconds=60, confidence=0.8)
         
         if not ask_location:
-            print(f"❌ [ENTRY] Could not find ask_gemini.png")
+            print(f"❌ [ENTRY] Could not find ask_gemini.png in any variant")
             hud.print("❌ UI element not found", "error")
             update_operation_status(f"Could not find ask_gemini.png for {entry_name}", is_error=True)
             return False
@@ -2082,30 +2415,116 @@ def generate_gemini_images():
         pyautogui.hotkey('ctrl', 'v')
         time.sleep(0.3)
         
-        # Step 3: Wait for upload_to_gemini.png to confirm paste and click it on the RIGHT side (NO Enter key)
+        # Step 3: Wait for upload_to_gemini.png to confirm paste and click it on the RIGHT side
         print(f"🔍 [ENTRY] Step 3: Looking for upload_to_gemini.png to confirm paste...")
+        
+        # First, try to wait for upload button with a short timeout
         upload_location = wait_for_image("upload_to_gemini.png", timeout_seconds=10, confidence=0.7)
         
+        if not upload_location:
+            # If upload button not found immediately, verify text was pasted
+            print(f"⚠️ [UPLOAD] Upload button not found initially - verifying text was pasted...")
+            
+            # Click on the text area to focus it
+            pyautogui.click()
+            time.sleep(0.1)
+            
+            # Select all and copy to verify
+            pyautogui.hotkey('ctrl', 'a')
+            time.sleep(0.1)
+            pyautogui.hotkey('ctrl', 'c')
+            time.sleep(0.1)
+            
+            # Get clipboard content
+            clipboard_content = pyperclip.paste()
+            
+            # Check if the pasted text matches (allow some tolerance for formatting)
+            if clipboard_content and len(clipboard_content) > 10:
+                # Verify that the pasted text is similar to what we intended
+                # Check if key parts of the entry_json are in the clipboard
+                entry_check = entry_json[:100] if len(entry_json) > 100 else entry_json
+                clipboard_check = clipboard_content[:100] if len(clipboard_content) > 100 else clipboard_content
+                
+                if entry_check.strip() in clipboard_check or clipboard_check.strip() in entry_check:
+                    print(f"✅ [UPLOAD] Text was successfully pasted (verified by clipboard)")
+                    print(f"⏳ [UPLOAD] Waiting INDEFINITELY for upload_to_gemini.png button to appear...")
+                    
+                    # Wait indefinitely for the upload button
+                    upload_location = wait_for_upload_button_indefinitely(hwnd, entry_name)
+                    
+                    if upload_location is None:
+                        # User aborted or limit reached
+                        return False
+                else:
+                    print(f"⚠️ [UPLOAD] Text not properly pasted - clipboard content doesn't match")
+                    print(f"   Expected: {entry_check[:50]}...")
+                    print(f"   Got: {clipboard_check[:50]}...")
+                    
+                    # Try pasting again
+                    print(f"🔄 [UPLOAD] Retrying paste...")
+                    pyautogui.click()
+                    time.sleep(0.1)
+                    pyautogui.hotkey('ctrl', 'a')
+                    time.sleep(0.05)
+                    pyautogui.press('backspace')
+                    time.sleep(0.05)
+                    pyperclip.copy(entry_json)
+                    pyautogui.hotkey('ctrl', 'v')
+                    time.sleep(0.3)
+                    
+                    # Now wait indefinitely for upload button
+                    print(f"⏳ [UPLOAD] Waiting INDEFINITELY for upload_to_gemini.png after retry...")
+                    upload_location = wait_for_upload_button_indefinitely(hwnd, entry_name)
+                    
+                    if upload_location is None:
+                        # User aborted or limit reached
+                        return False
+            else:
+                # Clipboard is empty - paste failed
+                print(f"❌ [UPLOAD] Paste verification failed - clipboard is empty")
+                print(f"🔄 [UPLOAD] Retrying paste...")
+                pyautogui.click()
+                time.sleep(0.1)
+                pyautogui.hotkey('ctrl', 'a')
+                time.sleep(0.05)
+                pyautogui.press('backspace')
+                time.sleep(0.05)
+                pyperclip.copy(entry_json)
+                pyautogui.hotkey('ctrl', 'v')
+                time.sleep(0.3)
+                
+                # Now wait indefinitely for upload button
+                print(f"⏳ [UPLOAD] Waiting INDEFINITELY for upload_to_gemini.png after retry...")
+                upload_location = wait_for_upload_button_indefinitely(hwnd, entry_name)
+                
+                if upload_location is None:
+                    # User aborted or limit reached
+                    return False
+        
+        # At this point, we have the upload_location
         if upload_location:
             print(f"✅ [ENTRY] Found upload_to_gemini.png - clicking on RIGHT side to submit")
             # Click the RIGHT side of upload_to_gemini.png (75% from left)
-            image_path = os.path.join(GUI_IMAGES, "upload_to_gemini.png")
-            try:
-                location = pyautogui.locateOnScreen(image_path, confidence=0.7)
-                if location:
-                    click_x = location.left + int(location.width * 0.75)
-                    click_y = location.top + int(location.height / 2)
-                    print(f"🎯 [ENTRY] Clicking upload_to_gemini.png right side at ({click_x}, {click_y})")
-                    pyautogui.moveTo(click_x, click_y, duration=0.1)
-                    pyautogui.click()
-                    time.sleep(0.5)
-                else:
-                    # Fallback: use the center if bounds can't be found
-                    pyautogui.moveTo(upload_location.x, upload_location.y, duration=0.1)
-                    pyautogui.click()
-                    time.sleep(0.5)
-            except Exception as e:
-                print(f"⚠️ [ENTRY] Error clicking upload_to_gemini.png: {e}")
+            variants = get_image_variants("upload_to_gemini.png")
+            found_variant = False
+            
+            for variant_path in variants:
+                try:
+                    location = pyautogui.locateOnScreen(variant_path, confidence=0.7)
+                    if location:
+                        click_x = location.left + int(location.width * 0.75)
+                        click_y = location.top + int(location.height / 2)
+                        print(f"🎯 [ENTRY] Clicking {os.path.basename(variant_path)} right side at ({click_x}, {click_y})")
+                        pyautogui.moveTo(click_x, click_y, duration=0.1)
+                        pyautogui.click()
+                        time.sleep(0.5)
+                        found_variant = True
+                        break
+                except Exception as e:
+                    # Suppress verbose error
+                    pass
+            
+            if not found_variant:
                 # Fallback: use the center
                 pyautogui.moveTo(upload_location.x, upload_location.y, duration=0.1)
                 pyautogui.click()
@@ -2118,62 +2537,13 @@ def generate_gemini_images():
                     break
                 time.sleep(0.3)
         else:
-            print(f"⚠️ [ENTRY] upload_to_gemini.png not found - trying to paste again")
-            # Retry: click ask_gemini again and paste
-            ask_location = wait_for_image("ask_gemini.png", timeout_seconds=10, confidence=0.8)
-            if ask_location:
-                pyautogui.moveTo(ask_location.x, ask_location.y, duration=0.1)
-                pyautogui.click()
-                time.sleep(0.3)
-                
-                # Clear and paste again
-                pyautogui.hotkey('ctrl', 'a')
-                time.sleep(0.05)
-                pyautogui.press('backspace')
-                time.sleep(0.05)
-                pyperclip.copy(entry_json)
-                pyautogui.hotkey('ctrl', 'v')
-                time.sleep(0.3)
-                
-                # Check for upload_to_gemini.png again
-                upload_location = wait_for_image("upload_to_gemini.png", timeout_seconds=10, confidence=0.7)
-                if upload_location:
-                    print(f"✅ [ENTRY] Found upload_to_gemini.png on retry - clicking on RIGHT side to submit")
-                    # Click the RIGHT side of upload_to_gemini.png (75% from left)
-                    image_path = os.path.join(GUI_IMAGES, "upload_to_gemini.png")
-                    try:
-                        location = pyautogui.locateOnScreen(image_path, confidence=0.7)
-                        if location:
-                            click_x = location.left + int(location.width * 0.75)
-                            click_y = location.top + int(location.height / 2)
-                            print(f"🎯 [ENTRY] Clicking upload_to_gemini.png right side at ({click_x}, {click_y})")
-                            pyautogui.moveTo(click_x, click_y, duration=0.1)
-                            pyautogui.click()
-                            time.sleep(0.5)
-                        else:
-                            pyautogui.moveTo(upload_location.x, upload_location.y, duration=0.1)
-                            pyautogui.click()
-                            time.sleep(0.5)
-                    except Exception as e:
-                        print(f"⚠️ [ENTRY] Error clicking upload_to_gemini.png: {e}")
-                        pyautogui.moveTo(upload_location.x, upload_location.y, duration=0.1)
-                        pyautogui.click()
-                        time.sleep(0.5)
-                else:
-                    # If upload_to_gemini.png still not found after retry, abort this entry
-                    print(f"❌ [ENTRY] Could not find upload_to_gemini.png after retry - skipping entry")
-                    hud.print("❌ Paste verification failed", "error")
-                    update_operation_status(f"Could not verify paste for {entry_name}", is_error=True)
-                    return False
-            else:
-                # If ask_gemini.png not found on retry, abort this entry
-                print(f"❌ [ENTRY] Could not find ask_gemini.png on retry - skipping entry")
-                hud.print("❌ UI element not found", "error")
-                update_operation_status(f"Could not find ask_gemini.png for {entry_name}", is_error=True)
-                return False
+            # This shouldn't happen if we waited indefinitely, but just in case
+            print(f"❌ [ENTRY] Could not find upload_to_gemini.png - aborting entry")
+            hud.print("❌ Upload button not found", "error")
+            update_operation_status(f"Could not find upload_to_gemini.png for {entry_name}", is_error=True)
+            return False
         
         # Step 4: Wait for generation to complete (with limit check)
-        # This now correctly waits for generating_image.png FIRST, then gemini_microphone.png
         print(f"⏳ [ENTRY] Step 4: Waiting for generation to complete...")
         generation_complete, status = wait_for_generation_complete(hwnd, entry_name, max_wait_seconds=300)
         
@@ -2201,7 +2571,6 @@ def generate_gemini_images():
         
         # Step 6: Look for more.png and click right side
         print(f"🔍 [ENTRY] Step 6: Looking for more.png...")
-        hud.print("🔍 Finding menu...", "navigating")
         
         # Scroll up multiple times to make more.png visible
         scroll_up_multiple(3)
@@ -2228,21 +2597,28 @@ def generate_gemini_images():
         
         if more_location:
             # Click the right side of the image (75% from left)
-            image_path = os.path.join(GUI_IMAGES, "more.png")
-            try:
-                location = pyautogui.locateOnScreen(image_path, confidence=0.8)
-                if location:
-                    click_x = location.left + int(location.width * 0.75)
-                    click_y = location.top + int(location.height / 2)
-                    print(f"🎯 [ENTRY] Clicking more.png right side at ({click_x}, {click_y})")
-                    pyautogui.moveTo(click_x, click_y, duration=0.1)
-                    pyautogui.click()
-                    time.sleep(0.5)
-                    print(f"✅ [ENTRY] Clicked more.png right side")
-                else:
-                    print(f"⚠️ [ENTRY] Could not get bounds for more.png")
-            except Exception as e:
-                print(f"⚠️ [ENTRY] Error clicking more.png: {e}")
+            variants = get_image_variants("more.png")
+            found_variant = False
+            
+            for variant_path in variants:
+                try:
+                    location = pyautogui.locateOnScreen(variant_path, confidence=0.8)
+                    if location:
+                        click_x = location.left + int(location.width * 0.75)
+                        click_y = location.top + int(location.height / 2)
+                        print(f"🎯 [ENTRY] Clicking {os.path.basename(variant_path)} right side at ({click_x}, {click_y})")
+                        pyautogui.moveTo(click_x, click_y, duration=0.1)
+                        pyautogui.click()
+                        time.sleep(0.5)
+                        print(f"✅ [ENTRY] Clicked more.png right side")
+                        found_variant = True
+                        break
+                except Exception as e:
+                    # Suppress verbose error
+                    pass
+            
+            if not found_variant:
+                print(f"⚠️ [ENTRY] Could not click more.png - none of the variants worked")
         else:
             print(f"⚠️ [ENTRY] more.png not found after multiple attempts - skipping")
         
@@ -2367,7 +2743,7 @@ def generate_gemini_images():
                 update_operation_status("Failed to load Gemini URL", is_error=True)
                 return
             
-            # Wait for initial page to load (wait for ask_gemini.png)
+            # Wait for initial page to load (wait for ask_gemini.png with fallback)
             print(f"🔍 [MAIN] Waiting for Gemini UI to load...")
             ask_location = wait_for_image("ask_gemini.png", timeout_seconds=60, confidence=0.8)
             if not ask_location:
@@ -2984,7 +3360,7 @@ def produce_video_from_images_entries():
                 audio_clip = None
         
         # Save final video
-        output_filename = f"{normalized_project_title}_with_captions.mp4"
+        output_filename = f"{normalized_project_title}.mp4"
         output_path = os.path.join(edited_folder, output_filename)
         
         print(f"💾 Saving: {output_filename}")
@@ -3085,179 +3461,8 @@ def produce_video_from_images_entries():
         'output_path': output_path
     }
 
-def distribute_characters():
-    """
-    Distributes character visual prompts from characters_visual_prompts to each entry
-    based on the view_focus_characters field.
-    
-    For each entry, it extracts character names from view_focus_characters,
-    normalizes them (removes special characters, handles "and" separator),
-    looks up each character in characters_visual_prompts, and adds them
-    as new fields in the entry.
-    """
-    # Load panel.json
-    if not os.path.exists(PANEL_PATH):
-        print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
-        return
-
-    try:
-        with open(PANEL_PATH, 'r', encoding='utf-8') as file:
-            panel_data = json.load(file)
-    except json.JSONDecodeError as e:
-        print(f"❌ Error: panel.json is not valid JSON: {e}")
-        return
-    except Exception as e:
-        print(f"❌ Error reading panel.json: {e}")
-        return
-
-    # Get characters_visual_prompts - FIXED: Correct path to the data
-    # The characters_visual_prompts is inside project_name.script_json
-    script_json = panel_data.get('project_name', {}).get('script_json', {})
-    characters_visual_prompts = script_json.get('characters_visual_prompts', {})
-    
-    if not characters_visual_prompts:
-        print("⚠️ No characters_visual_prompts found in panel.json")
-        print("   Tried path: project_name.script_json.characters_visual_prompts")
-        return
-
-    # Get script entries - FIXED: Use the correct path
-    script_data = script_json.get('script', {})
-    
-    if not script_data:
-        print("⚠️ No script data found in panel.json")
-        return
-
-    print(f"📊 [DISTRIBUTE] Found {len(characters_visual_prompts)} characters in lookup")
-
-    # Create a normalized lookup dictionary for characters
-    def normalize_name(name):
-        """Normalize character name for lookup."""
-        if not name:
-            return ""
-        # Remove extra whitespace
-        name = ' '.join(name.split())
-        # Convert to lowercase for case-insensitive matching
-        return name.lower().strip()
-
-    # Build character lookup dictionary with normalized keys
-    character_lookup = {}
-    for char_name, char_data in characters_visual_prompts.items():
-        normalized = normalize_name(char_name)
-        if normalized:
-            character_lookup[normalized] = {
-                'original_name': char_name,
-                'data': char_data
-            }
-    
-    print(f"📊 [DISTRIBUTE] Character lookup built with {len(character_lookup)} entries")
-
-    # Track statistics
-    entries_processed = 0
-    total_characters_added = 0
-    batches_processed = 0
-    
-    # Function to extract character names from view_focus_characters
-    def extract_character_names(view_focus_string):
-        """Extract character names from view_focus_string."""
-        if not view_focus_string:
-            return []
-        
-        # Handle " and " as a separator
-        normalized = view_focus_string.replace(' and ', ', ')
-        normalized = normalized.replace(' and', ',')
-        normalized = normalized.replace('and ', ',')
-        
-        # Split by comma and clean up
-        raw_names = [name.strip() for name in normalized.split(',') if name.strip()]
-        
-        return raw_names
-
-    # Process each batch
-    for batch_key, batch_data in script_data.items():
-        if not isinstance(batch_data, dict):
-            continue
-            
-        entries = batch_data.get('entries', [])
-        if not entries:
-            continue
-        
-        batches_processed += 1
-        print(f"\n📁 [DISTRIBUTE] Processing batch: {batch_key} ({len(entries)} entries)")
-        
-        for entry_idx, entry in enumerate(entries):
-            # Skip if no view_focus_characters
-            view_focus = entry.get('view_focus_characters', '')
-            if not view_focus:
-                print(f"  ⏭️ Entry {entry_idx + 1}: No view_focus_characters, skipping")
-                continue
-            
-            # Extract character names from view_focus
-            raw_names = extract_character_names(view_focus)
-            
-            if not raw_names:
-                print(f"  ⏭️ Entry {entry_idx + 1}: No names extracted from '{view_focus}'")
-                continue
-            
-            print(f"  📝 Entry {entry_idx + 1}: Extracted names: {raw_names}")
-            
-            # Process each character
-            characters_added = 0
-            for raw_name in raw_names:
-                # Try to find the character in the lookup
-                normalized_raw = normalize_name(raw_name)
-                
-                # Try exact match
-                matched_char = None
-                if normalized_raw in character_lookup:
-                    matched_char = character_lookup[normalized_raw]
-                else:
-                    # Try partial match (in case of slight variations)
-                    for lookup_key, lookup_data in character_lookup.items():
-                        # Check if either contains the other
-                        if normalized_raw in lookup_key or lookup_key in normalized_raw:
-                            matched_char = lookup_data
-                            print(f"    🔍 Partial match: '{raw_name}' -> '{lookup_key}'")
-                            break
-                
-                if matched_char:
-                    char_name = matched_char['original_name']
-                    char_data = matched_char['data']
-                    
-                    # Add character data to entry as a nested object
-                    entry[char_name] = char_data
-                    characters_added += 1
-                    total_characters_added += 1
-                    print(f"    ✅ Added character: {char_name}")
-                else:
-                    print(f"    ⚠️ Character not found in lookup: '{raw_name}'")
-                    print(f"       Available characters: {list(character_lookup.keys())}")
-            
-            if characters_added > 0:
-                entries_processed += 1
-                print(f"  ✅ Entry {entry_idx + 1}: Added {characters_added} characters")
-
-    print(f"\n{'='*50}")
-    print(f"📊 [DISTRIBUTE] Summary:")
-    print(f"   - Batches processed: {batches_processed}")
-    print(f"   - Entries with characters distributed: {entries_processed}")
-    print(f"   - Total character references added: {total_characters_added}")
-    print(f"{'='*50}")
-
-    # Save updated panel.json
-    try:
-        with open(PANEL_PATH, 'w', encoding='utf-8') as file:
-            json.dump(panel_data, file, indent=4, ensure_ascii=False)
-        print(f"✅ [DISTRIBUTE] Successfully updated panel.json")
-    except Exception as e:
-        print(f"❌ Error saving panel.json: {e}")
-        import traceback
-        traceback.print_exc()
-        return
-
-    return entries_processed, total_characters_added
-
 if __name__ == "__main__":
-   generate_gemini_images()
+   produce_video_from_images_entries()
 
    
 
