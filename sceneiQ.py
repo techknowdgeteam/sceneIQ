@@ -3462,7 +3462,7 @@ def produce_video_from_images_entries():
     }
 
 if __name__ == "__main__":
-   produce_video_from_images_entries()
+   generate_gemini_images()
 
    
 
