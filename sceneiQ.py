@@ -3098,14 +3098,17 @@ def sceneiq_google_flow_images_generation_engine():
     - Checks for exit_editinggfimage.png regularly throughout every workflow stage
     - Requires imagerenderingprogress.png and positions the cursor 50px left and 50px below it before preparing a download
     - Restores the image-hover cursor position before each download retry\n    - While locked, continuously checks the verified web-download confirmation modal\n    - Rechecks rendering while waiting for moregf and returns to render-wait if it reappears\n    - Blocks Windows mouse-wheel scrolling while the image-position lock is active
-    - On the first confirmed Google Flow prompt workspace, runs Nano Banana setup
-      BEFORE project-folder validation or any scene-entry processing
-    - Follows the Serenum sequence: click nanobananaconfig.png first, then
-      click only nanobanana_16ratio9.png
-    - Uses a function-lifetime one-shot guard consumed before the setup begins
-    - Automatic and Ctrl+Shift+F12 workflow restarts can never repeat Nano Banana setup
-    - If the one-time setup fails or is interrupted, scene generation is stopped
-      rather than continuing with an unconfirmed aspect ratio
+    - On every confirmed Google Flow prompt workspace, including every automatic,
+      shortcut, and fresh-function restart, configures Nano Banana BEFORE project
+      validation or any scene-entry processing
+    - Follows the Serenum sequence on every workflow attempt: click
+      nanobananaconfig.png first, then click only nanobanana_16ratio9.png
+    - Download monitoring snapshots the real Windows/Edge download folders BEFORE
+      triggering the download and detects new or updated image files across them
+    - Detects Edge custom download directories from profile Preferences and the
+      Windows Downloads known-folder registry values
+    - Handles temporary download files, waits for stable/valid image data, and
+      verifies the saved destination before reporting success
     """
     import os
     import json
@@ -3173,7 +3176,7 @@ def sceneiq_google_flow_images_generation_engine():
         pass
 
     class _NanoBananaStartupFailure(BaseException):
-        """Stop safely when the one-time Nano Banana startup setup cannot finish."""
+        """Stop safely when this workflow attempt cannot confirm Nano Banana setup."""
         pass
 
     def set_image_scroll_lock(enabled):
@@ -4272,8 +4275,8 @@ def sceneiq_google_flow_images_generation_engine():
         2. Select only nanobanana_16ratio9.png.
         3. Confirm the prompt input is reachable before continuing.
 
-        This helper must be called only once during the lifetime of this
-        SceneIQ function execution.
+        This helper is called once per complete workflow attempt, including
+        automatic and shortcut-triggered restarts.
         """
         check_for_termination()
         enforce_window_focus(hwnd)
@@ -5360,193 +5363,446 @@ def sceneiq_google_flow_images_generation_engine():
         print(f"⏰ [GF] Generation timeout after {max_wait_seconds} seconds")
         return False, "timeout"
 
-    # --- DOWNLOAD HELPERS (same as original) ---
+    # --- ROBUST DOWNLOAD HELPERS ---
+    DOWNLOAD_IMAGE_EXTENSIONS = {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff"
+    }
+    DOWNLOAD_TEMP_SUFFIXES = (".crdownload", ".part", ".tmp", ".download")
+
+    def _get_download_directories(extra_directory=None):
+        """Discover Windows Downloads and any custom Edge profile download paths."""
+        candidates = []
+
+        def _add_directory(value):
+            if not value:
+                return
+            try:
+                expanded = os.path.expandvars(os.path.expanduser(str(value).strip().strip('"')))
+                if not expanded:
+                    return
+                absolute = os.path.abspath(expanded)
+                normalized = os.path.normcase(absolute)
+                if all(os.path.normcase(os.path.abspath(item)) != normalized for item in candidates):
+                    candidates.append(absolute)
+            except Exception:
+                pass
+
+        # Windows Known Downloads directory (including redirected OneDrive paths).
+        downloads_guid = "{374DE290-123F-4565-9164-39C4925E467B}"
+        try:
+            import winreg
+            registry_locations = (
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+            )
+            for registry_path in registry_locations:
+                try:
+                    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, registry_path) as key:
+                        for value_name in (downloads_guid, "{374DE290-123F-4565-9164-39C4925E467B}"):
+                            try:
+                                value, _ = winreg.QueryValueEx(key, value_name)
+                                _add_directory(value)
+                            except OSError:
+                                continue
+                except OSError:
+                    continue
+        except Exception as registry_error:
+            print(f"ℹ️ [DOWNLOAD] Windows Downloads registry lookup unavailable: {registry_error}")
+
+        # Standard profile fallbacks.
+        user_profile = os.environ.get("USERPROFILE")
+        if user_profile:
+            _add_directory(os.path.join(user_profile, "Downloads"))
+        _add_directory(os.path.expanduser("~/Downloads"))
+
+        # Edge can use a custom directory per browser profile. Read every profile's
+        # Preferences file so Profile 1/Profile 2 paths are included as well as Default.
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            edge_user_data = os.path.join(
+                local_app_data, "Microsoft", "Edge", "User Data"
+            )
+            try:
+                if os.path.isdir(edge_user_data):
+                    for profile_name in os.listdir(edge_user_data):
+                        profile_path = os.path.join(edge_user_data, profile_name)
+                        preferences_path = os.path.join(profile_path, "Preferences")
+                        if not os.path.isdir(profile_path) or not os.path.isfile(preferences_path):
+                            continue
+                        try:
+                            with open(preferences_path, "r", encoding="utf-8") as pref_file:
+                                preferences = json.load(pref_file)
+                            download_settings = preferences.get("download", {})
+                            if isinstance(download_settings, dict):
+                                _add_directory(download_settings.get("default_directory"))
+                        except Exception as pref_error:
+                            print(
+                                f"ℹ️ [DOWNLOAD] Could not read Edge profile '{profile_name}' "
+                                f"download settings: {pref_error}"
+                            )
+            except Exception as edge_profile_error:
+                print(f"ℹ️ [DOWNLOAD] Edge profile scan unavailable: {edge_profile_error}")
+
+        # Include the project directory in case Edge is configured to save there.
+        _add_directory(extra_directory)
+
+        # Keep existing directories first, but retain not-yet-created custom paths
+        # because Edge may create them when the download is triggered.
+        return candidates
+
+    def _capture_download_snapshot(extra_directory=None):
+        """Capture file identity/size/time before clicking Google's download controls."""
+        directories = _get_download_directories(extra_directory)
+        files = {}
+        scanned_count = 0
+        for directory in directories:
+            if not os.path.isdir(directory):
+                continue
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        try:
+                            if not entry.is_file(follow_symlinks=True):
+                                continue
+                            stat = entry.stat(follow_symlinks=True)
+                            full_path = os.path.abspath(entry.path)
+                            files[os.path.normcase(full_path)] = {
+                                "mtime_ns": getattr(
+                                    stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)
+                                ),
+                                "size": int(stat.st_size),
+                            }
+                            scanned_count += 1
+                        except (OSError, PermissionError):
+                            continue
+            except (OSError, PermissionError) as scan_error:
+                print(f"⚠️ [DOWNLOAD] Could not snapshot '{directory}': {scan_error}")
+
+        snapshot = {
+            "captured_at": time.time(),
+            "captured_at_ns": time.time_ns(),
+            "directories": directories,
+            "files": files,
+        }
+        print(
+            f"📸 [DOWNLOAD] Pre-click download snapshot captured: "
+            f"{scanned_count} existing file(s) across {len(directories)} possible folder(s)."
+        )
+        for directory in directories:
+            print(f"   📁 {directory}")
+        return snapshot
+
+    def _get_download_image_extension(file_path):
+        """Return a supported image extension, using the file signature as fallback."""
+        extension = os.path.splitext(file_path)[1].lower()
+        if extension in DOWNLOAD_IMAGE_EXTENSIONS:
+            return extension
+        try:
+            with open(file_path, "rb") as image_file:
+                header = image_file.read(32)
+            if header.startswith(b"\x89PNG\r\n\x1a\n"):
+                return ".png"
+            if header.startswith(b"\xff\xd8\xff"):
+                return ".jpg"
+            if header.startswith((b"GIF87a", b"GIF89a")):
+                return ".gif"
+            if header.startswith(b"BM"):
+                return ".bmp"
+            if header.startswith((b"II*\x00", b"MM\x00*")):
+                return ".tiff"
+            if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+                return ".webp"
+        except Exception:
+            pass
+        return None
+
+    def _download_image_is_valid(file_path):
+        """Reject incomplete/corrupt files instead of treating any new file as success."""
+        try:
+            if not os.path.isfile(file_path) or os.path.getsize(file_path) <= 1024:
+                return False
+            from PIL import Image
+            with Image.open(file_path) as image_file:
+                image_file.verify()
+            return _get_download_image_extension(file_path) is not None
+        except ImportError:
+            return _get_download_image_extension(file_path) is not None
+        except Exception:
+            return False
+
+    def _get_new_download_candidates(snapshot):
+        """Return only image files created/changed after the pre-click snapshot."""
+        baseline = snapshot.get("files", {}) if isinstance(snapshot, dict) else {}
+        directories = snapshot.get("directories", []) if isinstance(snapshot, dict) else []
+        candidates = []
+        pending_files = []
+
+        for directory in directories:
+            if not os.path.isdir(directory):
+                continue
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        try:
+                            if not entry.is_file(follow_symlinks=True):
+                                continue
+                            name = entry.name
+                            lower_name = name.lower()
+                            full_path = os.path.abspath(entry.path)
+                            if lower_name.endswith(DOWNLOAD_TEMP_SUFFIXES):
+                                pending_files.append(full_path)
+                                continue
+
+                            extension = _get_download_image_extension(full_path)
+                            if extension is None:
+                                continue
+
+                            stat = entry.stat(follow_symlinks=True)
+                            mtime_ns = getattr(
+                                stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)
+                            )
+                            size = int(stat.st_size)
+                            key = os.path.normcase(full_path)
+                            previous = baseline.get(key)
+                            is_new = previous is None
+                            is_updated = (
+                                previous is not None
+                                and (
+                                    size != int(previous.get("size", -1))
+                                    or mtime_ns > int(previous.get("mtime_ns", 0))
+                                )
+                            )
+                            if is_new or is_updated:
+                                candidates.append({
+                                    "path": full_path,
+                                    "mtime_ns": mtime_ns,
+                                    "size": size,
+                                    "extension": extension,
+                                })
+                        except (OSError, PermissionError):
+                            continue
+            except (OSError, PermissionError) as scan_error:
+                print(f"⚠️ [DOWNLOAD] Could not scan '{directory}': {scan_error}")
+
+        candidates.sort(key=lambda item: item["mtime_ns"], reverse=True)
+        return candidates, pending_files
+
+    def _wait_for_download_file_stability(file_path, deadline):
+        """Wait for a candidate to stop changing, then validate its image contents."""
+        previous_signature = None
+        stable_samples = 0
+        last_logged_size = None
+
+        while time.monotonic() < deadline:
+            check_for_termination()
+            try:
+                stat = os.stat(file_path)
+                signature = (
+                    int(stat.st_size),
+                    getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)),
+                )
+                if signature[0] > 1024 and signature == previous_signature:
+                    stable_samples += 1
+                else:
+                    stable_samples = 0
+                    previous_signature = signature
+
+                if signature[0] != last_logged_size:
+                    print(
+                        f"   ⏳ [DOWNLOAD] Candidate size: {signature[0]} bytes; "
+                        f"waiting for it to stabilize."
+                    )
+                    last_logged_size = signature[0]
+
+                if stable_samples >= 2:
+                    if _download_image_is_valid(file_path):
+                        return True
+                    # An image can be stable briefly while the browser is still
+                    # finalizing it. Keep monitoring until the deadline.
+                    stable_samples = 0
+            except (OSError, PermissionError):
+                previous_signature = None
+                stable_samples = 0
+            _sleep(0.25)
+        return False
+
     def check_and_rename_download(
         entry_name, images_folder, timeout_seconds=40, check_interval=0.3,
-        force_png=False
+        force_png=False, download_snapshot=None
     ):
+        """Find, validate, and move the image created after the pre-click snapshot."""
         timeout_seconds = _bounded_timeout(timeout_seconds)
-        print(f"📊 [DOWNLOAD] Monitoring for download for {entry_name}...")
+        print(f"📊 [DOWNLOAD] Monitoring all discovered Windows/Edge download folders for {entry_name}...")
         try:
             hud.print("Waiting for the download to finish...", "waiting")
         except Exception:
             pass
         update_operation_status(f"Waiting for download: {entry_name}")
 
-        downloads_folder = os.path.expanduser("~/Downloads")
-        if not os.path.exists(downloads_folder):
-            print(f"❌ [DOWNLOAD] Downloads folder not found: {downloads_folder}")
+        if not isinstance(download_snapshot, dict):
+            download_snapshot = _capture_download_snapshot(images_folder)
+        directories = download_snapshot.get("directories", [])
+        if not directories:
+            print("❌ [DOWNLOAD] No download directories could be identified.")
             return False, None
 
-        initial_files = {}
-        try:
-            with os.scandir(downloads_folder) as entries:
-                for entry in entries:
-                    if entry.is_file():
-                        try:
-                            stat = entry.stat()
-                            initial_files[entry.name] = {'path': entry.path, 'time': stat.st_mtime, 'size': stat.st_size}
-                        except Exception:
-                            pass
-            print(f"📁 [DOWNLOAD] Found {len(initial_files)} existing files before download")
-        except Exception as e:
-            print(f"⚠️ [DOWNLOAD] Error scanning existing files: {e}")
-            initial_files = {}
-
-        start_time = time.time()
-        download_detected = False
+        start_time = time.monotonic()
+        deadline = start_time + timeout_seconds
         downloaded_file_path = None
-        image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.tiff'}
+        last_status_time = start_time
+        last_pending_report = 0.0
+        rejected_candidates = set()
 
-        while time.time() - start_time < timeout_seconds:
+        while time.monotonic() < deadline:
             check_for_termination()
-            check_and_click_exit_editing()
-            elapsed = int(time.time() - start_time)
             try:
-                if os.path.exists(downloads_folder):
-                    with os.scandir(downloads_folder) as entries:
-                        for entry in entries:
-                            if entry.is_file():
-                                file_name = entry.name
-                                file_ext = os.path.splitext(file_name)[1].lower()
-                                is_new_file = file_name not in initial_files
-                                is_recent = False
-                                try:
-                                    stat = entry.stat()
-                                    if stat.st_mtime > start_time - 10:
-                                        is_recent = True
-                                except Exception:
-                                    pass
-                                if (is_new_file or is_recent) and file_ext in image_extensions:
-                                    print(f"🆕 [DOWNLOAD] Found new/updated image file: {file_name}")
-                                    print(f"   📁 Path: {entry.path}")
-                                    print(f"   📏 Size: {stat.st_size} bytes")
-                                    stable_count = 0
-                                    stable_size = 0
-                                    max_stable_checks = 5
-                                    while stable_count < 3 and stable_count < max_stable_checks:
-                                        if time.time() - start_time >= timeout_seconds:
-                                            break
-                                        try:
-                                            current_size = os.path.getsize(entry.path)
-                                            if current_size == stable_size and current_size > 1024:
-                                                stable_count += 1
-                                                print(f"   ⏳ File stable ({stable_count}/3), size: {current_size} bytes")
-                                            else:
-                                                stable_count = 0
-                                                stable_size = current_size
-                                                print(f"   ⏳ File size changing: {current_size} bytes")
-                                        except Exception as e:
-                                            print(f"   ⚠️ Error checking size: {e}")
-                                        _sleep(min(0.3, max(0.0, timeout_seconds - (time.time() - start_time))))
-                                    if stable_count >= 3:
-                                        print(f"✅ [DOWNLOAD] File stable and ready!")
-                                        downloaded_file_path = entry.path
-                                        download_detected = True
-                                        break
-                                    else:
-                                        print(f"⚠️ [DOWNLOAD] File not stable, continuing to monitor...")
-                                elif file_name.endswith('.crdownload') or file_name.endswith('.tmp'):
-                                    print(f"⏳ [DOWNLOAD] Found temp download: {file_name}")
-                            if download_detected:
-                                break
-                if download_detected and downloaded_file_path:
+                # The Google Flow confirmation overlay can appear after the
+                # download-menu click. Handle it during file monitoring too.
+                now = time.monotonic()
+                if now - last_pending_report >= 0.8:
+                    try:
+                        handle_webdownloadconfirmationmodal()
+                    except (_WorkflowRestart, _ManualStop):
+                        raise
+                    except Exception as modal_error:
+                        print(f"⚠️ [DOWNLOAD] Confirmation-modal check failed safely: {modal_error}")
+                    last_pending_report = now
+
+                check_and_click_exit_editing()
+                candidates, pending_files = _get_new_download_candidates(download_snapshot)
+                for pending_path in pending_files:
+                    # Log partial downloads once per path; Chrome/Edge commonly
+                    # use .crdownload while the browser is still writing.
+                    if pending_path not in rejected_candidates:
+                        print(f"⏳ [DOWNLOAD] Browser is still writing: {pending_path}")
+                        rejected_candidates.add(pending_path)
+
+                for candidate in candidates:
+                    candidate_path = candidate["path"]
+                    if candidate_path in rejected_candidates:
+                        continue
+                    print(
+                        f"🆕 [DOWNLOAD] New/updated image candidate detected: {candidate_path} "
+                        f"({candidate['size']} bytes)"
+                    )
+                    if _wait_for_download_file_stability(candidate_path, deadline):
+                        downloaded_file_path = candidate_path
+                        print(f"✅ [DOWNLOAD] Stable, valid image confirmed: {downloaded_file_path}")
+                        break
+                    # Keep an unsteady candidate eligible for another check unless
+                    # it disappeared or became invalid; the next scan uses fresh stats.
+                    try:
+                        if not os.path.exists(candidate_path):
+                            rejected_candidates.add(candidate_path)
+                    except Exception:
+                        pass
+
+                if downloaded_file_path:
                     break
-                if elapsed % 10 == 0 and elapsed > 0:
-                    print(f"⏳ [DOWNLOAD] Still waiting for download... ({elapsed}s elapsed)")
+
+                elapsed = int(time.monotonic() - start_time)
+                if time.monotonic() - last_status_time >= 5:
+                    print(
+                        f"⏳ [DOWNLOAD] Still monitoring for {entry_name}... "
+                        f"({elapsed}s elapsed; {len(candidates)} candidate(s), "
+                        f"{len(pending_files)} partial download(s))"
+                    )
                     try:
                         hud.print(f"Still downloading... ({elapsed}s)", "waiting")
                     except Exception:
                         pass
                     update_operation_status(f"Waiting for download {entry_name}... ({elapsed}s)")
+                    last_status_time = time.monotonic()
                 _sleep(check_interval)
-            except Exception as e:
-                print(f"⚠️ [DOWNLOAD] Error in monitoring loop: {e}")
+            except (_WorkflowRestart, _ManualStop):
+                raise
+            except Exception as monitor_error:
+                print(f"⚠️ [DOWNLOAD] Monitoring pass failed safely: {monitor_error}")
                 _sleep(check_interval)
-                continue
 
-        if not download_detected or not downloaded_file_path:
-            print(f"⏰ [DOWNLOAD] Timeout or no download detected after {timeout_seconds} seconds")
-            try:
-                print(f"🔍 [DOWNLOAD] Performing final scan for new image files...")
-                with os.scandir(downloads_folder) as entries:
-                    for entry in entries:
-                        if entry.is_file():
-                            file_name = entry.name
-                            file_ext = os.path.splitext(file_name)[1].lower()
-                            if file_ext in image_extensions:
-                                try:
-                                    stat = entry.stat()
-                                    if stat.st_mtime > start_time - 10:
-                                        print(f"🆕 [DOWNLOAD] Found new file in final scan: {file_name}")
-                                        downloaded_file_path = entry.path
-                                        download_detected = True
-                                        break
-                                except Exception:
-                                    pass
-            except Exception as e:
-                print(f"⚠️ [DOWNLOAD] Final scan error: {e}")
+        # Final grace scan covers a browser that completed the file right at the
+        # timeout boundary; it still requires a stable and valid image.
+        if not downloaded_file_path:
+            print("🔍 [DOWNLOAD] Performing final cross-folder scan (including timeout grace)...")
+            grace_deadline = time.monotonic() + 2.0
+            candidates, pending_files = _get_new_download_candidates(download_snapshot)
+            for candidate in candidates:
+                candidate_path = candidate["path"]
+                print(
+                    f"🔎 [DOWNLOAD] Final candidate: {candidate_path} "
+                    f"({candidate['size']} bytes)"
+                )
+                if _wait_for_download_file_stability(candidate_path, grace_deadline):
+                    downloaded_file_path = candidate_path
+                    break
 
-        if not download_detected or not downloaded_file_path:
-            print(f"❌ [DOWNLOAD] No download detected")
+        if not downloaded_file_path:
+            print(
+                f"❌ [DOWNLOAD] No new/updated valid image was found in any monitored folder. "
+                f"Monitored {len(directories)} folder(s):"
+            )
+            for directory in directories:
+                print(f"   • {directory} (exists={os.path.isdir(directory)})")
             return False, None
 
         try:
-            file_name = os.path.basename(downloaded_file_path)
-            file_ext = os.path.splitext(file_name)[1].lower()
-            new_filename = f"{entry_name}.png" if force_png else f"{entry_name}{file_ext}"
-            target_path = os.path.join(images_folder, new_filename)
-            if not os.path.exists(images_folder):
-                os.makedirs(images_folder, exist_ok=True)
-            if not os.path.exists(downloaded_file_path):
-                print(f"❌ [DOWNLOAD] File no longer exists: {downloaded_file_path}")
+            os.makedirs(images_folder, exist_ok=True)
+            source_path = os.path.abspath(downloaded_file_path)
+            source_extension = _get_download_image_extension(source_path)
+            if source_extension is None:
+                print(f"❌ [DOWNLOAD] Detected file is not a supported image: {source_path}")
                 return False, None
 
-            try:
-                _sleep(0.5)
-                if force_png:
-                    # Do not just rename a JPG/WebP file to .png. Convert the
-                    # downloaded image so Thumbnail.png is a genuine PNG file.
-                    from PIL import Image
-                    with Image.open(downloaded_file_path) as source_image:
-                        converted = source_image.convert(
-                            "RGBA" if "A" in source_image.getbands() else "RGB"
-                        )
-                        converted.save(target_path, format="PNG", optimize=True)
+            new_filename = f"{entry_name}.png" if force_png else f"{entry_name}{source_extension}"
+            target_path = os.path.abspath(os.path.join(images_folder, new_filename))
+
+            if force_png:
+                # Save to a temporary sibling and atomically replace the target.
+                # This also handles a source that was already saved as Thumbnail.png.
+                temp_target = target_path + ".download_tmp"
+                from PIL import Image
+                with Image.open(source_path) as source_image:
+                    converted = source_image.convert(
+                        "RGBA" if "A" in source_image.getbands() else "RGB"
+                    )
+                    converted.save(temp_target, format="PNG", optimize=True)
+                os.replace(temp_target, target_path)
+                if os.path.normcase(source_path) != os.path.normcase(target_path):
                     try:
-                        os.remove(downloaded_file_path)
+                        os.remove(source_path)
                     except OSError:
                         pass
-                    print(f"✅ [DOWNLOAD] Thumbnail converted and saved as: {new_filename}")
-                else:
-                    # Replace only the same expected entry filename if a retry
-                    # is correcting a previously invalid/partial download.
-                    if os.path.exists(target_path):
-                        os.remove(target_path)
+                print(f"✅ [DOWNLOAD] Thumbnail converted and saved as genuine PNG: {target_path}")
+            else:
+                if os.path.normcase(source_path) != os.path.normcase(target_path):
                     try:
-                        os.replace(downloaded_file_path, target_path)
+                        os.replace(source_path, target_path)
                     except OSError:
                         import shutil
-                        shutil.copy2(downloaded_file_path, target_path)
+                        temporary_copy = target_path + ".download_tmp"
+                        shutil.copy2(source_path, temporary_copy)
+                        os.replace(temporary_copy, target_path)
                         try:
-                            os.remove(downloaded_file_path)
+                            os.remove(source_path)
                         except OSError:
                             pass
-                    print(f"✅ [DOWNLOAD] File saved as: {new_filename}")
+                print(f"✅ [DOWNLOAD] Scene image saved as: {target_path}")
 
-                print(f"📁 [DOWNLOAD] Moved to: {target_path}")
-                try:
-                    hud.print("Saved successfully.", "success")
-                except Exception:
-                    pass
-                update_operation_status(f"Downloaded and saved: {new_filename}")
-                return True, target_path
-            except Exception as e:
-                print(f"❌ [DOWNLOAD] Failed to save/convert downloaded image: {e}")
-                traceback.print_exc()
+            if not _download_image_is_valid(target_path):
+                print(f"❌ [DOWNLOAD] Destination image failed final validation: {target_path}")
                 return False, None
-        except Exception as e:
-            print(f"❌ [DOWNLOAD] Error processing downloaded file: {e}")
+
+            print(f"📁 [DOWNLOAD] Verified destination: {target_path}")
+            try:
+                hud.print("Saved successfully.", "success")
+            except Exception:
+                pass
+            update_operation_status(f"Downloaded and verified: {os.path.basename(target_path)}")
+            return True, target_path
+
+        except Exception as save_error:
+            print(f"❌ [DOWNLOAD] Failed to move/convert/verify downloaded image: {save_error}")
+            traceback.print_exc()
             return False, None
 
     def download_google_flow_image(hwnd, entry_name, images_folder, force_png=False):
@@ -5684,10 +5940,14 @@ def sceneiq_google_flow_images_generation_engine():
             print(f"🔍 [GF-DOWNLOAD] Step 4: Looking for downloadgfimage.png...")
             download_location = wait_for_image("downloadgfimage.png", timeout_seconds=20, confidence=0.7)
             if download_location:
+                # CRITICAL: take the filesystem baseline BEFORE the click. The old
+                # watcher took its snapshot after the download started, which could
+                # miss fast files or classify them as pre-existing.
+                download_snapshot = _capture_download_snapshot(images_folder)
                 pyautogui.moveTo(download_location.x, download_location.y, duration=0.1)
                 pyautogui.click()
                 _sleep(0.5)
-                print(f"✅ [GF-DOWNLOAD] Clicked downloadgfimage.png")
+                print(f"✅ [GF-DOWNLOAD] Clicked downloadgfimage.png; pre-click snapshot is active")
             else:
                 print(f"❌ [GF-DOWNLOAD] downloadgfimage.png not found — download cannot proceed")
                 return False
@@ -5717,17 +5977,38 @@ def sceneiq_google_flow_images_generation_engine():
             while download_attempts < max_download_attempts and not download_success:
                 download_attempts += 1
                 print(f"🔄 [GF-DOWNLOAD] Download attempt {download_attempts}/{max_download_attempts}")
-                timeout_seconds = 30 if download_attempts == 1 else 20
+                timeout_seconds = 40 if download_attempts == 1 else 30
                 download_success, file_path = check_and_rename_download(
                     entry_name,
                     images_folder,
                     timeout_seconds=timeout_seconds,
                     check_interval=0.3,
-                    force_png=force_png
+                    force_png=force_png,
+                    download_snapshot=download_snapshot
                 )
                 if download_success:
                     print(f"✅ [GF-DOWNLOAD] Download successful on attempt {download_attempts}")
                     break
+
+                if download_attempts < max_download_attempts:
+                    # A file can finish between the previous timeout return and
+                    # the retry UI sequence. Re-scan against the original baseline
+                    # before clicking Download again, avoiding duplicate downloads.
+                    print("🔎 [GF-DOWNLOAD] Quick late-arrival scan before retrying the UI...")
+                    late_success, late_file_path = check_and_rename_download(
+                        entry_name,
+                        images_folder,
+                        timeout_seconds=2,
+                        check_interval=0.2,
+                        force_png=force_png,
+                        download_snapshot=download_snapshot
+                    )
+                    if late_success:
+                        download_success = True
+                        file_path = late_file_path
+                        print("✅ [GF-DOWNLOAD] Late-arriving download detected; no second click needed.")
+                        break
+
                 if download_attempts < max_download_attempts:
                     print(f"⚠️ [GF-DOWNLOAD] Download not found after {timeout_seconds}s — retrying...")
                     try:
@@ -6284,13 +6565,6 @@ def sceneiq_google_flow_images_generation_engine():
             force_png=True
         )
 
-    # This guard belongs to the lifetime of this function execution, not to an
-    # individual workflow attempt. It is consumed BEFORE the two-step setup
-    # starts, so no shortcut or automatic restart can run it a second time.
-    # A failed/interrupted setup is fatal for this function run: do not generate
-    # scene images with an aspect ratio that was not successfully confirmed.
-    startup_nanobanana_state = {"attempted": False, "completed": False}
-
     def main_google_flow_workflow(force_url_restart=False):
         try:
             if not os.path.exists(GUI_IMAGES):
@@ -6434,46 +6708,23 @@ def sceneiq_google_flow_images_generation_engine():
                 update_operation_status(error_message, is_error=True)
                 return
 
-            # This is the first operation after Google Flow's prompt workspace
-            # is positively confirmed as loaded. It happens BEFORE project-folder
-            # validation and BEFORE any prompt-entry processing.
-            if not startup_nanobanana_state["attempted"]:
-                # Consume the lifetime one-shot guard BEFORE opening settings.
-                # No restart can ever repeat either of the two Nano Banana clicks.
-                startup_nanobanana_state["attempted"] = True
-                print(
-                    "🟦 [NANO-BANANA] Google Flow page is confirmed loaded. "
-                    "Running the Serenum two-step setup BEFORE project validation: "
-                    "nanobananaconfig.png first, then nanobanana_16ratio9.png."
-                )
-                try:
-                    configure_startup_nanobanana_16ratio9(hwnd)
-                    startup_nanobanana_state["completed"] = True
-                except _WorkflowRestart:
-                    # If a shortcut interrupts the two-step process, the guard
-                    # remains consumed. The next attempt will stop instead of
-                    # repeating the setup or generating at an unconfirmed ratio.
-                    raise
-                print(
-                    "✅ [NANO-BANANA] Both startup clicks completed. "
-                    "This setup is now consumed for the lifetime of this function run."
-                )
-            elif not startup_nanobanana_state["completed"]:
-                message = (
-                    "The one-time Nano Banana setup was interrupted or failed. "
-                    "It will not be repeated during a restart, and scene generation "
-                    "is blocked until the function is started again."
-                )
-                print(f"🛑 [NANO-BANANA] {message}")
-                raise _NanoBananaStartupFailure(message)
-            else:
-                print(
-                    "⏭️ [NANO-BANANA] Startup setup already completed. "
-                    "Skipping Nano Banana on this restart; no ratio image will be checked."
-                )
+            # Re-run the Serenum two-step Nano Banana setup on EVERY full workflow
+            # attempt, but only after the Google Flow workspace is positively
+            # confirmed as loaded and BEFORE project-folder validation or entries.
+            # This intentionally runs again after Ctrl+Shift+F12 and auto-recovery.
+            print(
+                "🟦 [NANO-BANANA] Google Flow page is confirmed loaded. "
+                "Running setup for this workflow attempt: "
+                "nanobananaconfig.png first, then nanobanana_16ratio9.png."
+            )
+            configure_startup_nanobanana_16ratio9(hwnd)
+            print(
+                "✅ [NANO-BANANA] Configuration and 16:9 ratio selected for "
+                "this workflow attempt. Continuing to project validation."
+            )
 
-            # Project-folder validation and scene-entry inspection deliberately
-            # happen only AFTER the one-time Nano Banana startup action above.
+            # Project-folder validation and scene-entry inspection happen only
+            # AFTER this attempt's Nano Banana configuration is complete.
             valid, missing_entries = validate_entry_order(images_folder, total_entries)
             if not valid:
                 print("❌ [MAIN] Project image-folder validation failed")
@@ -6818,21 +7069,6 @@ def sceneiq_google_flow_images_generation_engine():
                 force_this_attempt = force_url_restart_pending
                 force_url_restart_pending = False
 
-                # The function-lifetime guard decides whether Nano Banana may
-                # run. A restart before the first confirmed workspace can still
-                # reach the one permitted startup setup; after it starts, no
-                # automatic or shortcut restart can repeat either click.
-                if startup_nanobanana_state["attempted"]:
-                    print(
-                        "⏭️ [NANO-BANANA] Startup setup already consumed; "
-                        "this workflow restart must not activate Nano Banana again."
-                    )
-                else:
-                    print(
-                        "🟦 [NANO-BANANA] One-time startup setup is pending: "
-                        "configuration control first, 16:9 ratio second."
-                    )
-
                 main_google_flow_workflow(force_url_restart=force_this_attempt)
             except _WorkflowRestart as restart_reason:
                 print(f"🔁 [SUPERVISOR] Restarting from the beginning: {restart_reason}")
@@ -6850,9 +7086,9 @@ def sceneiq_google_flow_images_generation_engine():
                 stop_event.set()
                 terminate_automation = True
             except _NanoBananaStartupFailure as startup_error:
-                print(f"🛑 [SUPERVISOR] Nano Banana startup setup failed: {startup_error}")
+                print(f"🛑 [SUPERVISOR] Nano Banana setup failed for this workflow attempt: {startup_error}")
                 update_operation_status(
-                    f"Nano Banana startup setup failed; scene generation stopped: {startup_error}",
+                    f"Nano Banana setup failed; scene generation stopped for safety: {startup_error}",
                     is_error=True
                 )
                 stop_event.set()
@@ -9785,9 +10021,4 @@ if __name__ == "__main__":
         import traceback
         print(f"❌ FATAL ERROR: {e}", flush=True)
         traceback.print_exc()
-
-   
-
-   
-
          
