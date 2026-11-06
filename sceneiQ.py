@@ -3098,10 +3098,14 @@ def sceneiq_google_flow_images_generation_engine():
     - Checks for exit_editinggfimage.png regularly throughout every workflow stage
     - Requires imagerenderingprogress.png and positions the cursor 50px left and 50px below it before preparing a download
     - Restores the image-hover cursor position before each download retry\n    - While locked, continuously checks the verified web-download confirmation modal\n    - Rechecks rendering while waiting for moregf and returns to render-wait if it reappears\n    - Blocks Windows mouse-wheel scrolling while the image-position lock is active
-    - On a fresh function execution only, checks and clicks exactly nanobanana_16ratio9.png
-      once after the Google Flow prompt workspace is ready
-    - Does not search for or click any other Nano Banana ratio image
-    - Automatic and Ctrl+Shift+F12 workflow restarts never repeat Nano Banana activation
+    - On the first confirmed Google Flow prompt workspace, runs Nano Banana setup
+      BEFORE project-folder validation or any scene-entry processing
+    - Follows the Serenum sequence: click nanobananaconfig.png first, then
+      click only nanobanana_16ratio9.png
+    - Uses a function-lifetime one-shot guard consumed before the setup begins
+    - Automatic and Ctrl+Shift+F12 workflow restarts can never repeat Nano Banana setup
+    - If the one-time setup fails or is interrupted, scene generation is stopped
+      rather than continuing with an unconfirmed aspect ratio
     """
     import os
     import json
@@ -3166,6 +3170,10 @@ def sceneiq_google_flow_images_generation_engine():
 
     class _ManualStop(BaseException):
         """Raised only when the user presses Alt+/ ."""
+        pass
+
+    class _NanoBananaStartupFailure(BaseException):
+        """Stop safely when the one-time Nano Banana startup setup cannot finish."""
         pass
 
     def set_image_scroll_lock(enabled):
@@ -4257,48 +4265,89 @@ def sceneiq_google_flow_images_generation_engine():
         location, _ = find_image_with_fallback(image_name, confidence, region)
         return location
 
-    def click_startup_nanobanana_16ratio9(hwnd):
-        """Click only the exact 16:9 Nano Banana reference image, once when requested."""
-        image_name = "nanobanana_16ratio9.png"
-        image_path = os.path.join(GUI_IMAGES, image_name)
+    def configure_startup_nanobanana_16ratio9(hwnd):
+        """
+        Follow the same two-step Nano Banana setup used by Serenum:
+        1. Open Nano Banana settings with nanobananaconfig.png.
+        2. Select only nanobanana_16ratio9.png.
+        3. Confirm the prompt input is reachable before continuing.
 
-        # Do not use find_image_with_fallback here: it scans numbered variants.
-        # This startup action is deliberately restricted to this exact file.
-        if not os.path.isfile(image_path):
-            print(
-                f"⚠️ [NANO-BANANA] Exact reference image is missing: {image_path}. "
-                "No other ratio image will be searched or clicked."
-            )
-            return False
-
+        This helper must be called only once during the lifetime of this
+        SceneIQ function execution.
+        """
         check_for_termination()
         enforce_window_focus(hwnd)
-        try:
-            location = pyautogui.locateCenterOnScreen(
-                image_path,
-                confidence=0.8,
-                grayscale=False
-            )
-        except Exception as image_error:
-            print(
-                f"⚠️ [NANO-BANANA] Could not inspect {image_name}: {image_error}. "
-                "No other ratio image will be searched or clicked."
-            )
-            return False
 
-        if location is None:
-            print(
-                f"ℹ️ [NANO-BANANA] {image_name} is not visible on the current screen. "
-                "The one-time startup check is complete; no other ratio image will be checked."
-            )
-            return False
-
-        pyautogui.click(int(location.x), int(location.y))
-        print(
-            f"✅ [NANO-BANANA] Clicked {image_name} once at "
-            f"({location.x}, {location.y}). No other ratio image was searched or clicked."
+        print("\n⚙️ [NANO-BANANA] Opening Nano Banana configuration first...")
+        update_operation_status(
+            "Opening Nano Banana configuration before selecting the 16:9 aspect ratio"
         )
-        _sleep(0.8)
+
+        # STEP 1: Click the Nano Banana configuration control, exactly as Serenum does.
+        config_location = wait_for_image(
+            "nanobananaconfig.png",
+            timeout_seconds=STAGE_TIMEOUT_SECONDS,
+            confidence=0.8,
+        )
+        if not config_location:
+            message = (
+                "nanobananaconfig.png was not found; Nano Banana setup cannot "
+                "continue and no scene images will be generated."
+            )
+            print(f"❌ [NANO-BANANA] {message}")
+            raise _NanoBananaStartupFailure(message)
+
+        if not _click_google_flow_control(
+            hwnd, config_location, "nanobananaconfig.png"
+        ):
+            message = "Could not click nanobananaconfig.png; no scene images will be generated."
+            print(f"❌ [NANO-BANANA] {message}")
+            raise _NanoBananaStartupFailure(message)
+
+        print(
+            "✅ [NANO-BANANA] Configuration opened. "
+            "Now searching exclusively for nanobanana_16ratio9.png."
+        )
+
+        # STEP 2: Select only the requested 16:9 ratio. Do not search for 9:16,
+        # 3:4, 1:1, or any other Nano Banana ratio asset.
+        ratio_location = wait_for_image(
+            "nanobanana_16ratio9.png",
+            timeout_seconds=STAGE_TIMEOUT_SECONDS,
+            confidence=0.8,
+        )
+        if not ratio_location:
+            message = (
+                "nanobanana_16ratio9.png was not visible after opening Nano Banana "
+                "configuration; no scene images will be generated."
+            )
+            print(f"❌ [NANO-BANANA] {message}")
+            raise _NanoBananaStartupFailure(message)
+
+        if not _click_google_flow_control(
+            hwnd, ratio_location, "nanobanana_16ratio9.png"
+        ):
+            message = "Could not select nanobanana_16ratio9.png; no scene images will be generated."
+            print(f"❌ [NANO-BANANA] {message}")
+            raise _NanoBananaStartupFailure(message)
+
+        # Match Serenum's post-selection check: verify the prompt field can be
+        # reached only after both Nano Banana controls have been clicked.
+        prompt_location = find_whatdoyouwantocreate_with_fallbacks(
+            hwnd, timeout_seconds=STAGE_TIMEOUT_SECONDS
+        )
+        if not prompt_location:
+            message = (
+                "Prompt input did not become available after selecting Nano Banana 16:9; "
+                "no scene images will be generated."
+            )
+            print(f"❌ [NANO-BANANA] {message}")
+            raise _NanoBananaStartupFailure(message)
+
+        print(
+            "✅ [NANO-BANANA] Startup setup completed in the correct order: "
+            "nanobananaconfig.png → nanobanana_16ratio9.png."
+        )
         return True
 
     def move_mouse_to_center_of_screen():
@@ -6235,7 +6284,14 @@ def sceneiq_google_flow_images_generation_engine():
             force_png=True
         )
 
-    def main_google_flow_workflow(force_url_restart=False, activate_startup_nanobanana=False):
+    # This guard belongs to the lifetime of this function execution, not to an
+    # individual workflow attempt. It is consumed BEFORE the two-step setup
+    # starts, so no shortcut or automatic restart can run it a second time.
+    # A failed/interrupted setup is fatal for this function run: do not generate
+    # scene images with an aspect ratio that was not successfully confirmed.
+    startup_nanobanana_state = {"attempted": False, "completed": False}
+
+    def main_google_flow_workflow(force_url_restart=False):
         try:
             if not os.path.exists(GUI_IMAGES):
                 print(f"❌ Error: GUI_IMAGES path not found: {GUI_IMAGES}")
@@ -6257,54 +6313,6 @@ def sceneiq_google_flow_images_generation_engine():
                 hud.print(f"Preparing to generate {total_entries} images...", "initializing")
             except Exception:
                 pass
-
-            valid, missing_entries = validate_entry_order(images_folder, total_entries)
-            if not valid:
-                print("❌ [MAIN] Project image-folder validation failed")
-                return
-
-            # The thumbnail prompt is a project-level field in the JSON, outside
-            # the timed script entries. It is only submitted after every entry_N
-            # image has been verified.
-            latest_panel = _load_panel()
-            thumbnail_value = _find_field(latest_panel, ("Thumbnail",))
-            thumbnail_prompt = (
-                thumbnail_value.strip()
-                if isinstance(thumbnail_value, str)
-                else ""
-            )
-            thumbnail_already_exists = _thumbnail_exists(images_folder)
-            print(f"📊 [MAIN] Missing scene entries: {missing_entries}")
-            print(
-                f"🖼️ [MAIN] Thumbnail status: "
-                f"{'already generated' if thumbnail_already_exists else 'not generated yet'}"
-            )
-
-            if not missing_entries and thumbnail_already_exists:
-                print(
-                    f"✅ [MAIN] All {total_entries} scene images and Thumbnail.png "
-                    "already exist. Verifying project transfer."
-                )
-                transferred = _transfer_completed_project_to_ready_script(
-                    images_folder, total_entries
-                )
-                if transferred:
-                    _set_currently_running(
-                        "sceneiq_google_flow_images_generation_engine_successful",
-                        status="completed",
-                        operation_status=(
-                            f"✅ All {total_entries} scene images and Thumbnail.png "
-                            "verified and transferred to ready_script.json"
-                        )
-                    )
-                    print("🏁 [GF] Completed project appended to ready_script.json")
-                return
-
-            work_items = len(missing_entries) + (0 if thumbnail_already_exists else 1)
-            print(
-                f"📊 [MAIN] Work remaining: {len(missing_entries)} missing scene image(s), "
-                f"{0 if thumbnail_already_exists else 1} thumbnail."
-            )
 
             hwnd = ensure_window_ready_and_focused()
             print(f"🪟 [MAIN] Browser ready (HWND: {hwnd})")
@@ -6426,20 +6434,93 @@ def sceneiq_google_flow_images_generation_engine():
                 update_operation_status(error_message, is_error=True)
                 return
 
-            # Nano Banana ratio selection is allowed only for the first normal
-            # function-start attempt. The supervisor passes False on every
-            # automatic or shortcut-triggered workflow restart.
-            if activate_startup_nanobanana:
+            # This is the first operation after Google Flow's prompt workspace
+            # is positively confirmed as loaded. It happens BEFORE project-folder
+            # validation and BEFORE any prompt-entry processing.
+            if not startup_nanobanana_state["attempted"]:
+                # Consume the lifetime one-shot guard BEFORE opening settings.
+                # No restart can ever repeat either of the two Nano Banana clicks.
+                startup_nanobanana_state["attempted"] = True
                 print(
-                    "🟦 [NANO-BANANA] Fresh function execution detected. "
-                    "Checking only nanobanana_16ratio9.png once."
+                    "🟦 [NANO-BANANA] Google Flow page is confirmed loaded. "
+                    "Running the Serenum two-step setup BEFORE project validation: "
+                    "nanobananaconfig.png first, then nanobanana_16ratio9.png."
                 )
-                click_startup_nanobanana_16ratio9(hwnd)
+                try:
+                    configure_startup_nanobanana_16ratio9(hwnd)
+                    startup_nanobanana_state["completed"] = True
+                except _WorkflowRestart:
+                    # If a shortcut interrupts the two-step process, the guard
+                    # remains consumed. The next attempt will stop instead of
+                    # repeating the setup or generating at an unconfirmed ratio.
+                    raise
+                print(
+                    "✅ [NANO-BANANA] Both startup clicks completed. "
+                    "This setup is now consumed for the lifetime of this function run."
+                )
+            elif not startup_nanobanana_state["completed"]:
+                message = (
+                    "The one-time Nano Banana setup was interrupted or failed. "
+                    "It will not be repeated during a restart, and scene generation "
+                    "is blocked until the function is started again."
+                )
+                print(f"🛑 [NANO-BANANA] {message}")
+                raise _NanoBananaStartupFailure(message)
             else:
                 print(
-                    "⏭️ [NANO-BANANA] Startup activation is disabled for this attempt "
-                    "(workflow restart or not the initial function execution)."
+                    "⏭️ [NANO-BANANA] Startup setup already completed. "
+                    "Skipping Nano Banana on this restart; no ratio image will be checked."
                 )
+
+            # Project-folder validation and scene-entry inspection deliberately
+            # happen only AFTER the one-time Nano Banana startup action above.
+            valid, missing_entries = validate_entry_order(images_folder, total_entries)
+            if not valid:
+                print("❌ [MAIN] Project image-folder validation failed")
+                return
+
+            # The thumbnail prompt is a project-level field in the JSON, outside
+            # the timed script entries. It is only submitted after every entry_N
+            # image has been verified.
+            latest_panel = _load_panel()
+            thumbnail_value = _find_field(latest_panel, ("Thumbnail",))
+            thumbnail_prompt = (
+                thumbnail_value.strip()
+                if isinstance(thumbnail_value, str)
+                else ""
+            )
+            thumbnail_already_exists = _thumbnail_exists(images_folder)
+            print(f"📊 [MAIN] Missing scene entries: {missing_entries}")
+            print(
+                f"🖼️ [MAIN] Thumbnail status: "
+                f"{'already generated' if thumbnail_already_exists else 'not generated yet'}"
+            )
+
+            if not missing_entries and thumbnail_already_exists:
+                print(
+                    f"✅ [MAIN] All {total_entries} scene images and Thumbnail.png "
+                    "already exist. Verifying project transfer."
+                )
+                transferred = _transfer_completed_project_to_ready_script(
+                    images_folder, total_entries
+                )
+                if transferred:
+                    _set_currently_running(
+                        "sceneiq_google_flow_images_generation_engine_successful",
+                        status="completed",
+                        operation_status=(
+                            f"✅ All {total_entries} scene images and Thumbnail.png "
+                            "verified and transferred to ready_script.json"
+                        )
+                    )
+                    print("🏁 [GF] Completed project appended to ready_script.json")
+                return
+
+            work_items = len(missing_entries) + (0 if thumbnail_already_exists else 1)
+            print(
+                f"📊 [MAIN] Work remaining: {len(missing_entries)} missing scene image(s), "
+                f"{0 if thumbnail_already_exists else 1} thumbnail."
+            )
 
             print(
                 "✅ [MAIN] Google Flow prompt workspace is ready; "
@@ -6737,26 +6818,22 @@ def sceneiq_google_flow_images_generation_engine():
                 force_this_attempt = force_url_restart_pending
                 force_url_restart_pending = False
 
-                # Attempt 1 is the only attempt that may activate Nano Banana,
-                # and a shortcut-requested URL restart is explicitly excluded.
-                activate_startup_nanobanana = (
-                    restart_number == 1 and not force_this_attempt
-                )
-                if activate_startup_nanobanana:
+                # The function-lifetime guard decides whether Nano Banana may
+                # run. A restart before the first confirmed workspace can still
+                # reach the one permitted startup setup; after it starts, no
+                # automatic or shortcut restart can repeat either click.
+                if startup_nanobanana_state["attempted"]:
                     print(
-                        "🟦 [NANO-BANANA] One-time startup activation enabled for "
-                        "the initial function execution only."
+                        "⏭️ [NANO-BANANA] Startup setup already consumed; "
+                        "this workflow restart must not activate Nano Banana again."
                     )
                 else:
                     print(
-                        "⏭️ [NANO-BANANA] Ratio activation skipped: this is not "
-                        "the initial uninterrupted function-start attempt."
+                        "🟦 [NANO-BANANA] One-time startup setup is pending: "
+                        "configuration control first, 16:9 ratio second."
                     )
 
-                main_google_flow_workflow(
-                    force_url_restart=force_this_attempt,
-                    activate_startup_nanobanana=activate_startup_nanobanana
-                )
+                main_google_flow_workflow(force_url_restart=force_this_attempt)
             except _WorkflowRestart as restart_reason:
                 print(f"🔁 [SUPERVISOR] Restarting from the beginning: {restart_reason}")
                 if getattr(restart_reason, "force_url", False):
@@ -6770,6 +6847,14 @@ def sceneiq_google_flow_images_generation_engine():
                 )
             except _ManualStop as stop_reason:
                 print(f"🛑 [SUPERVISOR] {stop_reason}")
+                stop_event.set()
+                terminate_automation = True
+            except _NanoBananaStartupFailure as startup_error:
+                print(f"🛑 [SUPERVISOR] Nano Banana startup setup failed: {startup_error}")
+                update_operation_status(
+                    f"Nano Banana startup setup failed; scene generation stopped: {startup_error}",
+                    is_error=True
+                )
                 stop_event.set()
                 terminate_automation = True
             except Exception as unexpected_error:
