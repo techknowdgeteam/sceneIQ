@@ -344,6 +344,12 @@ def _sceneiq_on_restart_hotkey():
 def _sceneiq_on_stop_hotkey():
     _SCENEIQ_HOTKEY_STOP_EVENT.set()
     _SCENEIQ_SHUTDOWN_EVENT.set()
+    # This marker is consumed by the parent SceneIQ window and is emitted only
+    # by the image worker's Alt+/ shortcut. Command-button stops do not focus it.
+    try:
+        print("SCENEIQ_IMAGE_ALT_SLASH_FOCUS_REQUEST", flush=True)
+    except Exception:
+        pass
     hud.print("🛑 [HOTKEY] Alt+/ received — stopping Image Producer only.", "warning")
 
 

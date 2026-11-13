@@ -7595,6 +7595,50 @@ class _SceneIQTextStream:
         return True
 
 
+def _sceneiq_apply_dark_titlebar(window, background="#07111F", foreground="#EAF5FF"):
+    """Match the native Windows title bar to SCiQ's dark window surface."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        window.update_idletasks()
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        hwnd = wintypes.HWND(window.winfo_id())
+        try:
+            top = user32.GetAncestor(hwnd, 2)
+            if top:
+                hwnd = top
+        except Exception:
+            pass
+        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+        set_attribute = dwmapi.DwmSetWindowAttribute
+        set_attribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        set_attribute.restype = ctypes.c_long
+        enabled = ctypes.c_int(1)
+        dark_enabled = False
+        for attribute in (20, 19):
+            try:
+                if set_attribute(hwnd, attribute, ctypes.byref(enabled), ctypes.sizeof(enabled)) == 0:
+                    dark_enabled = True
+                    break
+            except Exception:
+                continue
+        def colorref(value):
+            value = str(value).lstrip("#")
+            red, green, blue = (int(value[i:i+2], 16) for i in (0, 2, 4))
+            return blue << 16 | green << 8 | red
+        for attribute, value in ((35, background), (36, foreground), (34, background)):
+            try:
+                color = wintypes.DWORD(colorref(value))
+                set_attribute(hwnd, attribute, ctypes.byref(color), ctypes.sizeof(color))
+            except Exception:
+                pass
+        return dark_enabled
+    except Exception:
+        return False
+
+
 _SCENEIQ_SINGLE_INSTANCE_HANDLE = None
 
 
@@ -7706,14 +7750,21 @@ class SceneIQApp:
         self.shutdown_path = self.session["shutdown_path"]
         self.heartbeat_path = self.session["heartbeat_path"]
 
-        self.root.title("SceneIQ — Image & Video Production Control Center")
+        self.root.title("SCiQ — SceneIQ Image & Video Studio")
         self.root.configure(bg=self.BG)
+        try:
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SceneIQ.ico")
+            if os.path.isfile(icon_path):
+                self.root.iconbitmap(icon_path)
+        except Exception:
+            pass
         # Start at a more compact desktop size. The window remains resizable;
         # the user can enlarge it manually after launch.
         self.root.geometry("1080x700")
         self.root.minsize(820, 540)
         self._center_window(1080, 700)
         self._build_interface()
+        self.root.after(180, lambda: _sceneiq_apply_dark_titlebar(self.root, self.BG, self.TEXT))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<Control-Return>", lambda _event: self.start_service())
         self.root.bind("<Control-l>", lambda _event: self.show_console())
@@ -8798,6 +8849,12 @@ class SceneIQApp:
             stream = process.stdout
             if stream is not None:
                 for line in iter(stream.readline, ""):
+                    if "SCENEIQ_IMAGE_ALT_SLASH_FOCUS_REQUEST" in line:
+                        self.events.put(("image_hotkey_focus", run_id))
+                        cleaned = line.replace("SCENEIQ_IMAGE_ALT_SLASH_FOCUS_REQUEST", "").strip()
+                        if not cleaned:
+                            continue
+                        line = cleaned + "\n"
                     self.events.put(("image_log", run_id, line))
                 try:
                     stream.close()
@@ -9305,6 +9362,10 @@ class SceneIQApp:
                     _kind, run_id, line = item
                     if run_id == self.active_image_run_id:
                         self._append_image_log(line)
+                elif event_type == "image_hotkey_focus":
+                    _kind, run_id = item
+                    if run_id == self.active_image_run_id:
+                        self._focus_sceneiq_window()
                 elif event_type == "image_exit":
                     _kind, run_id, return_code = item
                     self._finish_image_worker(run_id, return_code)
@@ -10101,35 +10162,60 @@ class SceneIQApp:
             self.log(f"Could not write graceful shutdown request: {exc}", "WARNING")
 
     def _confirm_exit_with_custom_modal(self):
-        """Ask before shutdown without a native title bar or X button."""
+        """Show a centered, movable, borderless exit prompt with only Cancel and Exit."""
         import tkinter as tk
 
-        message = (
-            "One or both SceneIQ producers may be active. Exiting will ask active "
-            "workers to stop at their safe checkpoints. Completed video renders "
-            "and image workflow progress will be retained. Do you want to exit SceneIQ?"
-        )
+        video_active = self.process is not None and self.process.poll() is None
+        image_active = self.image_process is not None and self.image_process.poll() is None
+        if video_active and image_active:
+            message = (
+                "Video Producer and Image Producer are currently active. Exiting SCiQ "
+                "will request both isolated workers to stop safely. Completed video "
+                "renders, generated images and saved workflow progress will be retained."
+            )
+        elif video_active:
+            message = (
+                "Video production is currently active. Exiting SCiQ will request the "
+                "Video Producer to stop at its next safe checkpoint. Completed renders "
+                "and saved progress will be retained."
+            )
+        elif image_active:
+            message = (
+                "Image production is currently active. Exiting SCiQ will request the "
+                "Image Producer to stop safely. Generated images and saved workflow "
+                "progress will be retained."
+            )
+        else:
+            message = "Are you sure you want to exit SCiQ? No production workers are currently running."
+
         result = {"confirmed": False}
         window = tk.Toplevel(self.root)
         window.overrideredirect(True)
-        window.geometry("560x250")
-        window.configure(bg=self.BORDER)
+        window.configure(bg=self.BG)
         window.transient(self.root)
-        shell = tk.Frame(window, bg=self.BG, highlightthickness=1, highlightbackground=self.BORDER)
-        shell.pack(fill="both", expand=True, padx=1, pady=1)
-        header = tk.Frame(shell, bg=self.PANEL_ALT, padx=14, pady=11)
+        window.resizable(False, False)
+
+        shell = tk.Frame(
+            window, bg=self.BG, bd=0, relief="flat",
+            highlightthickness=1, highlightbackground="#15577A",
+        )
+        shell.pack(fill="both", expand=True)
+
+        header = tk.Frame(shell, bg="#0B1C31", bd=0, highlightthickness=0, padx=18, pady=13)
         header.pack(fill="x")
         tk.Label(
-            header, text="EXIT SCENEIQ?", bg=self.PANEL_ALT, fg=self.AMBER,
-            font=("Segoe UI", 11, "bold"),
-        ).pack(anchor="w")
-        body = tk.Frame(shell, bg=self.BG, padx=16, pady=16)
+            header, text="SCiQ  /  EXIT CONFIRMATION", bg="#0B1C31", fg=self.CYAN,
+            font=("Segoe UI", 11, "bold"), anchor="w",
+        ).pack(fill="x")
+
+        body = tk.Frame(shell, bg=self.BG, padx=20, pady=18)
         body.pack(fill="both", expand=True)
         tk.Label(
             body, text=message, bg=self.BG, fg=self.TEXT,
-            font=("Segoe UI", 9), justify="left", anchor="w", wraplength=510,
+            font=("Segoe UI", 9), justify="left", anchor="w", wraplength=500,
         ).pack(fill="both", expand=True)
-        footer = tk.Frame(shell, bg=self.BG, padx=12, pady=10)
+
+        footer = tk.Frame(shell, bg=self.BG, padx=18, pady=14)
         footer.pack(fill="x")
 
         def finish(confirmed=False):
@@ -10143,36 +10229,46 @@ class SceneIQApp:
             except Exception:
                 pass
 
+        # Exactly two actions: Cancel at the left edge, Exit at the right edge.
         tk.Button(
-            footer, text="COPY DETAILS", command=lambda: self._copy_text(message),
-            bg="#172E49", fg=self.CYAN, activebackground="#214767",
-            relief="flat", bd=0, padx=13, pady=8,
-            font=("Segoe UI", 8, "bold"), cursor="hand2",
+            footer, text="CANCEL", command=lambda: finish(False),
+            bg="#172A40", fg=self.TEXT, activebackground="#24425F",
+            activeforeground=self.TEXT, relief="flat", bd=0,
+            padx=25, pady=10, font=("Segoe UI", 9, "bold"), cursor="hand2",
         ).pack(side="left")
         tk.Button(
-            footer, text="CLOSE / KEEP OPEN", command=lambda: finish(False),
-            bg="#202C3E", fg=self.TEXT, activebackground="#2B3B52",
-            relief="flat", bd=0, padx=12, pady=8,
-            font=("Segoe UI", 8, "bold"), cursor="hand2",
-        ).pack(side="right", padx=(6, 0))
-        tk.Button(
-            footer, text="EXIT SCENEIQ", command=lambda: finish(True),
-            bg="#542A32", fg="#FFE4E8", activebackground="#713541",
-            relief="flat", bd=0, padx=12, pady=8,
-            font=("Segoe UI", 8, "bold"), cursor="hand2",
+            footer, text="EXIT SCiQ", command=lambda: finish(True),
+            bg="#542A39", fg="#FFE8ED", activebackground="#74384C",
+            activeforeground="#FFFFFF", relief="flat", bd=0,
+            padx=25, pady=10, font=("Segoe UI", 9, "bold"), cursor="hand2",
         ).pack(side="right")
+
+        # The title strip is the drag handle, keeping this borderless modal portable.
+        drag_state = {"x": 0, "y": 0, "left": 0, "top": 0}
+        def drag_start(event):
+            drag_state["x"] = int(event.x_root)
+            drag_state["y"] = int(event.y_root)
+            drag_state["left"] = int(window.winfo_x())
+            drag_state["top"] = int(window.winfo_y())
+        def drag_move(event):
+            dx = int(event.x_root) - drag_state["x"]
+            dy = int(event.y_root) - drag_state["y"]
+            window.geometry(f"+{drag_state['left'] + dx}+{drag_state['top'] + dy}")
+        header.bind("<ButtonPress-1>", drag_start)
+        header.bind("<B1-Motion>", drag_move)
+
         window.bind("<Escape>", lambda _event: finish(False))
+        window.bind("<Return>", lambda _event: finish(True))
+        window.update_idletasks()
+        width = max(540, int(window.winfo_reqwidth()))
+        height = max(220, int(window.winfo_reqheight()))
+        # Center against the physical screen, not the parent window's coordinates.
+        screen_width = int(window.winfo_screenwidth())
+        screen_height = int(window.winfo_screenheight())
+        x = max(0, (screen_width - width) // 2)
+        y = max(0, (screen_height - height) // 2)
+        window.geometry(f"{width}x{height}+{x}+{y}")
         try:
-            window.update_idletasks()
-            parent_x = self.root.winfo_rootx()
-            parent_y = self.root.winfo_rooty()
-            parent_w = max(1, self.root.winfo_width())
-            parent_h = max(1, self.root.winfo_height())
-            width = 560
-            height = max(250, window.winfo_reqheight())
-            x = parent_x + max(0, (parent_w - width) // 2)
-            y = parent_y + max(0, (parent_h - height) // 2)
-            window.geometry(f"{width}x{height}+{x}+{y}")
             window.grab_set()
             window.lift()
             window.focus_force()
@@ -10185,26 +10281,12 @@ class SceneIQApp:
         if self._closing or self._closing_requested:
             return
 
+        # SCiQ always uses the same centered custom confirmation dialog.
+        if not self._confirm_exit_with_custom_modal():
+            return
+
         video_active = self.process is not None and self.process.poll() is None
         image_active = self.image_process is not None and self.image_process.poll() is None
-
-        if video_active:
-            answer = self._confirm_exit_with_custom_modal()
-            if not answer:
-                return
-        elif image_active:
-            try:
-                from tkinter import messagebox
-                answer = messagebox.askyesno(
-                    "Exit SceneIQ",
-                    "Image production is active. Exit SceneIQ and stop the Image Producer safely?",
-                    parent=self.root,
-                )
-            except Exception:
-                answer = True
-            if not answer:
-                return
-
         if not video_active and not image_active:
             self._close_application()
             return
@@ -10217,10 +10299,10 @@ class SceneIQApp:
             self._write_shutdown_request()
             self.set_status("STOPPING VIDEO AND IMAGE PRODUCERS", self.AMBER)
             self._set_visual_state(
-                "stopped", "SCENEIQ IS STOPPING SAFELY",
-                "SceneIQ is asking both isolated producers to stop. Completed video renders and image workflow progress are retained.",
+                "stopped", "SCiQ IS STOPPING SAFELY",
+                "SCiQ is asking both isolated producers to stop at safe checkpoints. Completed video renders and image workflow progress are retained.",
                 self.AMBER,
-                detail="The shared window will close after both worker processes exit.",
+                detail="The shared window will close after both producer processes exit.",
             )
 
         if image_active:
@@ -10230,6 +10312,37 @@ class SceneIQApp:
             self.root.after(350, self._poll_close)
         except Exception:
             self._poll_close()
+
+    def _focus_sceneiq_window(self):
+        """Return foreground focus to SCiQ after the Image Producer Alt+/ shortcut only."""
+        if self._closing or self._closing_requested:
+            return
+        try:
+            if not self.root.winfo_exists():
+                return
+            self.root.deiconify()
+            try:
+                if str(self.root.state()).casefold() == "iconic":
+                    self.root.state("normal")
+            except Exception:
+                pass
+            # Brief topmost promotion asks Windows to put the shared control center
+            # above Google Flow and the image-only progress HUD.
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+            self.root.focus_force()
+            self.root.after(900, self._release_sceneiq_focus_topmost)
+        except Exception:
+            pass
+
+    def _release_sceneiq_focus_topmost(self):
+        if self._closing:
+            return
+        try:
+            if self.root.winfo_exists():
+                self.root.attributes("-topmost", False)
+        except Exception:
+            pass
 
     def _poll_close(self):
         import time
