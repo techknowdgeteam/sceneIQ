@@ -1,3 +1,8 @@
+"""SceneIQ standalone video producer.
+sceneiqvideoproducer.py
+This module runs video rendering only. Google Flow image generation lives in
+sceniqimageproduction.py and is not imported or started here.
+"""
 import pyautogui
 from PIL import Image
 import os
@@ -5,18 +10,12 @@ import glob
 from datetime import datetime
 import subprocess
 import json
-import win32gui
-import win32con
-import win32process
-import win32api
-import win32process
 import psutil
 import time
 import re
 import difflib
 import pyperclip
 import keyboard 
-import tkinter as tk
 import threading
 import zipfile
 import csv
@@ -71,127 +70,6 @@ PANEL_PATH = r"C:\xampp\htdocs\AI automation\scenIQ\panel.json"
 READY_SCRIPT = r"C:\xampp\htdocs\AI automation\scenIQ\ready_script.json"
 GUI_REGION_SAVER = r"C:\xampp\htdocs\AI automation\scenIQ\gui.json"
 SUBSCRIBE_STICKERS = r"C:\xampp\htdocs\AI automation\scenIQ\subscribe"
-
-class AutomationHUD:
-    def __init__(self):
-        self.root = None
-        self.label_status = None
-        self.visible = True
-        self.current_text = "Initializing..."
-        self.status_history = []
-        self.current_status_type = "initializing"
-        self.thread = threading.Thread(target=self._run_hud, daemon=True)
-        self.thread.start()
-
-    def _run_hud(self):
-        self.root = tk.Tk()
-        self.root.title("Automation HUD")
-        
-        # Frameless, always on top, transparent background
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-transparentcolor", "black")
-        self.root.config(bg="black")
-        
-        # Make window larger to display full text
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        w, h = 600, 120  # Increased height for text visibility
-        x = (sw // 2) - (w // 2)
-        y = (sh // 2) - (h // 2) - 100
-        self.root.geometry(f"{w}x{h}+{x}+{y}")
-        
-        # Main container with black background
-        container = tk.Frame(self.root, bg="black")
-        container.pack(fill="both", expand=True, padx=20, pady=20)
-        
-        # Status message with large, bold font centered
-        self.label_status = tk.Label(container, text="🚀 Initializing...", 
-                                   font=("Segoe UI", 10, "bold"), 
-                                   fg="#00FFCC", bg="black",
-                                   wraplength=560, justify="center")
-        self.label_status.pack(expand=True, fill="both")
-        
-        # Apply Windows styling hooks for click-through
-        try:
-            hwnd = win32gui.GetParent(self.root.winfo_id())
-            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, 
-                                 ex_style | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT)
-        except:
-            pass  # Fallback if Windows API fails
-        
-        self.root.mainloop()
-
-    def print(self, text, status_type="processing"):
-        """Update status text"""
-        self.current_text = text
-        self.current_status_type = status_type
-        
-        # Store history
-        self.status_history.append((time.time(), text))
-        if len(self.status_history) > 20:
-            self.status_history.pop(0)
-        
-        # Update UI in thread-safe manner
-        if self.root and self.label_status:
-            # Color mapping for different status types
-            color_map = {
-                "searching": "#00CCFF",
-                "scanning": "#00FF88",
-                "processing": "#00FFCC",
-                "success": "#00FF88",
-                "warning": "#FFAA00",
-                "waiting": "#8888FF",
-                "clicking": "#FF66CC",
-                "typing": "#66CCFF",
-                "navigating": "#FF8844",
-                "error": "#FF4466",
-                "initializing": "#00FFCC",
-                "booting": "#00CCFF",
-                "connecting": "#66CCFF",
-                "loading": "#00FF88",
-                "verifying": "#00FFCC",
-                "complete": "#FF66CC"
-            }
-            color = color_map.get(status_type, "white")
-            self.root.after(0, lambda: self.label_status.config(text=text, fg=color))
-        
-        # Log with timestamp
-        timestamp = time.strftime("%H:%M:%S")
-        # Extract emoji from text if present
-        emoji_pattern = re.compile(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F700-\U0001F77F\U0001F780-\U0001F7FF\U0001F800-\U0001F8FF\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U0001FA70-\U0001FAFF\U00002702-\U000027B0\U000024C2-\U0001F251]+', flags=re.UNICODE)
-        emojis = emoji_pattern.findall(text)
-        icon = emojis[0] if emojis else "📊"
-        clean_text = emoji_pattern.sub('', text).strip()
-        print(f"{icon} [HUD @ {timestamp}] {clean_text}")
-
-    def hide(self):
-        """Hide the HUD (kept for compatibility but not used)"""
-        self.visible = False
-
-    def show(self):
-        """Show the HUD (kept for compatibility)"""
-        self.visible = True
-
-    def show_summary(self, final_status="✅ Operation Complete"):
-        """Display final operation summary with flash effect"""
-        if self.root:
-            self.print(final_status, "complete")
-            # Flash effect for completion
-            for _ in range(3):
-                if self.root:
-                    self.root.attributes("-alpha", 0.7)
-                    time.sleep(0.1)
-                    self.root.attributes("-alpha", 1.0)
-                    time.sleep(0.1)
-
-    def cleanup(self):
-        """Clean up resources"""
-        if self.root:
-            self.root.quit()
-            self.root.destroy()
-hud = AutomationHUD()
 
 def video_producer():
     """
@@ -262,9 +140,16 @@ def video_producer():
     else:
         print("ℹ️ [KEEP-AWAKE] Windows display/system sleep prevention is unavailable on this operating system")
 
+    # Tracks titles attempted during this one invocation only. It is deliberately
+    # in-memory: a later execution re-checks every project, including previously
+    # aborted projects whose missing assets may have been restored.
+    attempted_project_keys = set()
+
     def _run_video_producer():
         """
-        Assemble entry_N images into a narrated video using AI-directed per-entry
+        Assemble entry_N images into a narrated video using AI-directed per-entry.
+        Narration audio and a complete, readable image set (one per scene) are mandatory;
+        projects failing either check are marked aborted and skipped.
         transitions and keyframes, speech-synchronized captions, and subscribe stickers.
         - The JSON transition_to_next object controls each scene boundary.
         - The JSON keyframes object controls each scene's camera-motion sequence.
@@ -424,6 +309,76 @@ def video_producer():
         if not unique_projects:
             print("❌ READY_SCRIPT contains no discoverable project title with a valid script.")
             return None
+
+        # The current validation result is authoritative on every execution.
+        # Existing aborted markers are historical information only; they never
+        # block a fresh attempt after assets may have been restored.
+        VIDEO_VALIDATION_BLOCK_MARKER = "VIDEO_PRODUCER_VALIDATION_FAILED"
+
+        def _set_root_field(record, field_name, value):
+            wanted = _normalise_key(field_name)
+            for existing_key in list(record.keys()):
+                if _normalise_key(existing_key) == wanted:
+                    record[existing_key] = value
+                    return
+            record[field_name] = value
+
+        def _save_ready_data_atomic():
+            ready_directory = os.path.dirname(READY_SCRIPT)
+            if ready_directory:
+                os.makedirs(ready_directory, exist_ok=True)
+            temporary_path = READY_SCRIPT + f".validation_{os.getpid()}.tmp"
+            try:
+                with open(temporary_path, "w", encoding="utf-8") as temporary_file:
+                    json.dump(ready_data, temporary_file, indent=4, ensure_ascii=False)
+                    temporary_file.flush()
+                    os.fsync(temporary_file.fileno())
+                os.replace(temporary_path, READY_SCRIPT)
+                return True
+            except Exception as save_exc:
+                try:
+                    if os.path.exists(temporary_path):
+                        os.remove(temporary_path)
+                except OSError:
+                    pass
+                print(f"❌ [READY-SCRIPT] Could not persist validation status: {save_exc}")
+                return False
+
+        def _mark_record_aborted(record, title, reason):
+            reason_text = (
+                f"{VIDEO_VALIDATION_BLOCK_MARKER} | {reason} "
+                "Video production was skipped; no output was rendered."
+            )
+            _set_root_field(record, "status", "aborted")
+            _set_root_field(record, "operation_status", reason_text)
+            if _save_ready_data_atomic():
+                print(f"🛑 [READY-SCRIPT] Marked '{title}' as aborted: {reason_text}")
+                return True
+            return False
+
+        def _mark_record_operating(record, title):
+            """Clear any old validation failure and mark a newly valid project operating."""
+            operation_text = (
+                "video_production_started: Required narration audio and all expected "
+                "scene images have been verified; video production is in progress."
+            )
+            _set_root_field(record, "status", "operating")
+            _set_root_field(record, "operation_status", operation_text)
+            if _save_ready_data_atomic():
+                print(f"🚀 [READY-SCRIPT] '{title}' status updated to operating.")
+                return True
+            return False
+
+        def _mark_record_completed(record, title, video_path):
+            """Record successful output only after a non-empty video file exists."""
+            operation_text = f"video_production_completed: Video successfully rendered to '{video_path}'."
+            _set_root_field(record, "status", "completed")
+            _set_root_field(record, "operation_status", operation_text)
+            if _save_ready_data_atomic():
+                print(f"✅ [READY-SCRIPT] '{title}' status updated to completed.")
+                return True
+            return False
+
         def _has_entry_images(folder):
             if not folder or not os.path.isdir(folder):
                 return False
@@ -536,6 +491,15 @@ def video_producer():
         project_folder = None
         source_folder = None
         for candidate, candidate_title, candidate_script_data in unique_projects:
+            candidate_key = normalize_project_title(candidate_title).casefold()
+            if candidate_key in attempted_project_keys:
+                print(
+                    f"⏭️ [READY-SCRIPT] '{candidate_title}' was already checked during this "
+                    "execution. It will be checked again on the next execution."
+                )
+                continue
+            # Never use status or an old operation_status validation marker as a
+            # queue filter. Every project is re-evaluated on each new execution.
             candidate_folder = _resolve_project_folder(candidate_title)
             normalized_candidate_title = normalize_project_title(candidate_title)
             candidate_edited_folder = os.path.join(candidate_folder, "edited")
@@ -587,11 +551,14 @@ def video_producer():
                 None
             )
             if not found_image_folder:
-                print(
-                    f"⚠️ [READY-SCRIPT] No entry images found for '{candidate_title}'. "
-                    f"Checked project folder: {candidate_folder}"
+                # Keep the candidate in the queue even when no image exists. The
+                # validation gate below must mark it aborted rather than silently
+                # ignoring it or allowing a partial video to be rendered.
+                found_image_folder = next(
+                    (folder for folder in candidate_image_folders if os.path.isdir(folder)),
+                    candidate_image_folders[0],
                 )
-                continue
+            attempted_project_keys.add(candidate_key)
             panel_data = candidate
             project_title = candidate_title
             selected_script_data = candidate_script_data
@@ -603,10 +570,22 @@ def video_producer():
             break
         if panel_data is None or not project_title:
             print(
-                "✅ [READY-SCRIPT] No unfinished projects remain "
-                "(or no eligible project has images and script data)."
+                "✅ [READY-SCRIPT] No more projects remain to check in this execution. "
+                "All projects, including previously aborted projects, will be re-evaluated "
+                "the next time the producer is started."
             )
             return None
+
+        def _abort_current_project(reason):
+            """Persist a validation failure, then continue to the next queue item."""
+            saved = _mark_record_aborted(panel_data, project_title, reason)
+            if not saved:
+                # Stop rather than recursively selecting the same project when
+                # the failure marker could not be persisted.
+                return None
+            print("🔎 [READY-SCRIPT] Continuing with the next eligible project...")
+            return _run_video_producer()
+
         def _setting_is_yes(value):
             return str(value if value is not None else "").strip().casefold() == "yes"
         raw_transition_setting = _find_field(
@@ -634,11 +613,15 @@ def video_producer():
         # directory. Do not rebuild project_folder from the sanitized title here:
         # Google Flow stores projects under the original title (usually spaces).
         if not project_folder or not os.path.isdir(project_folder):
-            print(f"❌ [READY-SCRIPT] Resolved project folder is unavailable: {project_folder}")
-            return None
+            return _abort_current_project(
+                f"The project image folder is unavailable: '{project_folder}'. "
+                "The required scene images could not be checked."
+            )
         if not source_folder or not _has_entry_images(source_folder):
-            print(f"❌ [READY-SCRIPT] Resolved image folder has no valid entry_N images: {source_folder}")
-            return None
+            return _abort_current_project(
+                f"No usable scene images are currently available in '{source_folder}'. "
+                "The required scene-image set is incomplete."
+            )
         try:
             verified_image_names = [
                 name for name in os.listdir(source_folder)
@@ -839,8 +822,9 @@ def video_producer():
             return result
         entries = get_entries(panel_data)
         if not entries:
-            print("❌ No scene entries found in the discovered project script (new and legacy formats were checked).")
-            return None
+            return _abort_current_project(
+                "No scene entries were found in the project script, so the required scene count is unavailable."
+            )
         def _entry_has_overlay_metadata(entry):
             if not isinstance(entry, dict):
                 return False
@@ -854,39 +838,259 @@ def video_producer():
         if has_overlay_metadata:
             print("🎯 [STAGE-OVERLAY] Dynamic Stage/Step/Level/Example metadata detected; speech-timed overlay processing is enabled")
         def get_sorted_images(folder_path):
-            items = []
-            for filename in os.listdir(folder_path):
-                match = re.match(r"entry[_-]?(\d+)", filename, re.IGNORECASE)
-                if not match or os.path.splitext(filename)[1].lower() not in {
-                    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"
-                }:
+            """Return one best readable image per scene number, in scene order.
+
+            Duplicate files for the same entry are deduplicated in memory; source
+            files are never deleted. The highest-resolution valid image is preferred,
+            followed by a lossless-format preference, file size, and modification
+            time for deterministic selection.
+            """
+            if not folder_path or not os.path.isdir(folder_path):
+                return []
+
+            supported_extensions = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tiff"}
+            extension_priority = {
+                ".png": 7,
+                ".tiff": 6,
+                ".tif": 6,
+                ".webp": 5,
+                ".bmp": 4,
+                ".jpg": 3,
+                ".jpeg": 3,
+                ".gif": 2,
+            }
+            try:
+                filenames = os.listdir(folder_path)
+            except OSError as folder_exc:
+                print(f"⚠️ [READY-SCRIPT] Cannot inspect entry-image folder '{folder_path}': {folder_exc}")
+                return []
+
+            candidates_by_number = {}
+            for filename in filenames:
+                match = re.fullmatch(
+                    r"entry[_-]?(\d+)\.(png|jpg|jpeg|gif|bmp|webp|tiff)",
+                    filename,
+                    re.IGNORECASE,
+                )
+                if not match:
                     continue
-                items.append({
-                    "number": int(match.group(1)),
+
+                image_number = int(match.group(1))
+                image_path = os.path.join(folder_path, filename)
+                try:
+                    if not os.path.isfile(image_path):
+                        continue
+                    file_size = os.path.getsize(image_path)
+                    if file_size <= 0:
+                        continue
+                    # Verify the image payload and capture resolution before rendering.
+                    with Image.open(image_path) as image_check:
+                        image_width, image_height = image_check.size
+                        image_check.verify()
+                    if image_width <= 0 or image_height <= 0:
+                        raise ValueError("Image has invalid dimensions")
+                    modified_at = os.path.getmtime(image_path)
+                except Exception as image_exc:
+                    print(f"⚠️ [READY-SCRIPT] Invalid scene image rejected: {image_path} ({image_exc})")
+                    continue
+
+                extension = os.path.splitext(filename)[1].lower()
+                candidate = {
+                    "number": image_number,
                     "filename": filename,
-                    "path": os.path.join(folder_path, filename),
-                })
-            return sorted(items, key=lambda item: item["number"])
+                    "path": image_path,
+                    "width": image_width,
+                    "height": image_height,
+                    "file_size": file_size,
+                    "modified_at": modified_at,
+                    "_selection_score": (
+                        image_width * image_height,
+                        extension_priority.get(extension, 0),
+                        file_size,
+                        modified_at,
+                        filename.casefold(),
+                    ),
+                }
+                candidates_by_number.setdefault(image_number, []).append(candidate)
+
+            selected_items = []
+            for image_number in sorted(candidates_by_number):
+                candidates = candidates_by_number[image_number]
+                # Select one image per scene. Additional copies are ignored rather
+                # than causing the entire project to fail validation.
+                selected = max(candidates, key=lambda item: item["_selection_score"])
+                selected = {
+                    key: value for key, value in selected.items()
+                    if not key.startswith("_")
+                }
+                selected_items.append(selected)
+
+                if len(candidates) > 1:
+                    ignored_names = [
+                        item["filename"] for item in candidates
+                        if item["filename"] != selected["filename"]
+                    ]
+                    print(
+                        f"♻️ [READY-SCRIPT] Deduplicated {len(candidates)} files for entry_{image_number}; "
+                        f"using '{selected['filename']}' and ignoring: {', '.join(ignored_names)}"
+                    )
+
+            return selected_items
+
         image_files = get_sorted_images(source_folder)
-        if not image_files:
-            print("❌ No usable entry images found")
-            return None
+
         def find_audio_file(title):
+            """Find narration audio using punctuation- and spacing-insensitive names.
+
+            For example, "I am audio", "i_am_audio", "i-am-audio", and
+            "iamaudio" all normalize to the same matching key: "iamaudio".
+            Matching remains a normalized substring search, allowing filenames
+            to contain additional prefixes or suffixes around the project title.
+            """
+            import unicodedata
+
+            def normalize_audio_match_text(value):
+                value = unicodedata.normalize("NFKD", str(value or "")).casefold()
+                # Keep letters and digits only: discard spaces, underscores,
+                # hyphens, apostrophes, brackets, emoji, and other punctuation.
+                return "".join(character for character in value if character.isalnum())
+
             downloads = os.path.join(os.path.expanduser("~"), "Downloads")
             if not os.path.isdir(downloads):
+                print(f"⚠️ [AUDIO] Downloads folder was not found: {downloads}")
                 return None
+
+            normalized_title = normalize_audio_match_text(title)
+            if not normalized_title:
+                print(
+                    f"⚠️ [AUDIO] Cannot match narration audio because the project title "
+                    f"has no letters or numbers: {title!r}"
+                )
+                return None
+
             audio_exts = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".wma")
-            matches = [
-                os.path.join(downloads, name)
-                for name in os.listdir(downloads)
-                if name.lower().endswith(audio_exts) and title.lower() in name.lower()
-            ]
-            return max(matches, key=os.path.getmtime) if matches else None
+            try:
+                matches = []
+                for name in os.listdir(downloads):
+                    if not name.casefold().endswith(audio_exts):
+                        continue
+
+                    audio_path = os.path.join(downloads, name)
+                    if not os.path.isfile(audio_path):
+                        continue
+                    try:
+                        if os.path.getsize(audio_path) <= 0:
+                            continue
+                    except OSError:
+                        continue
+
+                    # Compare without the extension so it cannot affect the match.
+                    audio_name_without_extension = os.path.splitext(name)[0]
+                    normalized_audio_name = normalize_audio_match_text(
+                        audio_name_without_extension
+                    )
+                    if normalized_title in normalized_audio_name:
+                        matches.append(audio_path)
+                        print(
+                            f"🔎 [AUDIO] Normalized filename match: '{name}' "
+                            f"(project key: '{normalized_title}')"
+                        )
+            except OSError as audio_folder_exc:
+                print(f"⚠️ [AUDIO] Could not inspect Downloads folder: {audio_folder_exc}")
+                return None
+
+            if not matches:
+                print(
+                    f"⚠️ [AUDIO] No narration filename matched project '{title}' "
+                    f"after removing spaces and special characters "
+                    f"(normalized key: '{normalized_title}')."
+                )
+                return None
+
+            # Preserve the existing preference for the newest matching audio file.
+            return max(matches, key=os.path.getmtime)
+
+        # Mandatory validation gate: every scene requires one readable image and
+        # every project requires usable narration audio. Duplicate image copies are
+        # collapsed to one best image per entry before count/sequence validation.
+        # No partial or silent video is permitted.
+        validation_reasons = []
+        expected_scene_count = len(entries)
+        actual_image_count = len(image_files)
+        image_numbers = [item["number"] for item in image_files]
+
+        if actual_image_count != expected_scene_count:
+            validation_reasons.append(
+                f"Scene-image count mismatch: expected {expected_scene_count} readable entry images "
+                f"for {expected_scene_count} scene entries, but found {actual_image_count} in '{source_folder}'."
+            )
+        expected_image_numbers = list(range(1, expected_scene_count + 1))
+        if sorted(image_numbers) != expected_image_numbers:
+            missing_numbers = sorted(set(expected_image_numbers) - set(image_numbers))
+            unexpected_numbers = sorted(set(image_numbers) - set(expected_image_numbers))
+            numbering_details = []
+            if missing_numbers:
+                numbering_details.append(
+                    "missing " + ", ".join(f"entry_{number}" for number in missing_numbers)
+                )
+            if unexpected_numbers:
+                numbering_details.append(
+                    "unexpected " + ", ".join(f"entry_{number}" for number in unexpected_numbers)
+                )
+            validation_reasons.append(
+                "Scene-image sequence is incomplete; expected one-based numbering "
+                f"entry_1 through entry_{expected_scene_count}"
+                + (" (" + "; ".join(numbering_details) + ")." if numbering_details else ".")
+            )
+
         audio_file_path = find_audio_file(project_title)
-        if audio_file_path:
-            print(f"🎵 Found audio: {os.path.basename(audio_file_path)}")
+        audio_duration = None
+        if not audio_file_path:
+            validation_reasons.append(
+                "Required narration audio is missing: no matching non-empty audio file was found "
+                f"in the Downloads folder for '{project_title}'."
+            )
         else:
-            print("⚠️ No matching audio found; video will be silent")
+            audio_probe = None
+            try:
+                audio_probe = AudioFileClip(audio_file_path)
+                audio_duration = float(audio_probe.duration or 0.0)
+                if not math.isfinite(audio_duration) or audio_duration <= 0:
+                    raise ValueError("The narration audio has no valid duration.")
+                print(
+                    f"🎵 [AUDIO] Required narration audio verified: "
+                    f"{os.path.basename(audio_file_path)} ({audio_duration:.2f}s)"
+                )
+            except Exception as audio_exc:
+                validation_reasons.append(
+                    "Required narration audio is unavailable or unreadable: "
+                    f"'{os.path.basename(audio_file_path)}' could not be validated ({audio_exc})."
+                )
+                audio_file_path = None
+                audio_duration = None
+            finally:
+                if audio_probe is not None:
+                    try:
+                        audio_probe.close()
+                    except Exception:
+                        pass
+
+        if validation_reasons:
+            return _abort_current_project(" ".join(validation_reasons))
+
+        # This replaces any old aborted marker as soon as the current files pass
+        # validation, so a repaired project visibly returns to active processing.
+        if not _mark_record_operating(panel_data, project_title):
+            print(
+                f"❌ [READY-SCRIPT] Could not save the operating status for '{project_title}'. "
+                "Stopping this project before rendering to avoid an untracked run."
+            )
+            return None
+
+        print(
+            f"✅ [READY-SCRIPT] Mandatory asset check passed: "
+            f"{actual_image_count}/{expected_scene_count} scene images and narration audio are available."
+        )
         import sys
         caption_progress_state = {"started": False, "finished": False, "last_percent": -1}
 
@@ -2597,9 +2801,12 @@ def video_producer():
             cropped = image.crop((x, y, x + crop_width, y + crop_height))
             return cropped.resize((width, height), Image.Resampling.LANCZOS)
 
-        count = min(len(entries), len(image_files))
         if len(entries) != len(image_files):
-            print(f"⚠️ Entry/image count differs: {len(entries)} entries, {len(image_files)} images; processing {count} pairs")
+            return _abort_current_project(
+                f"Scene-image count changed after validation: expected {len(entries)} images, "
+                f"but found {len(image_files)}."
+            )
+        count = len(entries)
         prepared = []
         for index in range(count):
             entry = entries[index]
@@ -2626,24 +2833,18 @@ def video_producer():
                 print(f"🎬 [{index + 1}/{count}] {image_info['filename']} — {duration:.1f}s")
             except Exception as exc:
                 print(f"⚠️ Skipping unreadable image {image_info['path']}: {exc}")
+        if len(prepared) != len(entries):
+            return _abort_current_project(
+                f"Scene-image preparation was incomplete: expected {len(entries)} prepared images, "
+                f"but only {len(prepared)} could be loaded. No video was rendered."
+            )
         if not prepared:
-            print("❌ No images could be processed")
-            return None
-        audio_duration = None
-        audio_probe = None
-        if audio_file_path:
-            try:
-                audio_probe = AudioFileClip(audio_file_path)
-                audio_duration = float(audio_probe.duration)
-                print(f"🎵 Audio duration: {audio_duration:.2f}s")
-            except Exception as exc:
-                print(f"⚠️ Could not read audio duration: {exc}")
-            finally:
-                if audio_probe is not None:
-                    try:
-                        audio_probe.close()
-                    except Exception:
-                        pass
+            return _abort_current_project("No readable scene images could be prepared for video production.")
+        # audio_duration was verified by the mandatory pre-render validation gate.
+        if not audio_file_path or not os.path.isfile(audio_file_path) or audio_duration is None or audio_duration <= 0:
+            return _abort_current_project(
+                "Required narration audio became unavailable after validation; video production was cancelled."
+            )
         total_duration = sum(item["duration"] for item in prepared)
         if audio_duration and audio_duration > 0 and prepared:
             # Keep the final image visible through the exact end of the narration.
@@ -2873,23 +3074,29 @@ def video_producer():
                     f"spoken_heading_overlays={len(item.get('stage_overlay_events', []))}"
                 )
             final_clip = concatenate_videoclips(clips, method="chain")
-            if audio_file_path and os.path.exists(audio_file_path):
-                audio_clip = AudioFileClip(audio_file_path)
-                if audio_duration and audio_duration > total_duration:
-                    try:
-                        audio_clip = audio_clip.subclipped(0, total_duration)
-                    except AttributeError:
-                        audio_clip = audio_clip.subclip(0, total_duration)
-                elif audio_duration and audio_duration < total_duration:
-                    try:
-                        final_clip = final_clip.subclipped(0, audio_duration)
-                    except AttributeError:
-                        final_clip = final_clip.subclip(0, audio_duration)
-                    total_duration = audio_duration
-                if hasattr(final_clip, "with_audio"):
-                    final_clip = final_clip.with_audio(audio_clip)
-                else:
-                    final_clip = final_clip.set_audio(audio_clip)
+            # Fail closed: audio is mandatory. Never write a silent video.
+            if not audio_file_path or not os.path.isfile(audio_file_path) or os.path.getsize(audio_file_path) <= 0:
+                raise RuntimeError("Required narration audio is missing at render time; silent output is prohibited.")
+            audio_clip = AudioFileClip(audio_file_path)
+            if not audio_duration or audio_duration <= 0:
+                raise RuntimeError("Required narration audio has an invalid duration; video rendering is prohibited.")
+            if audio_duration > total_duration:
+                try:
+                    audio_clip = audio_clip.subclipped(0, total_duration)
+                except AttributeError:
+                    audio_clip = audio_clip.subclip(0, total_duration)
+            elif audio_duration < total_duration:
+                try:
+                    final_clip = final_clip.subclipped(0, audio_duration)
+                except AttributeError:
+                    final_clip = final_clip.subclip(0, audio_duration)
+                total_duration = audio_duration
+            if hasattr(final_clip, "with_audio"):
+                final_clip = final_clip.with_audio(audio_clip)
+            else:
+                final_clip = final_clip.set_audio(audio_clip)
+            if getattr(final_clip, "audio", None) is None:
+                raise RuntimeError("Narration audio could not be attached; silent output is prohibited.")
             # Preserve the previous project output instead of deleting it.
             # Continue numbering after the highest existing \\\\\\\\\\\\\\\<project>_old_N.mp4.
             if os.path.isfile(output_path):
@@ -2911,6 +3118,8 @@ def video_producer():
                     backup_path = os.path.join(edited_folder, backup_filename)
                 os.replace(output_path, backup_path)
                 print(f"📦 Preserved previous output as: {backup_path}")
+            if getattr(final_clip, "audio", None) is None:
+                raise RuntimeError("Final video has no narration track; refusing to render a silent video.")
             print(f"   Duration: {total_duration:.2f}s | FPS: 24 | Size: {video_width}x{video_height}")
             print("📊 Rendering progress will be shown in this console. No extra window will open.")
             render_started = time.monotonic()
@@ -2940,6 +3149,11 @@ def video_producer():
                 raise RuntimeError("FFmpeg finished without creating a valid output file")
             print(f"✅ Video saved: {output_path}")
             print(f"📊 Size: {os.path.getsize(output_path) / (1024 * 1024):.2f} MB")
+            if not _mark_record_completed(panel_data, project_title, output_path):
+                print(
+                    f"⚠️ [READY-SCRIPT] Video was rendered, but completion status could not "
+                    f"be saved for '{project_title}'. The output file is safely present."
+                )
         except Exception as exc:
             print(f"❌ Video assembly failed: {exc}")
             traceback.print_exc()
@@ -3018,9 +3232,9 @@ def video_producer():
             "subscribe_sticker_scale": 0.5,
         }
         # Continue through READY_SCRIPT in the same invocation. The next call
-        # re-scans the queue, skips this newly-created output, and selects the next
-        # unfinished project. Return the current result if no further project is
-        # eligible; otherwise return the last successful project's result.
+        # skips this newly-created output and selects another project. Validation
+        # failures are skipped only for this invocation; a later execution retries
+        # them regardless of their persisted status or operation_status text.
         # Release any cached sticker frames before the next queued project starts.
         if include_captions:
             try:

@@ -1,5 +1,4 @@
 [
-
     [
         {
             "automation": {
@@ -4457,8 +4456,8 @@
                 "status": "completed",
                 "operation_status": "Completed project 'I Risked Everything to Help My Brother. What He Did 11 Years Later Shocked Me.' with 117 verified image(s)"
             },
-            "status": "pending",
-            "operation_status": "entry_created: New Project added by admin"
+            "status": "operating",
+            "operation_status": "video_production_started: Required narration audio and all expected scene images have been verified; video production is in progress."
         }
     ]
 ]
