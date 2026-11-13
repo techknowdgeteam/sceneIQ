@@ -3063,7 +3063,7 @@ def generate_gemini_images():
 
     main_gemini_workflow()
 
-def sceneiq_google_flow_images_generation_engine_old():
+def sceneiq_google_flow_images_generation_engine():
     """
     Generates images using Google Flow via GUI automation with pyautogui image recognition.
     Features:
@@ -12578,10 +12578,6 @@ def video_producer():
     """Backward-compatible entry point; now launches parallel bulk production."""
     return video_producer_main()
 
-def main():
-    """Application entry point for parallel video production."""
-    return video_producer_main()
-
 def sceneiq_google_flow_images_generation_engine():
     """
     Generates images using Google Flow via GUI automation with pyautogui image recognition.
@@ -12615,10 +12611,21 @@ def sceneiq_google_flow_images_generation_engine():
       and opens GOOGLE_FLOW_URL only when neither is visible
     - Restart does not reuse saved scene-phase checkpoints
     - Checks for exit_editinggfimage.png regularly throughout every workflow stage
-    - Requires imagerenderingprogress.png and positions the cursor 50px left and 50px below it before preparing a download
-    - Restores the image-hover cursor position before each download retry\n    - While locked, continuously checks the verified web-download confirmation modal\n    - Rechecks rendering while waiting for moregf and returns to render-wait if it reappears\n    - Blocks Windows mouse-wheel scrolling while the image-position lock is active
-    - On every confirmed Google Flow prompt workspace, proceeds directly to Nano Banana
-      configuration without changing browser/profile zoom, BEFORE project
+    - Anchors rendering detection to a bounded screen region around the FIRST
+      imagerenderingprogress match; unrelated matches elsewhere cannot keep the
+      workflow stuck in the rendering state
+    - Requires three consecutive misses in that anchored region before declaring
+      rendering complete and handing off to download preparation
+    - Positions the cursor 50px left and 50px below the original progress match
+      before searching for moregf.png
+    - Restores the image-hover cursor position before each download retry
+    - Throttles download-confirmation modal checks while keeping the two-image
+      verification requirement
+    - Rechecks rendering only in the anchored region while waiting for moregf
+      and returns to render-wait if the indicator genuinely reappears
+    - Blocks Windows mouse-wheel scrolling while the image-position lock is active
+    - On every confirmed Google Flow prompt workspace, including every automatic,
+      shortcut, and fresh-function restart, configures Nano Banana BEFORE project
       validation or any scene-entry processing
     - Follows the Serenum sequence on every workflow attempt: click
       nanobananaconfig.png first, then click only nanobanana_16ratio9.png
@@ -12628,14 +12635,6 @@ def sceneiq_google_flow_images_generation_engine():
       Windows Downloads known-folder registry values
     - Handles temporary download files, waits for stable/valid image data, and
       verifies the saved destination before reporting success
-    - Sends scene prompts in adaptive batches of up to six
-    - Never scans for rendering indicators before the first prompt
-    - After each send and before every later send, checks whether an already-sent scene completed
-    - Stops sending immediately when a sent scene completes; downloads all already-sent scenes
-      before resuming from the first unsent entry
-    - Refreshes per-entry coordinates as Google Flow cards reflow
-    - Keeps extra ambiguous/pre-existing render markers as unowned alignment anchors, never as downloads
-    - Downloads each completed scene from its last tracked render position and verifies the file
     """
     import os
     import json
@@ -12645,7 +12644,6 @@ def sceneiq_google_flow_images_generation_engine():
     import traceback
     import threading
     import ctypes
-    import itertools
     from ctypes import wintypes
 
     try:
@@ -12682,6 +12680,11 @@ def sceneiq_google_flow_images_generation_engine():
     # rendering) and moregf.png (after rendering) may be searched.
     image_render_lock_active = False
     image_render_lock_position = None
+    RENDER_LOCK_PADDING_X = 260
+    RENDER_LOCK_PADDING_Y = 170
+    RENDER_DISAPPEAR_CONFIRM_SAMPLES = 3
+    RENDER_MODAL_CHECK_INTERVAL = 1.25
+    last_render_modal_check_at = 0.0
 
     # A Windows low-level mouse hook blocks physical wheel scrolling while the
     # image-position lock is active. It is installed only for the locked phase.
@@ -12705,10 +12708,6 @@ def sceneiq_google_flow_images_generation_engine():
 
     class _NanoBananaStartupFailure(BaseException):
         """Stop safely when this workflow attempt cannot confirm Nano Banana setup."""
-        pass
-
-    class _BatchTrackingFailure(BaseException):
-        """Stop safely when a batched UI position can no longer be mapped to an entry."""
         pass
 
     def set_image_scroll_lock(enabled):
@@ -13562,42 +13561,18 @@ def sceneiq_google_flow_images_generation_engine():
         for variant_path in variants:
             variant_name = os.path.basename(variant_path)
             try:
-                location = pyautogui.locateCenterOnScreen(variant_path, confidence=confidence, grayscale=False, region=region)
+                location = pyautogui.locateCenterOnScreen(
+                    variant_path,
+                    confidence=confidence,
+                    grayscale=False,
+                    region=region
+                )
                 if location:
                     print(f"✅ [FALLBACK] Found {variant_name} at ({location.x}, {location.y})")
                     return location, variant_path
             except Exception:
                 pass
         return None, None
-
-    def find_all_image_centers_with_fallback(image_name, confidence=0.7, region=None):
-        """Find every visible instance of a template, merging duplicate variants."""
-        variants = get_image_variants(image_name)
-        if not variants:
-            return []
-
-        matches = []
-        for variant_path in variants:
-            try:
-                for box in pyautogui.locateAllOnScreen(
-                    variant_path,
-                    confidence=confidence,
-                    grayscale=False,
-                    region=region
-                ):
-                    center = (int(box.left + box.width / 2), int(box.top + box.height / 2))
-                    duplicate = False
-                    for existing in matches:
-                        if abs(existing[0] - center[0]) <= 18 and abs(existing[1] - center[1]) <= 18:
-                            duplicate = True
-                            break
-                    if not duplicate:
-                        matches.append(center)
-            except Exception:
-                continue
-
-        matches.sort(key=lambda point: (point[1], point[0]))
-        return matches
 
     def wait_for_image_with_fallback(image_name, timeout_seconds=40, confidence=0.8, region=None):
         timeout_seconds = _bounded_timeout(timeout_seconds)
@@ -13613,7 +13588,12 @@ def sceneiq_google_flow_images_generation_engine():
             for variant_path in variants:
                 variant_name = os.path.basename(variant_path)
                 try:
-                    location = pyautogui.locateCenterOnScreen(variant_path, confidence=confidence, grayscale=False, region=region)
+                    location = pyautogui.locateCenterOnScreen(
+                        variant_path,
+                        confidence=confidence,
+                        grayscale=False,
+                        region=region
+                    )
                     if location:
                         print(f"✅ [FALLBACK] Found {variant_name} at ({location.x}, {location.y})")
                         return location, variant_path
@@ -13641,12 +13621,24 @@ def sceneiq_google_flow_images_generation_engine():
         return location
 
     def find_image_at_location(image_name, target_x, target_y, tolerance=20, confidence=0.7):
+        """Search only near a known point instead of matching an unrelated screen element."""
         variants = get_image_variants(image_name)
         if not variants:
             return None
+        screen_width, screen_height = pyautogui.size()
+        left = max(0, int(target_x - tolerance))
+        top = max(0, int(target_y - tolerance))
+        right = min(int(screen_width), int(target_x + tolerance + 1))
+        bottom = min(int(screen_height), int(target_y + tolerance + 1))
+        region = (left, top, max(1, right - left), max(1, bottom - top))
         for variant_path in variants:
             try:
-                location = pyautogui.locateCenterOnScreen(variant_path, confidence=confidence, grayscale=False)
+                location = pyautogui.locateCenterOnScreen(
+                    variant_path,
+                    confidence=confidence,
+                    grayscale=False,
+                    region=region
+                )
                 if location:
                     dx = abs(location.x - target_x)
                     dy = abs(location.y - target_y)
@@ -13655,10 +13647,6 @@ def sceneiq_google_flow_images_generation_engine():
                               f"({location.x}, {location.y}) — within tolerance of "
                               f"({target_x}, {target_y}) [dx={dx}, dy={dy}]")
                         return location
-                    else:
-                        print(f"⚠️ [LOC-LOCK] {os.path.basename(variant_path)} matched at "
-                              f"({location.x}, {location.y}) BUT outside tolerance of "
-                              f"({target_x}, {target_y}) [dx={dx}, dy={dy}] — rejecting this match")
             except Exception:
                 pass
         return None
@@ -13941,7 +13929,11 @@ def sceneiq_google_flow_images_generation_engine():
         variants = get_image_variants(image_name)
         for variant_path in variants:
             try:
-                location = pyautogui.locateOnScreen(variant_path, confidence=confidence, region=region)
+                location = pyautogui.locateOnScreen(
+                    variant_path,
+                    confidence=confidence,
+                    region=region
+                )
                 if location:
                     click_x = location.left + int(location.width * 0.95)
                     click_y = location.top + int(location.height / 2)
@@ -14392,6 +14384,43 @@ def sceneiq_google_flow_images_generation_engine():
         )
         return None
 
+    def _get_render_lock_region(padding_x=None, padding_y=None):
+        """
+        Return a bounded search rectangle around the ORIGINAL rendering marker.
+
+        image_render_lock_position stores the cursor anchor (50px left and
+        50px below the progress marker), so reverse that offset to recover the
+        progress marker's centre. This prevents variants elsewhere on the page
+        (for example, the false match at the bottom-right of the screen) from
+        being treated as active rendering.
+        """
+        if image_render_lock_position is None:
+            return None
+
+        pad_x = int(padding_x if padding_x is not None else RENDER_LOCK_PADDING_X)
+        pad_y = int(padding_y if padding_y is not None else RENDER_LOCK_PADDING_Y)
+        anchor_x, anchor_y = image_render_lock_position
+        marker_x = int(anchor_x + 50)
+        marker_y = int(anchor_y - 50)
+        screen_width, screen_height = pyautogui.size()
+
+        left = max(0, marker_x - pad_x)
+        top = max(0, marker_y - pad_y)
+        right = min(int(screen_width), marker_x + pad_x)
+        bottom = min(int(screen_height), marker_y + pad_y)
+        if right <= left or bottom <= top:
+            return None
+        return (left, top, right - left, bottom - top)
+
+    def _find_locked_rendering_indicator():
+        """Find the rendering marker only in the region established at first detection."""
+        region = _get_render_lock_region()
+        return find_image(
+            "imagerenderingprogress.png",
+            confidence=0.78,
+            region=region
+        )
+
     def handle_exit_gfsidebar_and_recheck():
         print(f"🔍 [GF] no_active_gf_generation.png not found — looking for exit_gfsidebar.png fallback...")
         exit_sidebar_location = find_image("exit_gfsidebar.png", confidence=0.7)
@@ -14427,71 +14456,6 @@ def sceneiq_google_flow_images_generation_engine():
         else:
             print(f"⚠️ [GF] exit_gfsidebar.png not found either")
         return None
-
-    def paste_prompt_and_click_send_batch(hwnd, entry_json, entry_name):
-        """Fast batch-only prompt submission; deliberately performs no render scan."""
-        check_for_termination()
-        enforce_window_focus(hwnd)
-
-        # The prompt workspace normally stays open between entries. Search it
-        # directly first; only use the expand control if the input is not visible.
-        prompt_location = find_image("whatdoyouwantocreate.png", confidence=0.8)
-        if not prompt_location:
-            expand_location = find_image("expandgfsidepanel.png", confidence=0.8)
-            if expand_location:
-                pyautogui.click(expand_location.x, expand_location.y)
-                _sleep(0.25)
-            prompt_location = wait_for_image(
-                "whatdoyouwantocreate.png", timeout_seconds=5, confidence=0.8
-            )
-
-        if not prompt_location:
-            print(f"❌ [BATCH-SEND] Prompt area not found for {entry_name}.")
-            return None
-
-        pyautogui.moveTo(prompt_location.x, prompt_location.y, duration=0.04)
-        pyautogui.click()
-        _sleep(0.08)
-        pyautogui.hotkey("ctrl", "a")
-        pyautogui.press("backspace")
-        pyperclip.copy(entry_json)
-        pyautogui.hotkey("ctrl", "v")
-        _sleep(0.12)
-
-        # Poll briefly for the enabled send button. Never search for
-        # imagerenderingprogress until AFTER the send action has happened.
-        send_location = None
-        send_deadline = time.monotonic() + 2.0
-        while time.monotonic() < send_deadline:
-            check_for_termination()
-            send_location = find_image("sendgf.png", confidence=0.8)
-            if send_location:
-                break
-            _sleep(0.08)
-
-        if send_location:
-            send_x, send_y = int(send_location.x), int(send_location.y)
-            pyautogui.moveTo(send_x, send_y, duration=0.04)
-            pyautogui.click()
-            move_mouse_to_center_of_screen()
-            print(
-                f"✅ [BATCH-SEND] {entry_name} submitted using sendgf.png "
-                f"at ({send_x}, {send_y})."
-            )
-            _sleep(0.12)
-            return (send_x, send_y)
-
-        # Enter is a last-resort send action. The following post-send render
-        # discovery must still find a new marker before this entry is tracked.
-        pyautogui.press("enter")
-        move_mouse_to_center_of_screen()
-        _sleep(0.18)
-        print(
-            f"⚠️ [BATCH-SEND] sendgf.png was not found for {entry_name}; "
-            "pressed Enter and will verify using the post-send render scan."
-        )
-        return (int(prompt_location.x), int(prompt_location.y))
-
 
     def paste_prompt_and_click_send(hwnd, entry_json, entry_name):
         print(f"🔍 [SEND-STEP] Looking for whatdoyouwantocreate.png...")
@@ -14548,10 +14512,7 @@ def sceneiq_google_flow_images_generation_engine():
 
     def confirm_sendgf_and_wait_for_generating(hwnd, entry_name, entry_json=None,
                                                send_x=None, send_y=None,
-                                               max_confirm_seconds=40, check_interval=0.4,
-                                               baseline_render_count=None,
-                                               baseline_prompt_sent_visible=None,
-                                               baseline_render_centers=None):
+                                               max_confirm_seconds=40, check_interval=0.4):
         max_confirm_seconds = _bounded_timeout(max_confirm_seconds)
         """
         CONFIRMATION RULE:
@@ -14616,7 +14577,6 @@ def sceneiq_google_flow_images_generation_engine():
 
         start_time = time.time()
         last_status_time = start_time
-        prompt_sent_was_cleared = not bool(baseline_prompt_sent_visible)
 
         while time.time() - start_time < max_confirm_seconds:
             check_for_termination()
@@ -14633,60 +14593,62 @@ def sceneiq_google_flow_images_generation_engine():
                 confidence=0.8
             )
 
-            if not prompt_sent_location:
-                prompt_sent_was_cleared = True
-            elif prompt_sent_was_cleared:
+            if prompt_sent_location:
                 matched_name = (
                     os.path.basename(matched_prompt_variant)
                     if matched_prompt_variant
                     else "gfpromptsent variant"
                 )
                 print(
-                    f"✅ [SEND-CONFIRM] Fresh {matched_name} detected at "
+                    f"✅ [SEND-CONFIRM] {matched_name} found at "
                     f"({prompt_sent_location.x}, {prompt_sent_location.y})."
                 )
+                print(
+                    f"✅ [SEND-CONFIRM] Prompt CONFIRMED SENT using "
+                    f"gfpromptsent detection."
+                )
+
                 try:
                     hud.print("Prompt sent.", "success")
                 except Exception:
                     pass
+
                 update_operation_status(
-                    f"Prompt confirmed for {entry_name} (fresh gfpromptsent detected)"
+                    f"Prompt confirmed for {entry_name} (gfpromptsent detected)"
                 )
                 return "confirmed"
-            else:
+
+            # Fallback confirmation: rendering progress means Flow has started
+            # processing the submitted prompt, even if gfpromptsent is absent.
+            rendering_location, matched_rendering_variant = find_image_with_fallback(
+                "imagerenderingprogress.png",
+                confidence=0.7
+            )
+
+            if rendering_location:
+                matched_name = (
+                    os.path.basename(matched_rendering_variant)
+                    if matched_rendering_variant
+                    else "imagerenderingprogress variant"
+                )
                 print(
-                    "ℹ️ [SEND-CONFIRM] gfpromptsent is still visible from an earlier "
-                    "submission; it is not being accepted as confirmation for this entry."
+                    f"✅ [SEND-CONFIRM] gfpromptsent was not found, but "
+                    f"{matched_name} was detected at "
+                    f"({rendering_location.x}, {rendering_location.y})."
+                )
+                print(
+                    f"✅ [SEND-CONFIRM] Prompt CONFIRMED SENT using "
+                    f"image-rendering progress fallback."
                 )
 
-            # For batched submissions, an already-running entry's progress image
-            # must not confirm the newly submitted prompt. Require the count to
-            # increase over the pre-send snapshot. Legacy single-job callers keep
-            # the original any-progress fallback when no baseline was supplied.
-            rendering_centers = find_all_image_centers_with_fallback(
-                "imagerenderingprogress.png", confidence=0.7
-            )
-            if baseline_render_count is None:
-                new_render_detected = bool(rendering_centers)
-            else:
-                baseline_positions = tuple(baseline_render_centers or ())
-                new_render_detected = bool(rendering_centers) and (
-                    len(rendering_centers) > int(baseline_render_count)
-                    or (baseline_render_centers is not None and tuple(rendering_centers) != baseline_positions)
-                )
-            if new_render_detected:
-                first_render = rendering_centers[-1]
-                print(
-                    "✅ [SEND-CONFIRM] A new image-rendering indicator was detected "
-                    f"(visible count={len(rendering_centers)}, baseline={baseline_render_count}); "
-                    f"latest ordered position=({first_render[0]}, {first_render[1]})."
-                )
                 try:
                     hud.print("Prompt sent — image rendering has started.", "success")
                 except Exception:
                     pass
+
                 update_operation_status(
-                    f"Prompt confirmed for {entry_name} using a newly appearing render indicator"
+                    f"Prompt confirmed for {entry_name} "
+                    f"(imagerenderingprogress fallback detected)"
                 )
                 return "confirmed"
 
@@ -14729,13 +14691,13 @@ def sceneiq_google_flow_images_generation_engine():
 
     def wait_for_imagerenderingprogress_and_jump_to_search(hwnd, entry_name, max_wait_seconds=40, check_interval=0.4):
         """
-        Find imagerenderingprogress once, then lock the cursor 50px left and
-        50px below that exact match until rendering finishes.
+        Detect the first rendering marker, lock its cursor position, and wait
+        until that SAME marker disappears from its bounded screen region.
 
-        Once the progress image is first found, no other GUI image/template is
-        searched until it disappears. Rendering has NO timeout. After it
-        disappears, the cursor remains locked while the caller searches only
-        for moregf.png.
+        Three consecutive misses are required to avoid a one-frame recognition
+        glitch. Importantly, after the first match no full-screen rendering
+        searches are performed, so an unrelated variant elsewhere cannot keep
+        the function stuck at "Image generation in progress".
         """
         nonlocal image_render_lock_active, image_render_lock_position
 
@@ -14744,14 +14706,16 @@ def sceneiq_google_flow_images_generation_engine():
         first_seen_at = time.monotonic()
         rendering_location = None
 
-        # Before the progress indicator is found, retain the normal bounded
-        # discovery window. The strict lock begins immediately on first match.
+        # First discovery is full-screen because the anchor is not known yet.
         while time.monotonic() - first_seen_at < max_wait_seconds:
             check_for_termination()
             enforce_window_focus(hwnd)
             if check_for_tryagain_and_abort():
                 return False
-            rendering_location = find_image("imagerenderingprogress.png", confidence=0.7)
+            rendering_location = find_image(
+                "imagerenderingprogress.png",
+                confidence=0.75
+            )
             if rendering_location:
                 break
             _sleep(check_interval)
@@ -14763,8 +14727,7 @@ def sceneiq_google_flow_images_generation_engine():
             )
             return False
 
-        # Record the original match and the exact cursor target. Do not search
-        # for the progress image a second time merely to position the cursor.
+        # Record the exact first match and lock the cursor at the required offset.
         image_render_lock_position = (
             int(rendering_location.x - 50),
             int(rendering_location.y + 50)
@@ -14772,10 +14735,12 @@ def sceneiq_google_flow_images_generation_engine():
         image_render_lock_active = True
         set_image_scroll_lock(True)
         target_x, target_y = image_render_lock_position
+        render_region = _get_render_lock_region()
         print(
             "🔒 [GF-LOCK] First match recorded at "
             f"({rendering_location.x}, {rendering_location.y}); "
-            f"cursor target permanently locked at ({target_x}, {target_y})."
+            f"cursor target locked at ({target_x}, {target_y}); "
+            f"render search region={render_region}."
         )
         pyautogui.moveTo(target_x, target_y, duration=0.2)
 
@@ -14783,50 +14748,71 @@ def sceneiq_google_flow_images_generation_engine():
             hud.print("Image generation in progress...", "processing")
         except Exception:
             pass
-        update_operation_status(f"Rendering in progress for {entry_name}; cursor position locked")
+        update_operation_status(
+            f"Rendering in progress for {entry_name}; monitoring only the original render location"
+        )
 
         render_started = time.monotonic()
         last_status_time = render_started
+        missing_samples = 0
+        check_interval = max(0.2, min(float(check_interval), 1.0))
 
-        # IMPORTANT: no 40-second deadline here. Keep waiting for as long as
-        # Google Flow needs. During this phase, only search the progress image.
         while True:
             check_for_termination()
+            enforce_window_focus(hwnd)
 
-            # The download-confirmation modal is the only additional UI
-            # exception allowed during the rendering lock. Its existing
-            # two-image verification remains mandatory.
+            # Modal checks are throttled independently. A false-positive modal
+            # header must never block the render-state transition.
             _service_modal_and_restore_locked_cursor()
             restore_locked_cursor()
 
-            # Search the rendering indicator only after modal servicing.
-            rendering_location = find_image("imagerenderingprogress.png", confidence=0.7)
-            if not rendering_location:
-                elapsed = int(time.monotonic() - render_started)
+            # CRITICAL: only search around the first marker, never the whole screen.
+            rendering_location = _find_locked_rendering_indicator()
+            if rendering_location:
+                if missing_samples:
+                    print(
+                        f"🔁 [GF-LOCK] Rendering marker reappeared in its anchor region; "
+                        f"resetting disappearance counter ({missing_samples} → 0)."
+                    )
+                missing_samples = 0
+            else:
+                missing_samples += 1
                 print(
-                    f"✅ [GF-LOCK] imagerenderingprogress.png disappeared after "
-                    f"{elapsed}s. Cursor remains locked at ({target_x}, {target_y}); "
-                    "next permitted search is moregf.png only."
+                    f"🔎 [GF-LOCK] Original rendering marker absent in anchor region "
+                    f"({missing_samples}/{RENDER_DISAPPEAR_CONFIRM_SAMPLES})."
                 )
-                try:
-                    hud.print("Image is ready; locating its More control...", "success")
-                except Exception:
-                    pass
-                update_operation_status(
-                    f"Rendering complete for {entry_name}; cursor remains locked while locating moregf.png"
-                )
-                return True
+                if missing_samples >= RENDER_DISAPPEAR_CONFIRM_SAMPLES:
+                    elapsed = int(time.monotonic() - render_started)
+                    print(
+                        f"✅ [GF-LOCK] Rendering is complete: the original marker was "
+                        f"absent for {missing_samples} consecutive checks over "
+                        f"approximately {elapsed}s. Handing off to download preparation."
+                    )
+                    try:
+                        hud.print("Rendering complete. Preparing the download...", "success")
+                    except Exception:
+                        pass
+                    update_operation_status(
+                        f"Rendering complete for {entry_name}; preparing More/download controls"
+                    )
+                    return True
 
             now = time.monotonic()
             if now - last_status_time >= 10:
                 elapsed = int(now - render_started)
-                print(f"⏳ [GF-LOCK] Still rendering... ({elapsed}s elapsed; no timeout)")
+                status_text = (
+                    f"Image generation in progress... ({elapsed}s)"
+                    if rendering_location else
+                    f"Checking render completion... ({missing_samples}/"
+                    f"{RENDER_DISAPPEAR_CONFIRM_SAMPLES} checks)"
+                )
+                print(f"⏳ [GF-LOCK] {status_text}")
                 try:
-                    hud.print(f"Image generation in progress... ({elapsed}s)", "processing")
+                    hud.print(status_text, "processing")
                 except Exception:
                     pass
                 update_operation_status(
-                    f"Google Flow image generation in progress for {entry_name} ({elapsed}s); waiting without timeout"
+                    f"Waiting for original rendering marker to disappear for {entry_name}"
                 )
                 last_status_time = now
 
@@ -15433,8 +15419,7 @@ def sceneiq_google_flow_images_generation_engine():
             traceback.print_exc()
             return False, None
 
-    def download_google_flow_image(hwnd, entry_name, images_folder, force_png=False,
-                                   known_render_center=None):
+    def download_google_flow_image(hwnd, entry_name, images_folder, force_png=False):
         # These variables belong to sceneiq_google_flow_images_generation_engine(), not this
         # nested function. Declaring them nonlocal also keeps the finally
         # block safe when Alt+/ interrupts the first polling wait.
@@ -15443,37 +15428,13 @@ def sceneiq_google_flow_images_generation_engine():
 
         print(f"📥 [GF-DOWNLOAD] Starting Google Flow download procedure for {entry_name}...")
 
-        # A batched scene job supplies the last tracked center of its own
-        # progress indicator. Its progress icon has disappeared, so never use
-        # another entry's still-visible indicator as this job's anchor.
-        batch_download_region = None
-        if known_render_center is not None:
-            render_x, render_y = int(known_render_center[0]), int(known_render_center[1])
-            image_render_lock_position = (render_x - 50, render_y + 50)
-            image_render_lock_active = True
-            set_image_scroll_lock(True)
-            target_x, target_y = image_render_lock_position
-            pyautogui.moveTo(target_x, target_y, duration=0.2)
-            _sleep(0.3)
-            search_location = type(
-                "TrackedRenderPosition",
-                (),
-                {"x": render_x, "y": render_y}
-            )()
-            screen_width, screen_height = pyautogui.size()
-            region_top = max(0, render_y - 450)
-            region_bottom = min(screen_height, render_y + 450)
-            batch_download_region = (0, region_top, screen_width, max(1, region_bottom - region_top))
-            print(
-                f"🔒 [GF-DOWNLOAD] Using tracked {entry_name} render center "
-                f"({render_x}, {render_y}); cursor anchor=({target_x}, {target_y})."
-            )
-        else:
-            # Legacy single-job / thumbnail route.
-            search_location = ensure_image_hover_position(
-                timeout_seconds=STAGE_TIMEOUT_SECONDS,
-                offset_px=50
-            )
+        # Rendering completion leaves the cursor locked at the original
+        # progress-indicator anchor. Do not search for any other UI element
+        # except moregf.png until that control is found.
+        search_location = ensure_image_hover_position(
+            timeout_seconds=STAGE_TIMEOUT_SECONDS,
+            offset_px=50
+        )
 
         # Protect the complete download UI sequence from periodic exit editing
         # detection. Hotkeys/timeouts continue to be checked normally.
@@ -15513,11 +15474,7 @@ def sceneiq_google_flow_images_generation_engine():
 
                 # If rendering has resumed while waiting for More, re-anchor
                 # 50px left and 50px below the new progress match, then wait again.
-                rendering_again = (
-                    find_image("imagerenderingprogress.png", confidence=0.7)
-                    if known_render_center is None
-                    else None
-                )
+                rendering_again = _find_locked_rendering_indicator()
                 if rendering_again:
                     image_render_lock_position = (
                         int(rendering_again.x - 50),
@@ -15538,9 +15495,7 @@ def sceneiq_google_flow_images_generation_engine():
                         check_for_termination()
                         _service_modal_and_restore_locked_cursor()
                         restore_locked_cursor()
-                        still_rendering = find_image(
-                            "imagerenderingprogress.png", confidence=0.7
-                        )
+                        still_rendering = _find_locked_rendering_indicator()
                         if not still_rendering:
                             elapsed_again = int(time.monotonic() - render_again_started)
                             print(
@@ -15561,17 +15516,21 @@ def sceneiq_google_flow_images_generation_engine():
                     continue
 
                 # Search More only after confirming rendering is not active.
-                moregf_location = find_image(
-                    "moregf.png", confidence=0.7, region=batch_download_region
-                )
+                if time.monotonic() - moregf_wait_started > STAGE_TIMEOUT_SECONDS:
+                    raise _WorkflowRestart(
+                        f"Rendering ended for {entry_name}, but moregf.png was not found "
+                        f"within {STAGE_TIMEOUT_SECONDS:.0f}s in the output-card region"
+                    )
+                # More may be positioned at the edge of the generated result card,
+                # so keep its search global. The rendering indicator itself is
+                # already restricted to the original anchor region above.
+                moregf_location = find_image("moregf.png", confidence=0.75)
                 if moregf_location:
                     print(
                         f"✅ [GF-DOWNLOAD] moregf.png found at "
                         f"({moregf_location.x}, {moregf_location.y}); clicking its right edge."
                     )
-                    clicked = click_right_edge_of_image(
-                        "moregf.png", confidence=0.7, region=batch_download_region
-                    )
+                    clicked = click_right_edge_of_image("moregf.png", confidence=0.75)
                     if clicked:
                         moregf_found = True
                         image_render_lock_active = False
@@ -15691,13 +15650,9 @@ def sceneiq_google_flow_images_generation_engine():
 
                     target_x, target_y = image_render_lock_position
                     pyautogui.moveTo(target_x, target_y, duration=0.1)
-                    more_retry_location = find_image(
-                        "moregf.png", confidence=0.7, region=batch_download_region
-                    )
+                    more_retry_location = find_image("moregf.png", confidence=0.75)
                     if more_retry_location:
-                        click_right_edge_of_image(
-                            "moregf.png", confidence=0.7, region=batch_download_region
-                        )
+                        click_right_edge_of_image("moregf.png", confidence=0.75)
                     download_location = wait_for_image("downloadgfimage.png", timeout_seconds=10, confidence=0.7)
                     if download_location:
                         pyautogui.moveTo(download_location.x, download_location.y, duration=0.1)
@@ -15729,11 +15684,7 @@ def sceneiq_google_flow_images_generation_engine():
 
         finally:
             download_ui_sequence_active = False
-            if known_render_center is not None:
-                image_render_lock_active = False
-                image_render_lock_position = None
-                set_image_scroll_lock(False)
-            elif not image_render_lock_active:
+            if not image_render_lock_active:
                 set_image_scroll_lock(False)
     def handle_webdownloadconfirmationmodal():
         """
@@ -15891,13 +15842,17 @@ def sceneiq_google_flow_images_generation_engine():
         return True
 
     def _service_modal_and_restore_locked_cursor():
-        """
-        Poll the download-confirmation modal during the locked phase. If it is
-        visible, the existing handler verifies both modal images and clicks it.
-        Always restore the saved image anchor immediately afterward.
-        """
+        """Check the verified confirmation modal on a short cadence, not every render poll."""
+        nonlocal last_render_modal_check_at
         if not image_render_lock_active or image_render_lock_position is None:
             return False
+
+        now = time.monotonic()
+        if now - last_render_modal_check_at < RENDER_MODAL_CHECK_INTERVAL:
+            restore_locked_cursor()
+            return False
+        last_render_modal_check_at = now
+
         handled = False
         try:
             handled = handle_webdownloadconfirmationmodal()
@@ -16216,694 +16171,6 @@ def sceneiq_google_flow_images_generation_engine():
             force_png=False
         )
 
-    def _render_position_alignment_cost(previous_jobs, old_indices, current_centers, current_indices):
-        """Score one order-preserving mapping while tolerating a common UI reflow."""
-        shifts = []
-        for old_index, current_index in zip(old_indices, current_indices):
-            old_x, old_y = previous_jobs[old_index]["center"]
-            new_x, new_y = current_centers[current_index]
-            shifts.append((new_x - old_x, new_y - old_y))
-
-        if shifts:
-            median_dx = sorted(item[0] for item in shifts)[len(shifts) // 2]
-            median_dy = sorted(item[1] for item in shifts)[len(shifts) // 2]
-            residual = sum(
-                abs(dx - median_dx) + abs(dy - median_dy)
-                for dx, dy in shifts
-            )
-            # A small motion penalty breaks ties without rejecting a coherent
-            # large shift caused by the cards being repositioned after a send.
-            cost = residual + 0.035 * (abs(median_dx) + abs(median_dy))
-            return cost, (median_dx, median_dy)
-        return 0.0, (0, 0)
-
-    unowned_render_marker_serial = 0
-
-    def _make_unowned_render_job(center, reason="pre-existing/ambiguous marker"):
-        """Track an unowned marker only for reflow alignment; it is never downloadable."""
-        nonlocal unowned_render_marker_serial
-        unowned_render_marker_serial += 1
-        return {
-            "entry_name": f"__unowned_render_{unowned_render_marker_serial}",
-            "entry_index": None,
-            "center": (int(center[0]), int(center[1])),
-            "state": "unowned",
-            "unowned_reason": reason,
-        }
-
-    def _reconcile_render_positions(previous_jobs, current_centers, newly_submitted=None):
-        """
-        Reconcile card positions using only snapshots taken AFTER prompts are sent.
-
-        Previous tracked markers are aligned to their new positions after Google
-        Flow reflows the cards. The one marker nearest the just-used send control
-        is assigned to the newly submitted entry. Any additional first-seen
-        markers are retained as unowned alignment anchors and are never downloaded.
-        """
-        previous = sorted(
-            [dict(job) for job in previous_jobs],
-            key=lambda job: (job["center"][1], job["center"][0])
-        )
-        current = sorted(
-            [(int(point[0]), int(point[1])) for point in current_centers],
-            key=lambda point: (point[1], point[0])
-        )
-
-        if newly_submitted is not None:
-            if not current:
-                return previous, [], None
-
-            # Reserve one current marker for the newly sent entry; align as many
-            # previously tracked markers as the remaining current set allows.
-            old_match_count = min(len(previous), max(0, len(current) - 1))
-            best = None
-            for old_indices in itertools.combinations(range(len(previous)), old_match_count):
-                for current_indices in itertools.combinations(range(len(current)), old_match_count):
-                    cost, shift = _render_position_alignment_cost(
-                        previous, old_indices, current, current_indices
-                    )
-                    if best is None or cost < best[0]:
-                        best = (cost, old_indices, current_indices, shift)
-
-            if best is None:
-                matched_old_indices = ()
-                matched_current_indices = ()
-                shift = (0, 0)
-            else:
-                _, matched_old_indices, matched_current_indices, shift = best
-
-            old_to_current = dict(zip(matched_old_indices, matched_current_indices))
-            current_used = set(matched_current_indices)
-            unmatched_current_indices = [
-                index for index in range(len(current)) if index not in current_used
-            ]
-            if not unmatched_current_indices:
-                raise _BatchTrackingFailure(
-                    f"Could not isolate a post-send render marker for "
-                    f"{newly_submitted['entry_name']}."
-                )
-
-            send_center = newly_submitted.get("send_center")
-            if send_center is not None:
-                send_x, send_y = int(send_center[0]), int(send_center[1])
-                new_index = min(
-                    unmatched_current_indices,
-                    key=lambda index: (
-                        (current[index][0] - send_x) ** 2
-                        + (current[index][1] - send_y) ** 2
-                    )
-                )
-            else:
-                # Fallback: use the lowest unmatched marker in visual order.
-                new_index = unmatched_current_indices[-1]
-
-            active = []
-            completed = []
-            for old_index, job in enumerate(previous):
-                if old_index in old_to_current:
-                    updated = dict(job)
-                    updated["center"] = current[old_to_current[old_index]]
-                    updated["state"] = job.get("state", "rendering")
-                    active.append(updated)
-                else:
-                    finished = dict(job)
-                    finished["center"] = (
-                        int(job["center"][0] + shift[0]),
-                        int(job["center"][1] + shift[1])
-                    )
-                    finished["state"] = "render_complete"
-                    completed.append(finished)
-
-            new_job = dict(newly_submitted)
-            new_job.pop("send_center", None)
-            new_job["center"] = current[new_index]
-            new_job["state"] = "rendering"
-            active.append(new_job)
-
-            # Extra matches on the first post-send scan may belong to an older
-            # Flow card. Keep them in the alignment set, but never queue a download.
-            for index in unmatched_current_indices:
-                if index == new_index:
-                    continue
-                foreign = _make_unowned_render_job(
-                    current[index],
-                    reason="additional marker first observed after a send"
-                )
-                active.append(foreign)
-                print(
-                    f"ℹ️ [BATCH-TRACK] Keeping {foreign['entry_name']} at "
-                    f"({foreign['center'][0]}, {foreign['center'][1]}) as an "
-                    "unowned alignment marker; it will never be downloaded."
-                )
-
-            active.sort(key=lambda job: (job["center"][1], job["center"][0]))
-            completed.sort(key=lambda job: (job["center"][1], job["center"][0]))
-            return active, completed, new_job["center"]
-
-        # Monitoring phase. Match every old marker that remains visible. A newly
-        # appearing unmatched marker is treated as unowned rather than guessed to
-        # be one of the six submitted scene entries.
-        if len(current) >= len(previous):
-            match_count = len(previous)
-        else:
-            match_count = len(current)
-
-        best = None
-        for old_indices in itertools.combinations(range(len(previous)), match_count):
-            for current_indices in itertools.combinations(range(len(current)), match_count):
-                cost, shift = _render_position_alignment_cost(
-                    previous, old_indices, current, current_indices
-                )
-                if best is None or cost < best[0]:
-                    best = (cost, old_indices, current_indices, shift)
-
-        if best is None:
-            matched_old_indices = ()
-            matched_current_indices = ()
-            shift = (0, 0)
-        else:
-            _, matched_old_indices, matched_current_indices, shift = best
-
-        old_to_current = dict(zip(matched_old_indices, matched_current_indices))
-        current_used = set(matched_current_indices)
-        active = []
-        completed = []
-
-        for old_index, job in enumerate(previous):
-            if old_index in old_to_current:
-                updated = dict(job)
-                updated["center"] = current[old_to_current[old_index]]
-                active.append(updated)
-            else:
-                finished = dict(job)
-                finished["center"] = (
-                    int(job["center"][0] + shift[0]),
-                    int(job["center"][1] + shift[1])
-                )
-                finished["state"] = "render_complete"
-                completed.append(finished)
-
-        for index, center in enumerate(current):
-            if index not in current_used:
-                foreign = _make_unowned_render_job(
-                    center,
-                    reason="additional marker appeared during monitoring"
-                )
-                active.append(foreign)
-                print(
-                    f"ℹ️ [BATCH-TRACK] New unowned marker {foreign['entry_name']} "
-                    f"at ({center[0]}, {center[1]}); tracking only for card alignment."
-                )
-
-        active.sort(key=lambda job: (job["center"][1], job["center"][0]))
-        completed.sort(key=lambda job: (job["center"][1], job["center"][0]))
-        return active, completed, None
-
-    def _apply_common_reflow_shift(previous_active, current_active, completed_queue):
-        """Move already-completed cards with the common shift of surviving cards."""
-        if not completed_queue or not previous_active or not current_active:
-            return
-        old_by_name = {job["entry_name"]: job["center"] for job in previous_active}
-        shifts = []
-        for job in current_active:
-            old_center = old_by_name.get(job["entry_name"])
-            if old_center is None:
-                continue
-            shifts.append((job["center"][0] - old_center[0], job["center"][1] - old_center[1]))
-        if not shifts:
-            return
-        median_dx = sorted(item[0] for item in shifts)[len(shifts) // 2]
-        median_dy = sorted(item[1] for item in shifts)[len(shifts) // 2]
-        if median_dx == 0 and median_dy == 0:
-            return
-        for completed in completed_queue:
-            completed["center"] = (
-                int(completed["center"][0] + median_dx),
-                int(completed["center"][1] + median_dy)
-            )
-        print(
-            f"🧭 [BATCH-TRACK] Repositioned {len(completed_queue)} completed-card anchor(s) "
-            f"by common UI shift ({median_dx:+d}, {median_dy:+d})."
-        )
-
-    def _order_render_centers_latest_first(current_centers, row_tolerance=58):
-        """Order visible render cards as newest-first: rows top-to-bottom, each row left-to-right."""
-        points = sorted(
-            {(int(point[0]), int(point[1])) for point in current_centers},
-            key=lambda point: (point[1], point[0])
-        )
-        rows = []
-        for point in points:
-            selected_row = None
-            selected_distance = None
-            for row in rows:
-                row_y = sum(item[1] for item in row) / len(row)
-                distance = abs(point[1] - row_y)
-                if distance <= row_tolerance and (
-                    selected_distance is None or distance < selected_distance
-                ):
-                    selected_row = row
-                    selected_distance = distance
-            if selected_row is None:
-                rows.append([point])
-            else:
-                selected_row.append(point)
-
-        rows.sort(key=lambda row: sum(item[1] for item in row) / len(row))
-        ordered = []
-        for row in rows:
-            ordered.extend(sorted(row, key=lambda point: point[0]))
-        return ordered
-
-    def _cluster_axis_values(values, tolerance=55):
-        """Collapse small coordinate variations into stable visual grid columns/rows."""
-        groups = []
-        for value in sorted(int(value) for value in values):
-            if not groups or abs(value - (sum(groups[-1]) / len(groups[-1]))) > tolerance:
-                groups.append([value])
-            else:
-                groups[-1].append(value)
-        return [int(round(sum(group) / len(group))) for group in groups]
-
-    def _estimate_batch_card_slot_center(ordered_centers, slot_index):
-        """Estimate a missing tail card slot using the observed card-grid pitch."""
-        if not ordered_centers:
-            raise _BatchTrackingFailure(
-                "Cannot estimate a completed card position because no render-card anchor was found."
-            )
-        if 0 <= slot_index < len(ordered_centers):
-            return tuple(ordered_centers[slot_index])
-
-        screen_width, screen_height = pyautogui.size()
-        fallback_pitch_x = max(180.0, screen_width * 0.283)
-        fallback_pitch_y = max(140.0, screen_height * 0.290)
-
-        x_values = _cluster_axis_values([point[0] for point in ordered_centers])
-        y_values = _cluster_axis_values([point[1] for point in ordered_centers])
-
-        def _pitch_from_axis(axis_values, fallback):
-            differences = [
-                float(b - a) for a, b in zip(axis_values, axis_values[1:])
-                if b - a >= 80
-            ]
-            if not differences:
-                return fallback
-            # A missing middle column/row can make an observed gap span two cells.
-            normalized = []
-            for difference in differences:
-                multiplier = max(1, int(round(difference / fallback)))
-                normalized.append(difference / multiplier)
-            normalized.sort()
-            return normalized[len(normalized) // 2]
-
-        pitch_x = _pitch_from_axis(x_values, fallback_pitch_x)
-        pitch_y = _pitch_from_axis(y_values, fallback_pitch_y)
-        origin_x, origin_y = ordered_centers[0]
-        column_count = 3
-        row_index, column_index = divmod(int(slot_index), column_count)
-        estimated = (
-            int(round(origin_x + column_index * pitch_x)),
-            int(round(origin_y + row_index * pitch_y))
-        )
-        print(
-            f"🧭 [BATCH-GRID] Estimated missing card slot {slot_index + 1} at "
-            f"({estimated[0]}, {estimated[1]}) using grid pitch "
-            f"({pitch_x:.1f}, {pitch_y:.1f})."
-        )
-        return estimated
-
-    def _bootstrap_batch_render_jobs(submitted_jobs, current_centers):
-        """Map one post-submission screen snapshot to the submitted batch."""
-        ordered_centers = _order_render_centers_latest_first(current_centers)
-        if not ordered_centers:
-            raise _BatchTrackingFailure(
-                "All prompts were submitted, but no imagerenderingprogress.png markers "
-                "were visible in the combined snapshot. There is no safe card anchor "
-                "for downloading an already-completed image."
-            )
-
-        latest_first_jobs = list(reversed(submitted_jobs))
-        visible_owned_count = min(len(latest_first_jobs), len(ordered_centers))
-        active = []
-        completed = []
-
-        print(
-            f"🔎 [BATCH-SNAPSHOT] Combined snapshot found {len(ordered_centers)} "
-            f"render marker(s) for {len(submitted_jobs)} submitted scene(s)."
-        )
-        print(
-            "🧭 [BATCH-SNAPSHOT] Assigning markers newest-first: the latest submitted "
-            "entry maps to the first/top-left marker, then older entries map rightward "
-            "and downward in row-major order."
-        )
-
-        for slot_index, job in enumerate(latest_first_jobs):
-            assigned = dict(job)
-            if slot_index < visible_owned_count:
-                assigned["center"] = tuple(ordered_centers[slot_index])
-                assigned["state"] = "rendering"
-                active.append(assigned)
-                print(
-                    f"✅ [BATCH-SNAPSHOT] {assigned['entry_name']} -> "
-                    f"({assigned['center'][0]}, {assigned['center'][1]}) [rendering]"
-                )
-            else:
-                # Under the documented Flow ordering, the oldest submitted
-                # cards occupy the tail/right/bottom slots. If their progress
-                # marker is already gone in this first snapshot, they are ready.
-                assigned["center"] = _estimate_batch_card_slot_center(
-                    ordered_centers, slot_index
-                )
-                assigned["state"] = "render_complete"
-                completed.append(assigned)
-                print(
-                    f"🎉 [BATCH-SNAPSHOT] {assigned['entry_name']} has no remaining "
-                    f"render marker; treating its older tail slot as complete at "
-                    f"({assigned['center'][0]}, {assigned['center'][1]})."
-                )
-
-        # Extra markers are older cards outside this six-entry batch. Retain them
-        # as alignment anchors so subsequent reflows do not corrupt scene mapping.
-        for center in ordered_centers[len(latest_first_jobs):]:
-            foreign = _make_unowned_render_job(
-                center,
-                reason="older render marker outside the current submitted batch"
-            )
-            active.append(foreign)
-            print(
-                f"ℹ️ [BATCH-SNAPSHOT] Keeping {foreign['entry_name']} at "
-                f"({foreign['center'][0]}, {foreign['center'][1]}) as an unowned "
-                "older-card alignment anchor."
-            )
-
-        active.sort(key=lambda job: (job["center"][1], job["center"][0]))
-        completed.sort(key=lambda job: (job["center"][1], job["center"][0]))
-        return active, completed
-
-    def _submit_scene_entry_to_batch(hwnd, entry_index):
-        """Submit one prompt only; never scan render indicators or lock a card position here."""
-        entry_name = f"entry_{entry_index + 1}"
-        entry_json = format_entry_for_paste(all_entries[entry_index])
-        if not entry_json:
-            raise _WorkflowRestart(f"No valid prompt data found for {entry_name}")
-
-        print(
-            f"\n📝 [BATCH-SEND] Submitting {entry_name} consecutively. "
-            "Rendering-progress lookup and card-position tracking are deferred "
-            "until the entire batch has been sent."
-        )
-        check_for_termination()
-        send_coords = paste_prompt_and_click_send_batch(hwnd, entry_json, entry_name)
-        if send_coords is None:
-            raise _WorkflowRestart(f"Could not paste or submit {entry_name}")
-
-        job = {
-            "entry_name": entry_name,
-            "entry_index": entry_index,
-            "center": None,
-            "send_center": send_coords,
-            "state": "sent"
-        }
-        print(
-            f"✅ [BATCH-SEND] {entry_name} sent. No rendering-image search, "
-            "position verification, or location lock was performed."
-        )
-        return job
-
-    def _download_completed_scene_job(hwnd, job, images_folder):
-        """Download a finished card using its own last recorded render location."""
-        center = job.get("center")
-        if not center:
-            raise _BatchTrackingFailure(
-                f"No last-known render location is available for {job.get('entry_name', 'unknown entry')}"
-            )
-        entry_name = job["entry_name"]
-        print(
-            f"\n📥 [BATCH-DOWNLOAD] {entry_name} completed. Moving to its last tracked "
-            f"render position ({center[0]}, {center[1]}) and 50px left / 50px below."
-        )
-        download_success = download_google_flow_image(
-            hwnd,
-            entry_name,
-            images_folder,
-            force_png=False,
-            known_render_center=center
-        )
-        if not download_success:
-            raise _BatchTrackingFailure(
-                f"Download failed for completed batch entry {entry_name}; stopping this batch rather than resubmitting prompts."
-            )
-
-        verified_path = _find_entry_image(images_folder, int(job["entry_index"]) + 1)
-        if not verified_path:
-            raise _BatchTrackingFailure(
-                f"{entry_name} download returned success but its destination image is missing or invalid"
-            )
-
-        # The download watcher already checks the two-image modal verification;
-        # this final pass catches a modal that appeared immediately after the file.
-        handle_webdownloadconfirmationmodal()
-        _sleep(0.35)
-        print(f"✅ [BATCH-DOWNLOAD] {entry_name} saved and verified: {verified_path}")
-        update_operation_status(f"{entry_name} downloaded and verified")
-        return verified_path
-
-    def process_scene_entries_in_batches(hwnd, missing_entry_numbers, images_folder, batch_size=6):
-        """
-        Send up to six prompts consecutively with NO rendering-progress search
-        or render-position lock between sends. After every prompt in the batch
-        has been sent, take one combined snapshot and map markers newest-first.
-
-        Google Flow's newest card is treated as the first row-major position;
-        older cards proceed to the right and then downward. If fewer markers
-        remain than prompts sent, the oldest tail entries are treated as already
-        complete and their positions are extrapolated from the visible grid.
-        """
-        batch_size = max(1, min(6, int(batch_size)))
-        entry_numbers = [int(number) for number in missing_entry_numbers]
-        if not entry_numbers:
-            return True
-
-        batch_number = 0
-        for batch_start in range(0, len(entry_numbers), batch_size):
-            check_for_termination()
-            batch_number += 1
-            batch_label = str(batch_number)
-            batch_numbers = entry_numbers[batch_start:batch_start + batch_size]
-
-            print(
-                f"\n{'=' * 64}\n"
-                f"🚀 [BATCH] Starting consecutive scene batch {batch_label}: "
-                f"{batch_numbers} (up to {batch_size} entries)\n"
-                f"{'=' * 64}"
-            )
-            print(
-                "⚡ [BATCH] Sending every prompt in order without checking or locking "
-                "render positions. All render locations will be read together only "
-                "after the final prompt in this batch has been submitted."
-            )
-
-            submitted_jobs = []
-            for entry_number in batch_numbers:
-                check_for_termination()
-                entry_name = f"entry_{entry_number}"
-
-                # File validation is local and does not inspect the Google Flow UI.
-                if _find_entry_image(images_folder, entry_number):
-                    print(
-                        f"⏭️ [BATCH] {entry_name} already has a valid image; "
-                        "skipping submission."
-                    )
-                    continue
-
-                job = _submit_scene_entry_to_batch(hwnd, entry_number - 1)
-                submitted_jobs.append(job)
-                update_operation_status(
-                    f"Batch {batch_label}: consecutively submitted "
-                    f"{len(submitted_jobs)}/{len(batch_numbers)} prompts; "
-                    "render-position lookup is deferred until the batch is sent"
-                )
-                try:
-                    hud.print(
-                        f"Batch {batch_label}: sent {len(submitted_jobs)}/{len(batch_numbers)} prompts",
-                        "processing"
-                    )
-                except Exception:
-                    pass
-
-            if not submitted_jobs:
-                print(f"ℹ️ [BATCH] No new prompts needed in batch {batch_label}.")
-                continue
-
-            print(
-                f"✅ [BATCH] All {len(submitted_jobs)} prompt(s) in batch {batch_label} "
-                "have been sent consecutively. Now taking ONE combined render snapshot."
-            )
-            update_operation_status(
-                f"Batch {batch_label}: all {len(submitted_jobs)} prompts submitted; "
-                "locating render cards together"
-            )
-
-            # This is the FIRST rendering-progress lookup in this batch.
-            # No imagerenderingprogress search or cursor lock occurred between sends.
-            current_centers = find_all_image_centers_with_fallback(
-                "imagerenderingprogress.png", confidence=0.7
-            )
-            active_jobs, completed_jobs = _bootstrap_batch_render_jobs(
-                submitted_jobs, current_centers
-            )
-
-            print(
-                f"📍 [BATCH] Combined mapping complete: {len(active_jobs)} active/alignment "
-                f"anchor(s), {len(completed_jobs)} already-completed scene(s)."
-            )
-            for tracked in active_jobs:
-                kind = (
-                    "scene" if tracked.get("entry_index") is not None
-                    else "unowned older-card anchor"
-                )
-                print(
-                    f"   • {tracked['entry_name']} ({kind}) at "
-                    f"({tracked['center'][0]}, {tracked['center'][1]})"
-                )
-            for finished in completed_jobs:
-                print(
-                    f"   • {finished['entry_name']} (ready) at "
-                    f"({finished['center'][0]}, {finished['center'][1]})"
-                )
-
-            downloaded_in_batch = set()
-            expected_batch_names = {job["entry_name"] for job in submitted_jobs}
-            last_render_status = time.monotonic()
-
-            # Completed-before-snapshot jobs are queued immediately. Still-rendering
-            # jobs are monitored until their individual progress marker disappears.
-            while len(downloaded_in_batch) < len(expected_batch_names):
-                check_for_termination()
-
-                current_centers = find_all_image_centers_with_fallback(
-                    "imagerenderingprogress.png", confidence=0.7
-                )
-                previous_active = [dict(job) for job in active_jobs]
-                active_jobs, newly_completed, _ = _reconcile_render_positions(
-                    active_jobs,
-                    current_centers,
-                    newly_submitted=None
-                )
-                _apply_common_reflow_shift(
-                    previous_active, active_jobs, completed_jobs
-                )
-
-                owned_completed = [
-                    job for job in newly_completed
-                    if job.get("entry_index") is not None
-                ]
-                if owned_completed:
-                    completed_jobs.extend(owned_completed)
-                    for finished in owned_completed:
-                        print(
-                            f"🎉 [BATCH-TRACK] {finished['entry_name']} render marker "
-                            "disappeared; last tracked card center="
-                            f"({finished['center'][0]}, {finished['center'][1]})."
-                        )
-
-                # If a destination file already exists, count it only after validating it.
-                remaining_completed_jobs = []
-                for job in completed_jobs:
-                    if job.get("entry_index") is None:
-                        continue
-                    entry_path = _find_entry_image(
-                        images_folder, int(job["entry_index"]) + 1
-                    )
-                    if entry_path:
-                        downloaded_in_batch.add(job["entry_name"])
-                    elif job["entry_name"] not in downloaded_in_batch:
-                        remaining_completed_jobs.append(job)
-                completed_jobs = remaining_completed_jobs
-
-                if completed_jobs:
-                    completed_jobs.sort(
-                        key=lambda job: (job["center"][1], job["center"][0])
-                    )
-                    finished_job = completed_jobs.pop(0)
-                    _download_completed_scene_job(
-                        hwnd, finished_job, images_folder
-                    )
-                    downloaded_in_batch.add(finished_job["entry_name"])
-
-                    # Download/hover/modal handling can reflow every remaining card.
-                    # Refresh their positions together after the download interaction.
-                    current_centers = find_all_image_centers_with_fallback(
-                        "imagerenderingprogress.png", confidence=0.7
-                    )
-                    previous_active = [dict(job) for job in active_jobs]
-                    active_jobs, newly_completed, _ = _reconcile_render_positions(
-                        active_jobs,
-                        current_centers,
-                        newly_submitted=None
-                    )
-                    _apply_common_reflow_shift(
-                        previous_active, active_jobs, completed_jobs
-                    )
-                    completed_jobs.extend(
-                        job for job in newly_completed
-                        if job.get("entry_index") is not None
-                    )
-                    continue
-
-                owned_active_jobs = [
-                    job for job in active_jobs
-                    if job.get("entry_index") is not None
-                ]
-                if not owned_active_jobs:
-                    missing_from_queue = expected_batch_names - downloaded_in_batch
-                    if missing_from_queue:
-                        raise _BatchTrackingFailure(
-                            "No tracked scene render remains, but these entries were "
-                            "not mapped to a verified downloadable completion: "
-                            + ", ".join(sorted(missing_from_queue))
-                        )
-                    break
-
-                now = time.monotonic()
-                if now - last_render_status >= 10:
-                    print(
-                        f"⏳ [BATCH] Batch {batch_label}: still rendering "
-                        f"{len(owned_active_jobs)} scene image(s); downloaded "
-                        f"{len(downloaded_in_batch)}/{len(expected_batch_names)}."
-                    )
-                    update_operation_status(
-                        f"Batch {batch_label}: waiting for {len(owned_active_jobs)} "
-                        f"render(s); downloads verified "
-                        f"{len(downloaded_in_batch)}/{len(expected_batch_names)}"
-                    )
-                    last_render_status = now
-                _sleep(0.35)
-
-            missing_batch_files = [
-                name for name in expected_batch_names
-                if _find_entry_image(
-                    images_folder, int(name.split("_")[1])
-                ) is None
-            ]
-            if missing_batch_files:
-                raise _BatchTrackingFailure(
-                    f"Batch {batch_label} finished without verified files for: "
-                    + ", ".join(sorted(missing_batch_files))
-                )
-
-            print(
-                f"🏁 [BATCH] Batch {batch_label} completed: all "
-                f"{len(expected_batch_names)} submitted scene image(s) "
-                "downloaded and verified."
-            )
-            update_operation_status(
-                f"Batch {batch_label} complete: "
-                f"{len(expected_batch_names)} scene images verified"
-            )
-
-        return True
-
     def process_thumbnail_gf(hwnd, thumbnail_prompt, images_folder):
         """Generate the single project-level thumbnail after all scene images."""
         print("\n🖼️ [THUMBNAIL] All scene images are verified. Preparing the YouTube thumbnail.")
@@ -17179,19 +16446,43 @@ def sceneiq_google_flow_images_generation_engine():
                 else:
                     print("ℹ️ [NEXT-PROMPT] generatinggf_image.png not present.")
 
-            # Submit up to six missing scene entries before starting downloads.
-            # Each progress indicator is re-mapped after every submission because
-            # Google Flow repositions earlier cards as new scene prompts are added.
-            if missing_entries:
-                batch_success = process_scene_entries_in_batches(
-                    hwnd,
-                    missing_entries,
-                    images_folder,
-                    batch_size=6
-                )
-                if not batch_success:
-                    abort_operation("One or more six-entry scene batches did not complete")
-                processed_job_this_attempt = True
+            # Walk the complete expected range, not just a contiguous suffix.
+            # A valid entry_5 is preserved even when entry_3 is missing.
+            for i in range(total_entries):
+                check_for_termination()
+                entry_name = f"entry_{i + 1}"
+                existing_image = _find_entry_image(images_folder, i + 1)
+                if existing_image:
+                    print(
+                        f"⏭️ [MAIN] {entry_name} already exists and is valid; "
+                        "skipping generation for this entry only."
+                    )
+                    continue
+
+                _prepare_for_next_prompt_if_needed()
+                entry = all_entries[i]
+                success = process_single_entry_gf(hwnd, i, entry, images_folder)
+                if success:
+                    processed_job_this_attempt = True
+                    _sleep(2)
+                    if _find_entry_image(images_folder, i + 1) is None:
+                        abort_operation(
+                            f"{entry_name} generation returned success but the file is missing"
+                        )
+                else:
+                    print(
+                        f"❌ [MAIN] {entry_name} failed — aborting the entire operation "
+                        "(the entry will not be skipped)."
+                    )
+                    try:
+                        hud.print(f"Stopping — {entry_name} did not finish.", "error")
+                    except Exception:
+                        pass
+                    update_operation_status(
+                        f"{entry_name} failed — stopping this attempt (never skip)",
+                        is_abort=True
+                    )
+                    abort_operation(f"{entry_name} failed — aborting operation")
 
             # Final scene-image audit before the thumbnail is allowed to start.
             _cleanup_project_image_folder(images_folder, total_entries)
@@ -17419,17 +16710,9 @@ def sceneiq_google_flow_images_generation_engine():
                 stop_event.set()
                 terminate_automation = True
             except _NanoBananaStartupFailure as startup_error:
-                print(f"🛑 [SUPERVISOR] Startup setup failed for this workflow attempt: {startup_error}")
+                print(f"🛑 [SUPERVISOR] Nano Banana setup failed for this workflow attempt: {startup_error}")
                 update_operation_status(
-                    f"Startup setup failed; scene generation stopped for safety: {startup_error}",
-                    is_error=True
-                )
-                stop_event.set()
-                terminate_automation = True
-            except _BatchTrackingFailure as batch_error:
-                print(f"🛑 [SUPERVISOR] Batch tracking stopped safely: {batch_error}")
-                update_operation_status(
-                    f"Batch tracking stopped safely to prevent a wrong image download: {batch_error}",
+                    f"Nano Banana setup failed; scene generation stopped for safety: {startup_error}",
                     is_error=True
                 )
                 stop_event.set()
@@ -17497,8 +16780,83 @@ def sceneiq_google_flow_images_generation_engine():
                 pass
             print("🛑 [SUPERVISOR] Google Flow function stopped by the user.")
 
+def main():
+    import os
+    import json
+    import traceback
+
+    print("\n" + "=" * 65, flush=True)
+    print("🚀 SCENIQ VIDEO PRODUCER STARTING", flush=True)
+    print("=" * 65, flush=True)
+
+    try:
+        print(f"📁 READY_SCRIPT: {READY_SCRIPT}", flush=True)
+        print(f"📁 IMAGES_PATH: {IMAGES_PATH}", flush=True)
+
+        if not os.path.isfile(READY_SCRIPT):
+            raise FileNotFoundError(
+                f"ready_script.json not found: {READY_SCRIPT}"
+            )
+
+        if not os.path.isdir(IMAGES_PATH):
+            raise NotADirectoryError(
+                f"Project images folder not found: {IMAGES_PATH}"
+            )
+
+        print("🔍 Inspecting ready_script.json...", flush=True)
+
+        with open(READY_SCRIPT, "r", encoding="utf-8") as f:
+            ready_data = json.load(f)
+
+        print(
+            f"📊 READY_SCRIPT root type: {type(ready_data).__name__}",
+            flush=True
+        )
+
+        titles = _video_producer_collect_ready_titles(READY_SCRIPT)
+
+        print(
+            f"📊 Recognized projects: {len(titles)}",
+            flush=True
+        )
+
+        for index, title in enumerate(titles, 1):
+            print(f"   {index}. {title}", flush=True)
+
+        if not titles:
+            print(
+                "❌ No processable projects found in ready_script.json.",
+                flush=True
+            )
+            print(
+                "Check that each project contains a project title "
+                "and a non-empty script.",
+                flush=True
+            )
+            return None
+
+        print("\n🎬 Launching complete video production pipeline...", flush=True)
+
+        result = video_producer_main()
+
+        print("\n" + "=" * 65, flush=True)
+        print("🏁 VIDEO PRODUCTION PIPELINE FINISHED", flush=True)
+        print(f"RESULT: {result}", flush=True)
+        print("=" * 65, flush=True)
+
+        return result
+
+    except Exception:
+        print("\n❌ VIDEO PRODUCER FAILED:", flush=True)
+        traceback.print_exc()
+        raise
+
+
 if __name__ == "__main__":
-    sceneiq_google_flow_images_generation_engine()
+    import multiprocessing
+    multiprocessing.freeze_support()
+    main()
+
 
 
  

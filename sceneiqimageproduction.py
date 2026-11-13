@@ -74,13 +74,16 @@ GEMINI_URL = "https://gemini.google.com/app"
 GOOGLE_FLOW_URL = "https://flow.google.com/#overview"
 GUI_IMAGES = r"C:\xampp\htdocs\AI automation\gui_images"
 PANEL_PATH = r"C:\xampp\htdocs\AI automation\scenIQ\panel.json"
-CONTROLLER_PATH = r"C:\xampp\htdocs\AI automation\scenIQ\panel.json"
+CONTROLLER_PATH = os.environ.get(
+    "SCENEIQ_CONTROLLER_PATH",
+    r"C:\xampp\htdocs\AI automation\scenIQ\controller.json"
+)
 READY_SCRIPT = r"C:\xampp\htdocs\AI automation\scenIQ\ready_script.json"
 GUI_REGION_SAVER = r"C:\xampp\htdocs\AI automation\scenIQ\gui.json"
 SUBSCRIBE_STICKERS = r"C:\xampp\htdocs\AI automation\scenIQ\subscribe"
 
 # The image-producer controller is intentionally independent from video workers.
-# CONTROLLER_PATH currently points to panel.json and expects:
+# CONTROLLER_PATH points to a separate, read-only controller.json and expects:
 # {"imageproducercontroller": {"operation": "run|pause|continue|restart|stop"}}
 _SCENEIQ_CONTROLLER_LOCK = threading.RLock()
 
@@ -269,16 +272,20 @@ def _sceneiq_resolve_project_images_folder(project_title, project_category=None)
     )
 
 def _sceneiq_controller_file_path():
-    return os.path.abspath(os.fspath(CONTROLLER_PATH or PANEL_PATH))
+    """Return the optional, read-only controller JSON path."""
+    return os.path.abspath(os.fspath(CONTROLLER_PATH))
 
 
 def _sceneiq_read_image_controller_operation():
-    """Read the remote image command. Missing/empty/unknown values mean run."""
+    """Read the optional controller command. This function NEVER writes JSON."""
     path = _sceneiq_controller_file_path()
     try:
         with open(path, "r", encoding="utf-8") as handle:
             data = json.load(handle)
-    except (OSError, ValueError, TypeError):
+    except FileNotFoundError:
+        return "run"  # Keyboard-only mode when controller.json is absent.
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"⚠️ [IMAGE-CONTROLLER] Could not read {path}: {exc}; defaulting to run.")
         return "run"
 
     controller = _sceneiq_find_named_object(data, "imageproducercontroller")
@@ -289,8 +296,10 @@ def _sceneiq_read_image_controller_operation():
                 raw = value
                 break
     command = _sceneiq_normalize_key(raw)
-    if command in {"", "run", "running", "start", "continue", "resume"}:
-        return "continue" if command in {"continue", "resume"} else "run"
+    if command in {"", "run", "running", "start"}:
+        return "run"
+    if command in {"continue", "resume"}:
+        return "continue"
     if command in {"pause", "paused", "hold"}:
         return "pause"
     if command in {"restart", "reboot", "reload"}:
@@ -300,51 +309,96 @@ def _sceneiq_read_image_controller_operation():
     return "run"
 
 
-def _sceneiq_write_controller_operation(operation):
-    """Persist a controller command without changing the rest of panel.json."""
-    path = _sceneiq_controller_file_path()
-    temporary_path = path + f".controller_{os.getpid()}.tmp"
-    with _SCENEIQ_CONTROLLER_LOCK:
-        try:
-            if os.path.isfile(path):
-                with open(path, "r", encoding="utf-8") as handle:
-                    data = json.load(handle)
-            else:
-                data = {}
-            if not isinstance(data, (dict, list)):
-                data = {}
-            controller = _sceneiq_find_named_object(data, "imageproducercontroller")
-            if controller is None:
-                controller = {"operation": str(operation)}
-                if isinstance(data, dict):
-                    data["imageproducercontroller"] = controller
-                else:
-                    data.append({"imageproducercontroller": controller})
-            else:
-                operation_key = next(
-                    (key for key in controller if _sceneiq_normalize_key(key) == "operation"),
-                    "operation",
-                )
-                controller[operation_key] = str(operation)
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with open(temporary_path, "w", encoding="utf-8", newline="") as handle:
-                json.dump(data, handle, ensure_ascii=False, indent=4)
-                handle.flush()
-                try:
-                    os.fsync(handle.fileno())
-                except OSError:
-                    pass
-            os.replace(temporary_path, path)
-            return True
-        except Exception as exc:
-            try:
-                if os.path.exists(temporary_path):
-                    os.remove(temporary_path)
-            except OSError:
-                pass
-            print(f"⚠️ [IMAGE-CONTROLLER] Could not save controller operation '{operation}': {exc}")
-            return False
+# Process-wide shortcut state. The shortcuts are installed before the producer
+# enters its idle controller loop, so they work even when there is no project.
+_SCENEIQ_HOTKEY_RESTART_EVENT = threading.Event()
+_SCENEIQ_HOTKEY_STOP_EVENT = threading.Event()
+_SCENEIQ_SHUTDOWN_EVENT = threading.Event()
+_SCENEIQ_HOTKEY_HANDLES = []
+_SCENEIQ_HOTKEYS_REGISTERED = False
+_SCENEIQ_HOTKEY_REGISTRATION_LOCK = threading.Lock()
 
+
+def _sceneiq_on_restart_hotkey():
+    if _SCENEIQ_SHUTDOWN_EVENT.is_set():
+        return
+    _SCENEIQ_HOTKEY_RESTART_EVENT.set()
+    print("🔁 [HOTKEY] Ctrl+Shift+F12 received — requesting a fresh Google Flow restart.")
+    try:
+        hud.notify_modal(
+            "Restart requested. The image producer will reopen Google Flow and restart the current workflow.",
+            persistent=False,
+        )
+    except Exception:
+        pass
+
+
+def _sceneiq_on_stop_hotkey():
+    _SCENEIQ_HOTKEY_STOP_EVENT.set()
+    _SCENEIQ_SHUTDOWN_EVENT.set()
+    print("🛑 [HOTKEY] Alt+/ received — stopping the image producer process.")
+    try:
+        hud.notify_modal("Stopping SceneIQ Image Producer...", persistent=False)
+    except Exception:
+        pass
+
+
+def _sceneiq_register_global_hotkeys():
+    """Install global shortcuts once, before waiting for the first project."""
+    global _SCENEIQ_HOTKEYS_REGISTERED
+    with _SCENEIQ_HOTKEY_REGISTRATION_LOCK:
+        if _SCENEIQ_HOTKEYS_REGISTERED:
+            return True
+
+        registered_restart = False
+        registered_stop = False
+        try:
+            restart_handle = keyboard.add_hotkey(
+                "ctrl+shift+f12",
+                _sceneiq_on_restart_hotkey,
+                suppress=False,
+                trigger_on_release=False,
+            )
+            _SCENEIQ_HOTKEY_HANDLES.append(restart_handle)
+            registered_restart = True
+            print("⌨️ [HOTKEY] Ctrl+Shift+F12 registered globally at startup.")
+        except Exception as exc:
+            print(f"❌ [HOTKEY] Ctrl+Shift+F12 registration failed: {exc}")
+
+        # Use the keyboard library's canonical key name first; fall back to the
+        # literal slash spelling for versions that expose that alias instead.
+        stop_error = None
+        for chord in ("alt+slash", "alt+/"):
+            try:
+                stop_handle = keyboard.add_hotkey(
+                    chord,
+                    _sceneiq_on_stop_hotkey,
+                    suppress=False,
+                    trigger_on_release=False,
+                )
+                _SCENEIQ_HOTKEY_HANDLES.append(stop_handle)
+                registered_stop = True
+                print(f"⌨️ [HOTKEY] Alt+/ registered globally as {chord!r}.")
+                break
+            except Exception as exc:
+                stop_error = exc
+        if not registered_stop:
+            print(f"❌ [HOTKEY] Alt+/ registration failed: {stop_error}")
+
+        _SCENEIQ_HOTKEYS_REGISTERED = bool(_SCENEIQ_HOTKEY_HANDLES)
+        return registered_restart and registered_stop
+
+
+def _sceneiq_unregister_global_hotkeys():
+    global _SCENEIQ_HOTKEYS_REGISTERED
+    with _SCENEIQ_HOTKEY_REGISTRATION_LOCK:
+        for handle in list(_SCENEIQ_HOTKEY_HANDLES):
+            try:
+                keyboard.remove_hotkey(handle)
+            except Exception:
+                pass
+        _SCENEIQ_HOTKEY_HANDLES.clear()
+        _SCENEIQ_HOTKEYS_REGISTERED = False
 
 def _sceneiq_get_automation_settings(panel_data):
     automation = _sceneiq_find_named_object(panel_data, "automation")
@@ -420,45 +474,15 @@ class AutomationHUD:
         self.root = tk.Tk()
         self.root.title("Automation HUD")
         
-        # Frameless, always on top, transparent background
-        self.root.overrideredirect(True)
-        self.root.attributes("-topmost", True)
-        self.root.attributes("-transparentcolor", "black")
-        self.root.config(bg="black")
-        
-        # Make window larger to display full text
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        w, h = 600, 120  # Increased height for text visibility
-        x = (sw // 2) - (w // 2)
-        y = (sh // 2) - (h // 2) - 100
-        self.root.geometry(f"{w}x{h}+{x}+{y}")
-        
-        # Main container with black background
-        container = tk.Frame(self.root, bg="black")
-        container.pack(fill="both", expand=True, padx=20, pady=20)
-        
-        # Status message with large, bold font centered
-        self.label_status = tk.Label(container, text="🚀 Initializing...", 
-                                   font=("Segoe UI", 10, "bold"), 
-                                   fg="#00FFCC", bg="black",
-                                   wraplength=560, justify="center")
-        self.label_status.pack(expand=True, fill="both")
-        
-        # Apply Windows styling hooks for click-through
-        try:
-            hwnd = win32gui.GetParent(self.root.winfo_id())
-            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, 
-                                 ex_style | win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT)
-        except:
-            pass  # Fallback if Windows API fails
-        
+        # Keep a hidden Tk root for thread-safe message scheduling. The only
+        # visible UI is the compact 300x300 white modal notification.
+        self.root.withdraw()
+        self.label_status = tk.Label(self.root, text="", font=("Segoe UI", 10))
         self.root.after(100, self._drain_modal_queue)
         self.root.mainloop()
 
     def notify_modal(self, message, persistent=False, duration_ms=4200):
-        """Queue a wide, topmost controller notification without blocking automation."""
+        """Queue a centered 300x300 white notification with a Cancel button."""
         try:
             self._modal_queue.put(("show", str(message), bool(persistent), int(duration_ms)))
         except Exception:
@@ -497,25 +521,64 @@ class AutomationHUD:
                 self._modal_window = window
                 window.overrideredirect(True)
                 window.attributes("-topmost", True)
-                window.configure(bg="#111827")
-                width, height = 900, 92
+                # Compact, portable message dialog. Keep the whole window at
+                # the centre of the active screen with the message centred in
+                # both directions; long messages wrap inside the 300px width.
+                window.configure(bg="#FFFFFF")
+                width, height = 300, 300
                 screen_width = window.winfo_screenwidth()
+                screen_height = window.winfo_screenheight()
                 x = max(0, (screen_width - width) // 2)
-                window.geometry(f"{width}x{height}+{x}+48")
-                outer = tk.Frame(window, bg="#111827", highlightthickness=2, highlightbackground="#22C55E")
+                y = max(0, (screen_height - height) // 2)
+                window.geometry(f"{width}x{height}+{x}+{y}")
+                window.minsize(width, height)
+                window.maxsize(width, height)
+                outer = tk.Frame(
+                    window,
+                    bg="#FFFFFF",
+                    highlightthickness=1,
+                    highlightbackground="#D1D5DB",
+                )
                 outer.pack(fill="both", expand=True)
                 label = tk.Label(
                     outer,
                     text=message,
-                    font=("Segoe UI", 15, "bold"),
-                    fg="#F9FAFB",
-                    bg="#111827",
-                    wraplength=850,
+                    font=("Segoe UI", 10, "normal"),
+                    fg="#111827",
+                    bg="#FFFFFF",
+                    wraplength=250,
                     justify="center",
-                    padx=22,
+                    anchor="center",
+                    padx=18,
                     pady=18,
                 )
-                label.pack(fill="both", expand=True)
+                label.pack(fill="both", expand=True, padx=14, pady=(16, 4))
+
+                button_row = tk.Frame(outer, bg="#FFFFFF")
+                button_row.pack(fill="x", padx=14, pady=(2, 14))
+                cancel_button = tk.Button(
+                    button_row,
+                    text="Cancel",
+                    command=lambda w=window: self._destroy_modal_window(w),
+                    font=("Segoe UI", 9),
+                    fg="#111827",
+                    bg="#F3F4F6",
+                    activeforeground="#111827",
+                    activebackground="#E5E7EB",
+                    relief="flat",
+                    bd=0,
+                    padx=18,
+                    pady=7,
+                    cursor="hand2",
+                )
+                cancel_button.pack()
+                window.bind("<Escape>", lambda _event, w=window: self._destroy_modal_window(w))
+                window.protocol("WM_DELETE_WINDOW", lambda w=window: self._destroy_modal_window(w))
+                window.lift()
+                try:
+                    window.focus_force()
+                except Exception:
+                    pass
                 if not persistent:
                     window.after(
                         max(1200, duration_ms),
@@ -662,7 +725,7 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
       and navigates to GOOGLE_FLOW_URL only when neither is visible
     - A restart never resumes directly at generation completion or image download
     - Alt+/ is the explicit manual stop shortcut
-    - UI waits use bounded polling where appropriate; generation/card readiness continues to be polled
+    - UI waits are bounded; rendering gets a 10-minute ceiling before controlled recovery
     - A single OS/pyautogui call cannot be safely force-killed while it is blocked
     - Failed stages trigger a full automatic restart with fresh panel.json state
     - Before opening Google Flow, detects the current visible page state in Edge
@@ -741,6 +804,13 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
 
     pyautogui.PAUSE = 0.0
     STAGE_TIMEOUT_SECONDS = 40.0
+    # A visible render marker can otherwise hold the workflow forever.
+    # Ten minutes is a generous generation window; exceeding it triggers
+    # the existing controlled workflow restart instead of a silent 20+ min wait.
+    IMAGE_RENDER_TIMEOUT_SECONDS = 600.0
+    # A render marker that reappears after completion should clear quickly.
+    RENDER_RECOVERY_TIMEOUT_SECONDS = 180.0
+    DOWNLOAD_CONFIRMATION_POLL_SECONDS = 1.5
     # Page navigation can take longer than a normal UI control wait. The user
     # stopped the previous run at about 32 seconds, before its 40-second wait
     # could finish, so navigation now receives its own longer bounded window.
@@ -749,9 +819,9 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
     PAGE_STATE_MATCH_SCALES = tuple(round(value, 2) for value in np.arange(0.55, 1.66, 0.05))
     template_match_debug = {}
     restart_event = threading.Event()
-    restart_from_url_event = threading.Event()
-    stop_event = threading.Event()
-    terminate_automation = False
+    restart_from_url_event = _SCENEIQ_HOTKEY_RESTART_EVENT
+    stop_event = _SCENEIQ_HOTKEY_STOP_EVENT
+    terminate_automation = _SCENEIQ_SHUTDOWN_EVENT.is_set()
 
     # YOLO is loaded lazily after prompts have been submitted. The default
     # lightweight COCO model can identify common scene objects (especially people).
@@ -780,6 +850,8 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
     # rendering) and moregf.png (after rendering) may be searched.
     image_render_lock_active = False
     image_render_lock_position = None
+    RENDER_MODAL_CHECK_INTERVAL = 1.25
+    last_render_modal_check_at = 0.0
 
     # A Windows low-level mouse hook blocks physical wheel scrolling while the
     # image-position lock is active. It is installed only for the locked phase.
@@ -1490,6 +1562,9 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
 
     def update_operation_status(message, is_error=False, is_abort=False, is_success=False):
         nonlocal operation_status_message, operation_status_flag, operation_aborted
+        if _SCENEIQ_HOTKEY_STOP_EVENT.is_set() or _SCENEIQ_SHUTDOWN_EVENT.is_set():
+            print(f"ℹ️ [STATUS] Skipping panel.json status write after keyboard stop: {message}")
+            return
         try:
             with open(PANEL_PATH, 'r', encoding='utf-8') as file:
                 current_panel = json.load(file)
@@ -1543,16 +1618,30 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
 
     remote_controller_last_operation = "run"
     remote_controller_last_poll_at = 0.0
+    remote_controller_override = False
 
     def _poll_remote_controller(force=False):
         nonlocal remote_controller_last_operation, remote_controller_last_poll_at
+        nonlocal remote_controller_override
         now = time.monotonic()
         if not force and now - remote_controller_last_poll_at < 1.0:
+            if remote_controller_last_operation == "restart":
+                return "run"
+            if remote_controller_override and remote_controller_last_operation in {"pause", "stop"}:
+                return "run"
             return remote_controller_last_operation
         remote_controller_last_poll_at = now
         command = _sceneiq_read_image_controller_operation()
+        # A keyboard restart overrides a stale remote pause/stop command for
+        # this in-memory workflow session. The controller JSON remains untouched.
+        if remote_controller_override:
+            if command in {"run", "continue"}:
+                remote_controller_override = False
+            elif command in {"pause", "stop"}:
+                command = "run"
         previous = remote_controller_last_operation
-        if command != previous:
+        changed = command != previous
+        if changed:
             remote_controller_last_operation = command
             messages = {
                 "pause": ("Image production has been paused by the remote controller.", True),
@@ -1573,12 +1662,11 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
                 except Exception:
                     pass
             if command == "restart":
-                # Restart is an edge-triggered command, not a permanent state.
-                # Consume it after capturing the command so the internal workflow
-                # supervisor performs one restart instead of restarting forever.
-                _sceneiq_write_controller_operation("run")
-                remote_controller_last_operation = "run"
+                # A restart is edge-triggered in memory. Never acknowledge it by
+                # writing "run" back to controller.json or panel.json.
                 return "restart"
+        if remote_controller_last_operation == "restart":
+            return "run"  # The file remains unchanged; do not restart on every poll.
         return remote_controller_last_operation
 
     def on_restart_shortcut():
@@ -1593,9 +1681,8 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
         nonlocal terminate_automation
         terminate_automation = True
         stop_event.set()
-        _sceneiq_write_controller_operation("stop")
         try:
-            hud.notify_modal("Image production has been stopped by the keyboard shortcut. The remote controller is still listening.", persistent=False)
+            hud.notify_modal("Image production has been stopped by the keyboard shortcut.", persistent=False)
         except Exception:
             pass
         print("🛑 [HOTKEY] Alt+/ pressed — image production stopped; controller remains available.")
@@ -1603,6 +1690,19 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
     def check_for_termination():
         nonlocal last_exit_editing_check_at, exit_editing_check_active
         nonlocal download_ui_sequence_active, terminate_automation
+
+        nonlocal remote_controller_override
+
+        # Process-local keyboard shortcuts always win over controller.json state.
+        if stop_event.is_set() or _SCENEIQ_SHUTDOWN_EVENT.is_set():
+            raise _ManualStop("Manual stop requested with Alt+/")
+        if restart_from_url_event.is_set():
+            restart_from_url_event.clear()
+            remote_controller_override = True
+            raise _WorkflowRestart(
+                "Manual Ctrl+Shift+F12 requested: restart directly from GOOGLE_FLOW_URL",
+                force_url=True,
+            )
 
         remote_operation = _poll_remote_controller()
         if remote_operation == "pause":
@@ -1613,6 +1713,7 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
                     raise _ManualStop("Image production stopped while remotely paused")
                 if restart_from_url_event.is_set():
                     restart_from_url_event.clear()
+                    remote_controller_override = True
                     raise _WorkflowRestart("Manual Ctrl+Shift+F12 requested while paused", force_url=True)
                 if restart_event.is_set():
                     restart_event.clear()
@@ -1827,7 +1928,7 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
         return best
 
     def find_image_with_fallback(
-        image_name, confidence=0.8, region=None, screen_bgr=None
+        image_name, confidence=0.8, region=None, screen_bgr=None, scales=None
     ):
         """Find a GUI template using scale-tolerant OpenCV, then legacy PyAutoGUI.
 
@@ -1866,7 +1967,7 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
             for variant_path in variants:
                 try:
                     match = _opencv_multiscale_template_match(
-                        search_frame, variant_path
+                        search_frame, variant_path, scales=scales
                     )
                     score = float(match[0]) if match else None
                     variant_scores.append((score, os.path.basename(variant_path)))
@@ -2185,8 +2286,14 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
         location, _ = wait_for_image_with_fallback(image_name, timeout_seconds, confidence, region)
         return location
 
-    def find_image(image_name, confidence=0.8, region=None):
-        location, _ = find_image_with_fallback(image_name, confidence, region)
+    def find_image(image_name, confidence=0.8, region=None, screen_bgr=None, scales=None):
+        location, _ = find_image_with_fallback(
+            image_name,
+            confidence,
+            region,
+            screen_bgr=screen_bgr,
+            scales=scales,
+        )
         return location
 
     def configure_startup_nanobanana_16ratio9(hwnd):
@@ -3266,9 +3373,10 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
         50px below that exact match until rendering finishes.
 
         Once the progress image is first found, no other GUI image/template is
-        searched until it disappears. Rendering has NO timeout. After it
-        disappears, the cursor remains locked while the caller searches only
-        for moregf.png.
+        searched until it disappears. Rendering is monitored for at most
+        IMAGE_RENDER_TIMEOUT_SECONDS; exceeding that ceiling triggers controlled
+        workflow recovery. After it disappears, the cursor remains locked while
+        the caller searches only for moregf.png.
         """
         nonlocal image_render_lock_active, image_render_lock_position
 
@@ -3319,12 +3427,23 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
         update_operation_status(f"Rendering in progress for {entry_name}; cursor position locked")
 
         render_started = time.monotonic()
+        render_deadline = render_started + IMAGE_RENDER_TIMEOUT_SECONDS
         last_status_time = render_started
 
-        # IMPORTANT: no 40-second deadline here. Keep waiting for as long as
-        # Google Flow needs. During this phase, only search the progress image.
+        # Do not wait forever for a stale/misdetected progress indicator. Flow
+        # gets a generous ten-minute render window; after that, recover through
+        # the existing supervisor instead of blocking the download stage forever.
         while True:
             check_for_termination()
+            if time.monotonic() >= render_deadline:
+                image_render_lock_active = False
+                image_render_lock_position = None
+                set_image_scroll_lock(False)
+                elapsed = int(time.monotonic() - render_started)
+                raise _WorkflowRestart(
+                    f"Google Flow rendering for {entry_name} did not finish within "
+                    f"{elapsed}s; restarting the workflow rather than waiting indefinitely"
+                )
 
             # The download-confirmation modal is the only additional UI
             # exception allowed during the rendering lock. Its existing
@@ -3353,13 +3472,17 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
             now = time.monotonic()
             if now - last_status_time >= 10:
                 elapsed = int(now - render_started)
-                print(f"⏳ [GF-LOCK] Still rendering... ({elapsed}s elapsed; no timeout)")
+                print(
+                    f"⏳ [GF-LOCK] Still rendering... ({elapsed}s elapsed; "
+                    f"limit={IMAGE_RENDER_TIMEOUT_SECONDS:.0f}s)"
+                )
                 try:
                     hud.print(f"Image generation in progress... ({elapsed}s)", "processing")
                 except Exception:
                     pass
                 update_operation_status(
-                    f"Google Flow image generation in progress for {entry_name} ({elapsed}s); waiting without timeout"
+                    f"Google Flow image generation in progress for {entry_name} "
+                    f"({elapsed}s of {IMAGE_RENDER_TIMEOUT_SECONDS:.0f}s allowed)"
                 )
                 last_status_time = now
 
@@ -3820,7 +3943,7 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
                 # The Google Flow confirmation overlay can appear after the
                 # download-menu click. Handle it during file monitoring too.
                 now = time.monotonic()
-                if now - last_pending_report >= 0.8:
+                if now - last_pending_report >= DOWNLOAD_CONFIRMATION_POLL_SECONDS:
                     try:
                         handle_webdownloadconfirmationmodal()
                     except (_WorkflowRestart, _ManualStop):
@@ -4096,10 +4219,16 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
                         f"re-anchored at ({target_x}, {target_y}) and waiting again."
                     )
                     render_again_started = time.monotonic()
+                    render_again_deadline = render_again_started + RENDER_RECOVERY_TIMEOUT_SECONDS
                     last_render_again_log = render_again_started
 
                     while True:
                         check_for_termination()
+                        if time.monotonic() >= render_again_deadline:
+                            raise _WorkflowRestart(
+                                f"Rendering reappeared while preparing {entry_name} and did not "
+                                f"clear within {RENDER_RECOVERY_TIMEOUT_SECONDS:.0f}s"
+                            )
                         _service_modal_and_restore_locked_cursor()
                         restore_locked_cursor()
                         still_rendering = find_image(
@@ -4117,7 +4246,8 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
                             elapsed_again = int(now_again - render_again_started)
                             print(
                                 f"⏳ [GF-DOWNLOAD-LOCK] Rendering resumed "
-                                f"({elapsed_again}s); waiting without timeout."
+                                f"({elapsed_again}s; recovery limit="
+                                f"{RENDER_RECOVERY_TIMEOUT_SECONDS:.0f}s)."
                             )
                             last_render_again_log = now_again
                         _sleep(0.4)
@@ -4318,9 +4448,20 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
         """
 
         print(f"🔍 [MODAL] Step 1: Checking for webdownloadconfirmationmodal.png...")
+        # Capture once and reuse the same frame for both verification assets.
+        # A short scale list is sufficient for this fixed confirmation dialog
+        # and avoids the expensive 23-scale page matcher on every poll.
+        modal_scales = (0.75, 0.85, 0.95, 1.0, 1.05, 1.15, 1.25, 1.4)
+        try:
+            modal_screen = _capture_screen_bgr()
+        except Exception as capture_error:
+            print(f"⚠️ [MODAL] Shared screenshot unavailable; using fallback: {capture_error}")
+            modal_screen = None
         modal_location = find_image(
             "webdownloadconfirmationmodal.png",
-            confidence=0.7
+            confidence=0.7,
+            screen_bgr=modal_screen,
+            scales=modal_scales,
         )
 
         if not modal_location:
@@ -4344,7 +4485,9 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
 
         modal_appearance_location = find_image(
             "webdownloadmodalappearance.png",
-            confidence=0.7
+            confidence=0.7,
+            screen_bgr=modal_screen,
+            scales=modal_scales,
         )
 
         if not modal_appearance_location:
@@ -4396,14 +4539,24 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
             f"after first click..."
         )
 
+        try:
+            recheck_screen = _capture_screen_bgr()
+        except Exception as capture_error:
+            print(f"⚠️ [MODAL] Recheck screenshot unavailable; using fallback: {capture_error}")
+            recheck_screen = None
+
         recheck_appearance_location = find_image(
             "webdownloadmodalappearance.png",
-            confidence=0.7
+            confidence=0.7,
+            screen_bgr=recheck_screen,
+            scales=modal_scales,
         )
 
         recheck_modal_location = find_image(
             "webdownloadconfirmationmodal.png",
-            confidence=0.7
+            confidence=0.7,
+            screen_bgr=recheck_screen,
+            scales=modal_scales,
         )
 
         if recheck_modal_location and recheck_appearance_location:
@@ -4457,13 +4610,17 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
         return True
 
     def _service_modal_and_restore_locked_cursor():
-        """
-        Poll the download-confirmation modal during the locked phase. If it is
-        visible, the existing handler verifies both modal images and clicks it.
-        Always restore the saved image anchor immediately afterward.
-        """
+        """Check the verified confirmation modal on a short, throttled cadence."""
+        nonlocal last_render_modal_check_at
         if not image_render_lock_active or image_render_lock_position is None:
             return False
+
+        now = time.monotonic()
+        if now - last_render_modal_check_at < RENDER_MODAL_CHECK_INTERVAL:
+            restore_locked_cursor()
+            return False
+        last_render_modal_check_at = now
+
         handled = False
         try:
             handled = handle_webdownloadconfirmationmodal()
@@ -6388,28 +6545,13 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
             raise _WorkflowRestart(error_message) from exc
 
     # ------------------------------------------------------------------
-    # Full-workflow restart supervisor and global keyboard shortcuts
+    # Full-workflow restart supervisor. Global hotkeys were registered by main().
     # ------------------------------------------------------------------
-    # Ctrl+Shift+F12: hard-restart this function by navigating to GOOGLE_FLOW_URL first.
-    # Alt+/: stop the function manually.
-    # Both shortcuts are registered once and remain active across restarts.
     restart_number = 0
     force_url_restart_pending = False
     restart_hotkey = None
     url_restart_hotkey = None
     stop_hotkey = None
-
-    try:
-        url_restart_hotkey = keyboard.add_hotkey("ctrl+shift+f12", on_restart_shortcut, suppress=True)
-        print("⌨️ [HOTKEY] Ctrl+Shift+F12 registered: hard restart from GOOGLE_FLOW_URL.")
-    except Exception as hotkey_error:
-        print(f"⚠️ [HOTKEY] Could not register Ctrl+Shift+F12: {hotkey_error}")
-
-    try:
-        stop_hotkey = keyboard.add_hotkey("alt+/", on_terminate_shortcut, suppress=True)
-        print("⌨️ [HOTKEY] Alt+/ registered: stop the function manually.")
-    except Exception as hotkey_error:
-        print(f"⚠️ [HOTKEY] Could not register Alt+/: {hotkey_error}")
 
     try:
         while True:
@@ -6492,11 +6634,14 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
                     force_url_restart_pending = True
                 operation_status_flag = True
                 operation_aborted = False
-                _set_currently_running(
-                    "sceneiq_google_flow_images_generation_engine()",
-                    status="pending",
-                    operation_status=f"Automatic restart after: {restart_reason}"
-                )
+                if any(token in str(restart_reason).casefold() for token in ("manual ctrl+shift+f12", "remote controller")):
+                    print("🔒 [STATUS] Restart came from a keyboard/controller command; no command result will be written to JSON.")
+                else:
+                    _set_currently_running(
+                        "sceneiq_google_flow_images_generation_engine()",
+                        status="pending",
+                        operation_status=f"Automatic restart after: {restart_reason}"
+                    )
             except _ManualStop as stop_reason:
                 print(f"🛑 [SUPERVISOR] {stop_reason}")
                 stop_event.set()
@@ -6542,12 +6687,7 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
                 restart_event.clear()
                 operation_status_flag = True
                 operation_aborted = False
-                print("🔁 [SUPERVISOR] Ctrl+Shift+F12 arrived at the end of an attempt; starting a fresh attempt instead of accepting the old result.")
-                _set_currently_running(
-                    "sceneiq_google_flow_images_generation_engine()",
-                    status="pending",
-                    operation_status="Manual Ctrl+Shift+F12 restart requested"
-                )
+                print("🔁 [SUPERVISOR] Ctrl+Shift+F12 arrived at the end of an attempt; starting a fresh attempt without writing a controller command to JSON.")
                 continue
 
             final_panel = _load_panel()
@@ -6574,7 +6714,7 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
 
         if stop_event.is_set() or terminate_automation:
             try:
-                update_operation_status("Google Flow operation manually stopped by user (Alt+/); work remains resumable")
+                # Alt+/ is a process-local action. Do not persist it to any controller JSON.
                 hud.show_summary("Stopped at your request.")
             except Exception:
                 pass
@@ -6602,7 +6742,7 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
       and navigates to GOOGLE_FLOW_URL only when neither is visible
     - A restart never resumes directly at generation completion or image download
     - Alt+/ is the explicit manual stop shortcut
-    - Every image/page/generation/download polling wait is bounded to 40 seconds
+    - Standard UI waits are bounded to 40 seconds; rendering is capped at 10 minutes
     - A single OS/pyautogui call cannot be safely force-killed while it is blocked
     - Failed stages trigger a full automatic restart with fresh panel.json state
     - Before opening Google Flow, detects the current visible page state in Edge
@@ -6663,10 +6803,17 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
 
     pyautogui.PAUSE = 0.0
     STAGE_TIMEOUT_SECONDS = 40.0
+    # A visible render marker can otherwise hold the workflow forever.
+    # Ten minutes is a generous generation window; exceeding it triggers
+    # the existing controlled workflow restart instead of a silent 20+ min wait.
+    IMAGE_RENDER_TIMEOUT_SECONDS = 600.0
+    # A render marker that reappears after completion should clear quickly.
+    RENDER_RECOVERY_TIMEOUT_SECONDS = 180.0
+    DOWNLOAD_CONFIRMATION_POLL_SECONDS = 1.5
     restart_event = threading.Event()
-    restart_from_url_event = threading.Event()
-    stop_event = threading.Event()
-    terminate_automation = False
+    restart_from_url_event = _SCENEIQ_HOTKEY_RESTART_EVENT
+    stop_event = _SCENEIQ_HOTKEY_STOP_EVENT
+    terminate_automation = _SCENEIQ_SHUTDOWN_EVENT.is_set()
 
     # The shared polling path checks the exit editing control at most once per
     # second. The re-entry guard is essential because clicking that control
@@ -7393,6 +7540,9 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
 
     def update_operation_status(message, is_error=False, is_abort=False, is_success=False):
         nonlocal operation_status_message, operation_status_flag, operation_aborted
+        if _SCENEIQ_HOTKEY_STOP_EVENT.is_set() or _SCENEIQ_SHUTDOWN_EVENT.is_set():
+            print(f"ℹ️ [STATUS] Skipping panel.json status write after keyboard stop: {message}")
+            return
         try:
             with open(PANEL_PATH, 'r', encoding='utf-8') as file:
                 current_panel = json.load(file)
@@ -7446,16 +7596,30 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
 
     remote_controller_last_operation = "run"
     remote_controller_last_poll_at = 0.0
+    remote_controller_override = False
 
     def _poll_remote_controller(force=False):
         nonlocal remote_controller_last_operation, remote_controller_last_poll_at
+        nonlocal remote_controller_override
         now = time.monotonic()
         if not force and now - remote_controller_last_poll_at < 1.0:
+            if remote_controller_last_operation == "restart":
+                return "run"
+            if remote_controller_override and remote_controller_last_operation in {"pause", "stop"}:
+                return "run"
             return remote_controller_last_operation
         remote_controller_last_poll_at = now
         command = _sceneiq_read_image_controller_operation()
+        # A keyboard restart overrides a stale remote pause/stop command for
+        # this in-memory workflow session. The controller JSON remains untouched.
+        if remote_controller_override:
+            if command in {"run", "continue"}:
+                remote_controller_override = False
+            elif command in {"pause", "stop"}:
+                command = "run"
         previous = remote_controller_last_operation
-        if command != previous:
+        changed = command != previous
+        if changed:
             remote_controller_last_operation = command
             messages = {
                 "pause": ("Image production has been paused by the remote controller.", True),
@@ -7476,12 +7640,11 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
                 except Exception:
                     pass
             if command == "restart":
-                # Restart is an edge-triggered command, not a permanent state.
-                # Consume it after capturing the command so the internal workflow
-                # supervisor performs one restart instead of restarting forever.
-                _sceneiq_write_controller_operation("run")
-                remote_controller_last_operation = "run"
+                # A restart is edge-triggered in memory. Never acknowledge it by
+                # writing "run" back to controller.json or panel.json.
                 return "restart"
+        if remote_controller_last_operation == "restart":
+            return "run"  # The file remains unchanged; do not restart on every poll.
         return remote_controller_last_operation
 
     def on_restart_shortcut():
@@ -7496,9 +7659,8 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
         nonlocal terminate_automation
         terminate_automation = True
         stop_event.set()
-        _sceneiq_write_controller_operation("stop")
         try:
-            hud.notify_modal("Image production has been stopped by the keyboard shortcut. The remote controller is still listening.", persistent=False)
+            hud.notify_modal("Image production has been stopped by the keyboard shortcut.", persistent=False)
         except Exception:
             pass
         print("🛑 [HOTKEY] Alt+/ pressed — image production stopped; controller remains available.")
@@ -7506,6 +7668,19 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
     def check_for_termination():
         nonlocal last_exit_editing_check_at, exit_editing_check_active
         nonlocal download_ui_sequence_active, terminate_automation
+
+        nonlocal remote_controller_override
+
+        # Process-local keyboard shortcuts always win over controller.json state.
+        if stop_event.is_set() or _SCENEIQ_SHUTDOWN_EVENT.is_set():
+            raise _ManualStop("Manual stop requested with Alt+/")
+        if restart_from_url_event.is_set():
+            restart_from_url_event.clear()
+            remote_controller_override = True
+            raise _WorkflowRestart(
+                "Manual Ctrl+Shift+F12 requested: restart directly from GOOGLE_FLOW_URL",
+                force_url=True,
+            )
 
         remote_operation = _poll_remote_controller()
         if remote_operation == "pause":
@@ -7516,6 +7691,7 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
                     raise _ManualStop("Image production stopped while remotely paused")
                 if restart_from_url_event.is_set():
                     restart_from_url_event.clear()
+                    remote_controller_override = True
                     raise _WorkflowRestart("Manual Ctrl+Shift+F12 requested while paused", force_url=True)
                 if restart_event.is_set():
                     restart_event.clear()
@@ -8841,6 +9017,7 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
         )
 
         render_started = time.monotonic()
+        render_deadline = render_started + IMAGE_RENDER_TIMEOUT_SECONDS
         last_status_time = render_started
         missing_samples = 0
         check_interval = max(0.2, min(float(check_interval), 1.0))
@@ -8848,6 +9025,15 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
         while True:
             check_for_termination()
             enforce_window_focus(hwnd)
+            if time.monotonic() >= render_deadline:
+                image_render_lock_active = False
+                image_render_lock_position = None
+                set_image_scroll_lock(False)
+                elapsed = int(time.monotonic() - render_started)
+                raise _WorkflowRestart(
+                    f"Google Flow rendering for {entry_name} did not finish within "
+                    f"{elapsed}s; restarting the workflow rather than waiting indefinitely"
+                )
 
             # Modal checks are throttled independently. A false-positive modal
             # header must never block the render-state transition.
@@ -9361,7 +9547,7 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
                 # The Google Flow confirmation overlay can appear after the
                 # download-menu click. Handle it during file monitoring too.
                 now = time.monotonic()
-                if now - last_pending_report >= 0.8:
+                if now - last_pending_report >= DOWNLOAD_CONFIRMATION_POLL_SECONDS:
                     try:
                         handle_webdownloadconfirmationmodal()
                     except (_WorkflowRestart, _ManualStop):
@@ -9577,10 +9763,16 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
                         f"re-anchored at ({target_x}, {target_y}) and waiting again."
                     )
                     render_again_started = time.monotonic()
+                    render_again_deadline = render_again_started + RENDER_RECOVERY_TIMEOUT_SECONDS
                     last_render_again_log = render_again_started
 
                     while True:
                         check_for_termination()
+                        if time.monotonic() >= render_again_deadline:
+                            raise _WorkflowRestart(
+                                f"Rendering reappeared while preparing {entry_name} and did not "
+                                f"clear within {RENDER_RECOVERY_TIMEOUT_SECONDS:.0f}s"
+                            )
                         _service_modal_and_restore_locked_cursor()
                         restore_locked_cursor()
                         still_rendering = _find_locked_rendering_indicator()
@@ -9596,7 +9788,8 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
                             elapsed_again = int(now_again - render_again_started)
                             print(
                                 f"⏳ [GF-DOWNLOAD-LOCK] Rendering resumed "
-                                f"({elapsed_again}s); waiting without timeout."
+                                f"({elapsed_again}s; recovery limit="
+                                f"{RENDER_RECOVERY_TIMEOUT_SECONDS:.0f}s)."
                             )
                             last_render_again_log = now_again
                         _sleep(0.4)
@@ -10687,28 +10880,13 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
             raise _WorkflowRestart(error_message) from exc
 
     # ------------------------------------------------------------------
-    # Full-workflow restart supervisor and global keyboard shortcuts
+    # Full-workflow restart supervisor. Global hotkeys were registered by main().
     # ------------------------------------------------------------------
-    # Ctrl+Shift+F12: hard-restart this function by navigating to GOOGLE_FLOW_URL first.
-    # Alt+/: stop the function manually.
-    # Both shortcuts are registered once and remain active across restarts.
     restart_number = 0
     force_url_restart_pending = False
     restart_hotkey = None
     url_restart_hotkey = None
     stop_hotkey = None
-
-    try:
-        url_restart_hotkey = keyboard.add_hotkey("ctrl+shift+f12", on_restart_shortcut, suppress=True)
-        print("⌨️ [HOTKEY] Ctrl+Shift+F12 registered: hard restart from GOOGLE_FLOW_URL.")
-    except Exception as hotkey_error:
-        print(f"⚠️ [HOTKEY] Could not register Ctrl+Shift+F12: {hotkey_error}")
-
-    try:
-        stop_hotkey = keyboard.add_hotkey("alt+/", on_terminate_shortcut, suppress=True)
-        print("⌨️ [HOTKEY] Alt+/ registered: stop the function manually.")
-    except Exception as hotkey_error:
-        print(f"⚠️ [HOTKEY] Could not register Alt+/: {hotkey_error}")
 
     try:
         while True:
@@ -10791,11 +10969,14 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
                     force_url_restart_pending = True
                 operation_status_flag = True
                 operation_aborted = False
-                _set_currently_running(
-                    "sceneiq_google_flow_images_generation_engine()",
-                    status="pending",
-                    operation_status=f"Automatic restart after: {restart_reason}"
-                )
+                if any(token in str(restart_reason).casefold() for token in ("manual ctrl+shift+f12", "remote controller")):
+                    print("🔒 [STATUS] Restart came from a keyboard/controller command; no command result will be written to JSON.")
+                else:
+                    _set_currently_running(
+                        "sceneiq_google_flow_images_generation_engine()",
+                        status="pending",
+                        operation_status=f"Automatic restart after: {restart_reason}"
+                    )
             except _ManualStop as stop_reason:
                 print(f"🛑 [SUPERVISOR] {stop_reason}")
                 stop_event.set()
@@ -10833,12 +11014,7 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
                 restart_event.clear()
                 operation_status_flag = True
                 operation_aborted = False
-                print("🔁 [SUPERVISOR] Ctrl+Shift+F12 arrived at the end of an attempt; starting a fresh attempt instead of accepting the old result.")
-                _set_currently_running(
-                    "sceneiq_google_flow_images_generation_engine()",
-                    status="pending",
-                    operation_status="Manual Ctrl+Shift+F12 restart requested"
-                )
+                print("🔁 [SUPERVISOR] Ctrl+Shift+F12 arrived at the end of an attempt; starting a fresh attempt without writing a controller command to JSON.")
                 continue
 
             final_panel = _load_panel()
@@ -10865,39 +11041,65 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
 
         if stop_event.is_set() or terminate_automation:
             try:
-                update_operation_status("Google Flow operation manually stopped by user (Alt+/); work remains resumable")
+                # Alt+/ is a process-local action. Do not persist it to any controller JSON.
                 hud.show_summary("Stopped at your request.")
             except Exception:
                 pass
             print("🛑 [SUPERVISOR] Google Flow function stopped by the user.")
 
-def sceneiq_image_producer_controller_loop(poll_interval=1.0):
-    """Continuously supervise the image engine without terminating the process on stop."""
-    poll_interval = max(0.25, float(poll_interval or 1.0))
+def sceneiq_image_producer_controller_loop(poll_interval=0.5):
+    """Supervise Google Flow using read-only controller.json plus global hotkeys."""
+    poll_interval = max(0.15, float(poll_interval or 0.5))
     last_started_signature = None
     last_operation = _sceneiq_read_image_controller_operation()
-    if last_operation == "pause":
-        hud.notify_modal("Image production has been paused by the remote controller.", persistent=True)
-    elif last_operation == "stop":
-        hud.notify_modal("Image production is stopped by the remote controller. Waiting for continue/run/restart...", persistent=False)
+    keyboard_override = False
 
-    print("📡 [IMAGE-CONTROLLER] Remote image controller is active; polling every second.")
-    while True:
-        operation = _sceneiq_read_image_controller_operation()
+    if os.path.isfile(_sceneiq_controller_file_path()):
+        print(f"📖 [IMAGE-CONTROLLER] Read-only command source: {_sceneiq_controller_file_path()}")
+        print("🔒 [IMAGE-CONTROLLER] controller.json is read-only; no commands are written back.")
+    else:
+        print(
+            "ℹ️ [IMAGE-CONTROLLER] controller.json was not found; running in keyboard-only mode. "
+            f"Expected path: {_sceneiq_controller_file_path()}"
+        )
+
+    print("📡 [IMAGE-CONTROLLER] Listening for global hotkeys and read-only controller.json changes.")
+    if last_operation == "pause":
+        hud.notify_modal("Image production is paused by controller.json. Change operation to run or continue to resume.", persistent=True)
+    elif last_operation == "stop":
+        hud.notify_modal("Image production is stopped by controller.json. Change operation to run or continue to resume.", persistent=True)
+    while not _SCENEIQ_SHUTDOWN_EVENT.is_set():
+        # A keyboard restart can override a read-only pause/stop state without
+        # editing the controller file. The override lasts until the file returns
+        # to run/continue or the process is closed.
+        if _SCENEIQ_HOTKEY_RESTART_EVENT.is_set() and not keyboard_override:
+            _SCENEIQ_HOTKEY_RESTART_EVENT.clear()
+            keyboard_override = True
+            last_started_signature = None
+            print("🔁 [IMAGE-CONTROLLER] Keyboard restart accepted; ignoring read-only pause/stop until controller.json resumes.")
+
+        file_operation = _sceneiq_read_image_controller_operation()
+        if keyboard_override and file_operation in {"pause", "stop"}:
+            operation = "run"
+        else:
+            operation = file_operation
+            if file_operation in {"run", "continue"}:
+                keyboard_override = False
+
         if operation != last_operation:
             previous = last_operation
             last_operation = operation
             notice = None
             persistent = False
             if operation == "pause":
-                notice, persistent = "Image production has been paused by the remote controller.", True
+                notice, persistent = "Image production has been paused by controller.json.", True
             elif operation == "stop":
-                notice = "Image production has been stopped by the remote controller. Waiting for a new command..."
+                notice = "Image production is stopped by controller.json. Change its operation to run or continue to resume."
             elif operation == "restart":
-                notice = "Image production has been restarted by the remote controller. Restarting the workflow..."
+                notice = "A restart command was detected in controller.json. Restarting the workflow once."
                 last_started_signature = None
             elif operation == "continue":
-                notice = "Image production has resumed by the remote controller."
+                notice = "Image production has resumed by controller.json."
                 if previous == "stop":
                     last_started_signature = None
             elif operation == "run" and previous in {"pause", "stop"}:
@@ -10908,16 +11110,15 @@ def sceneiq_image_producer_controller_loop(poll_interval=1.0):
                 hud.notify_modal(notice, persistent=persistent)
                 print(f"📡 [IMAGE-CONTROLLER] operation changed: {previous} -> {operation}")
 
-        # Pause/stop are image-only commands. The video service has no dependency
-        # on this state and continues its own queue/workers independently.
         if operation in {"pause", "stop"}:
-            time.sleep(poll_interval)
+            _SCENEIQ_SHUTDOWN_EVENT.wait(poll_interval)
             continue
 
         try:
             with open(PANEL_PATH, "r", encoding="utf-8") as panel_file:
                 panel_data = json.load(panel_file)
-        except Exception:
+        except Exception as panel_error:
+            print(f"⚠️ [IMAGE-CONTROLLER] Could not read panel.json: {panel_error}")
             panel_data = {}
 
         metadata = _sceneiq_get_project_metadata(panel_data)
@@ -10927,7 +11128,7 @@ def sceneiq_image_producer_controller_loop(poll_interval=1.0):
         has_script = isinstance(script, (dict, list)) and bool(script)
         if engine_name != "googleflow" or not title or not has_script:
             last_started_signature = None
-            time.sleep(poll_interval)
+            _SCENEIQ_SHUTDOWN_EVENT.wait(poll_interval)
             continue
 
         try:
@@ -10945,18 +11146,20 @@ def sceneiq_image_producer_controller_loop(poll_interval=1.0):
             signature_payload = f"{title}|{metadata.get('project_category')}|{repr(script)}"
         signature = hashlib.sha256(signature_payload.encode("utf-8", errors="replace")).hexdigest()
 
-        # A new project, explicit restart, or continue after a stopped worker may
-        # launch one image engine. Never start single and multiple operators together.
-        should_start = signature != last_started_signature
+        should_start = signature != last_started_signature or operation == "restart"
         if should_start:
             engine_function, selected_metadata = _sceneiq_select_image_engine_operation(panel_data)
             if engine_function is None:
                 print(f"ℹ️ [IMAGE-CONTROLLER] Image engine is not Google Flow: {selected_metadata.get('engine')!r}; waiting.")
                 last_started_signature = signature
-                time.sleep(poll_interval)
+                _SCENEIQ_SHUTDOWN_EVENT.wait(poll_interval)
                 continue
             operator_text = selected_metadata.get("engineoperator") or "Single operator"
-            engine_label = "multiple operator" if engine_function is sceneiq_google_flow_images_generation_engine_mp_opertion else "single operator"
+            engine_label = (
+                "multiple operator"
+                if engine_function is sceneiq_google_flow_images_generation_engine_mp_opertion
+                else "single operator"
+            )
             print(
                 f"🎬 [IMAGE-CONTROLLER] Launching {engine_label} for '{title}' "
                 f"(automation.engineoperator={operator_text!r})."
@@ -10971,23 +11174,49 @@ def sceneiq_image_producer_controller_loop(poll_interval=1.0):
                 print(f"❌ [IMAGE-CONTROLLER] Image engine ended unexpectedly: {engine_error}")
                 traceback.print_exc()
                 last_started_signature = None
-                time.sleep(2.0)
-            # Read the new controller value immediately after an engine exits.
+                _SCENEIQ_SHUTDOWN_EVENT.wait(2.0)
             last_operation = _sceneiq_read_image_controller_operation()
         else:
-            time.sleep(poll_interval)
+            _SCENEIQ_SHUTDOWN_EVENT.wait(poll_interval)
 
+    print("🛑 [IMAGE-CONTROLLER] Shutdown requested; controller loop has exited.")
 
 def main():
-    """Run only the Google Flow image-producer controller in this process."""
+    """Run only the standalone Google Flow image producer."""
     print("\n" + "=" * 72)
     print("🚀 SCENEIQ IMAGE PRODUCER — STANDALONE")
     print("=" * 72)
-    print(f"📄 PANEL_PATH: {PANEL_PATH}")
-    print(f"📄 READY_SCRIPT: {READY_SCRIPT}")
+    print(f"📄 PANEL_PATH (project input): {PANEL_PATH}")
+    print(f"📖 CONTROLLER_PATH (read-only): {CONTROLLER_PATH}")
+    print(f"📄 READY_SCRIPT (completed project output): {READY_SCRIPT}")
     print(f"📁 IMAGES_PATH: {IMAGES_PATH}")
     print("ℹ️ Video production is not started or imported by this script.")
-    sceneiq_image_producer_controller_loop()
+
+    _SCENEIQ_HOTKEY_STOP_EVENT.clear()
+    _SCENEIQ_SHUTDOWN_EVENT.clear()
+    _SCENEIQ_HOTKEY_RESTART_EVENT.clear()
+    _sceneiq_register_global_hotkeys()
+
+    hud.notify_modal(
+        "SceneIQ Image Producer is running.\n\n"
+        "Waiting for a Google Flow project.\n\n"
+        "Ctrl + Shift + F12: restart the workflow\n"
+        "Alt + /: stop the producer\n\n"
+        "Press Cancel to close this message.",
+        persistent=True,
+    )
+
+    try:
+        sceneiq_image_producer_controller_loop()
+    except KeyboardInterrupt:
+        print("🛑 [IMAGE-CONTROLLER] KeyboardInterrupt received; shutting down.")
+    finally:
+        hud.close_modal()
+        _sceneiq_unregister_global_hotkeys()
+        try:
+            hud.cleanup()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
