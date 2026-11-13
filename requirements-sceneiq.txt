@@ -1,0 +1,15 @@
+# SceneIQ third-party packages. Windows standard-library modules such as msvcrt are not pip packages.
+Pillow
+ctranslate2
+faster-whisper
+imageio-ffmpeg
+moviepy
+numpy
+proglog
+psutil
+opencv-python
+keyboard
+PyAutoGUI
+pyperclip
+ultralytics
+pywin32

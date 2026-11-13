@@ -1,0 +1,122 @@
+Starting SCiQ / SceneIQ setup and validation.
+Previous video producer backed up as sceneiqvideoproduction_20261113_222757.py.
+Installed video producer: sceneiqvideoproduction.py
+Previous image producer backed up as sceniqimageproduction_20261113_222758.py.
+Installed image producer: sceniqimageproduction.py
+Application component refreshed: sceniq_setup.pyw
+Application component refreshed: sceniq_updater.pyw
+Application component refreshed: Start_SceneIQ.vbs
+Application component refreshed: Update_SceneIQ.vbs
+Application component refreshed: Install_SceneIQ.vbs
+Application component refreshed: SceneIQ_Launcher.bat
+Application component refreshed: SceneIQ_Launcher_NoConsole.vbs
+Application component refreshed: requirements-sceneiq.txt
+Application component refreshed: README_SceneIQ_Desktop_Installer.txt
+Application component refreshed: SceneIQ.ico
+Application component refreshed: SCiQ_Brand.png
+Application component refreshed: SceneIQ_AppIcon.png
+Application component refreshed: Robot(1).gif
+Application component refreshed: Mapping for machine learning(1).gif
+Preserving existing panel.json.
+Preserving existing ready_script.json.
+Python runtime detected: 3.10.11
+pip is available in the selected Python installation.
+Found 68 unique import/module-symbol checks across both producer scripts.
+Missing import paths: 0. Missing distributions: 0.
+SETUP FAILED: SetupFailure: One or more SceneIQ dependencies still fail import verification. fcntl: ModuleNotFoundError: No module named 'fcntl'
+Traceback (most recent call last):
+  File "C:\Users\PC\Downloads\sceneIQ installer\sceniq_setup.pyw", line 645, in _setup_background
+    raise SetupFailure("One or more SceneIQ dependencies still fail import verification. " + detail)
+SetupFailure: One or more SceneIQ dependencies still fail import verification. fcntl: ModuleNotFoundError: No module named 'fcntl'
+
+Starting SCiQ / SceneIQ setup and validation.
+Previous video producer backed up as sceneiqvideoproduction_20261113_222824.py.
+Installed video producer: sceneiqvideoproduction.py
+Previous image producer backed up as sceniqimageproduction_20261113_222824.py.
+Installed image producer: sceniqimageproduction.py
+Application component refreshed: sceniq_setup.pyw
+Application component refreshed: sceniq_updater.pyw
+Application component refreshed: Start_SceneIQ.vbs
+Application component refreshed: Update_SceneIQ.vbs
+Application component refreshed: Install_SceneIQ.vbs
+Application component refreshed: SceneIQ_Launcher.bat
+Application component refreshed: SceneIQ_Launcher_NoConsole.vbs
+Application component refreshed: requirements-sceneiq.txt
+Application component refreshed: README_SceneIQ_Desktop_Installer.txt
+Application component refreshed: SceneIQ.ico
+Application component refreshed: SCiQ_Brand.png
+Application component refreshed: SceneIQ_AppIcon.png
+Application component refreshed: Robot(1).gif
+Application component refreshed: Mapping for machine learning(1).gif
+Preserving existing panel.json.
+Preserving existing ready_script.json.
+Python runtime detected: 3.10.11
+pip is available in the selected Python installation.
+Found 68 unique import/module-symbol checks across both producer scripts.
+Missing import paths: 0. Missing distributions: 0.
+SETUP FAILED: SetupFailure: One or more SceneIQ dependencies still fail import verification. fcntl: ModuleNotFoundError: No module named 'fcntl'
+Traceback (most recent call last):
+  File "C:\Users\PC\Downloads\sceneIQ installer\sceniq_setup.pyw", line 645, in _setup_background
+    raise SetupFailure("One or more SceneIQ dependencies still fail import verification. " + detail)
+SetupFailure: One or more SceneIQ dependencies still fail import verification. fcntl: ModuleNotFoundError: No module named 'fcntl'
+
+Starting SCiQ / SceneIQ setup and validation.
+Previous video producer backed up as sceneiqvideoproduction_20261113_222857.py.
+Installed video producer: sceneiqvideoproduction.py
+Previous image producer backed up as sceniqimageproduction_20261113_222857.py.
+Installed image producer: sceniqimageproduction.py
+Application component refreshed: sceniq_setup.pyw
+Application component refreshed: sceniq_updater.pyw
+Application component refreshed: Start_SceneIQ.vbs
+Application component refreshed: Update_SceneIQ.vbs
+Application component refreshed: Install_SceneIQ.vbs
+Application component refreshed: SceneIQ_Launcher.bat
+Application component refreshed: SceneIQ_Launcher_NoConsole.vbs
+Application component refreshed: requirements-sceneiq.txt
+Application component refreshed: README_SceneIQ_Desktop_Installer.txt
+Application component refreshed: SceneIQ.ico
+Application component refreshed: SCiQ_Brand.png
+Application component refreshed: SceneIQ_AppIcon.png
+Application component refreshed: Robot(1).gif
+Application component refreshed: Mapping for machine learning(1).gif
+Preserving existing panel.json.
+Preserving existing ready_script.json.
+Python runtime detected: 3.10.11
+pip is available in the selected Python installation.
+Found 68 unique import/module-symbol checks across both producer scripts.
+Missing import paths: 0. Missing distributions: 0.
+SETUP FAILED: SetupFailure: One or more SceneIQ dependencies still fail import verification. fcntl: ModuleNotFoundError: No module named 'fcntl'
+Traceback (most recent call last):
+  File "C:\Users\PC\Downloads\sceneIQ installer\sceniq_setup.pyw", line 645, in _setup_background
+    raise SetupFailure("One or more SceneIQ dependencies still fail import verification. " + detail)
+SetupFailure: One or more SceneIQ dependencies still fail import verification. fcntl: ModuleNotFoundError: No module named 'fcntl'
+
+Starting SCiQ / SceneIQ setup and validation.
+Previous video producer backed up as sceneiqvideoproduction_20261113_223753.py.
+Installed video producer: sceneiqvideoproduction.py
+Previous image producer backed up as sceniqimageproduction_20261113_223754.py.
+Installed image producer: sceniqimageproduction.py
+Application component refreshed: sceniq_setup.pyw
+Application component refreshed: sceniq_updater.pyw
+Application component refreshed: Start_SceneIQ.vbs
+Application component refreshed: Update_SceneIQ.vbs
+Application component refreshed: Install_SceneIQ.vbs
+Application component refreshed: SceneIQ_Launcher.bat
+Application component refreshed: SceneIQ_Launcher_NoConsole.vbs
+Application component refreshed: requirements-sceneiq.txt
+Application component refreshed: README_SceneIQ_Desktop_Installer.txt
+Application component refreshed: SceneIQ.ico
+Application component refreshed: SCiQ_Brand.png
+Application component refreshed: SceneIQ_AppIcon.png
+Application component refreshed: Robot(1).gif
+Application component refreshed: Mapping for machine learning(1).gif
+Preserving existing panel.json.
+Preserving existing ready_script.json.
+Python runtime detected: 3.10.11
+pip is available in the selected Python installation.
+Found 67 unique import/module-symbol checks across both producer scripts.
+Skipped imports that belong to the other operating system: fcntl. These are guarded OS-specific code paths, not missing dependencies.
+Missing import paths: 0. Missing distributions: 0.
+Verified all four SceneIQ shortcuts: two on Desktop and two in Start Menu > Programs > SceneIQ.
+All SceneIQ imports and script syntax checks passed.
+SceneIQ setup completed successfully.
