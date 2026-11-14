@@ -4951,7 +4951,7 @@ def _video_producer_dashboard_window(manifest_path, ready_path):
     grid_shell = tk.Frame(outer, bg=background)
     grid_shell.pack(fill="both", expand=True)
     canvas = tk.Canvas(grid_shell, bg=background, highlightthickness=0, borderwidth=0)
-    vertical_scroll = ttk.Scrollbar(grid_shell, orient="vertical", command=canvas.yview)
+    vertical_scroll = ttk.Scrollbar(grid_shell, orient="vertical", command=canvas.yview, style="SceneIQ.Vertical.TScrollbar")
     canvas.configure(yscrollcommand=vertical_scroll.set)
     vertical_scroll.pack(side="right", fill="y")
     canvas.pack(side="left", fill="both", expand=True)
@@ -7749,6 +7749,7 @@ class SceneIQApp:
         self.manifest_path = self.session["manifest_path"]
         self.shutdown_path = self.session["shutdown_path"]
         self.heartbeat_path = self.session["heartbeat_path"]
+        self.home_gif_frames = self._load_home_gif_frames()
 
         self.root.title("SCiQ — SceneIQ Image & Video Studio")
         self.root.configure(bg=self.BG)
@@ -7766,7 +7767,7 @@ class SceneIQApp:
         self._build_interface()
         self.root.after(180, lambda: _sceneiq_apply_dark_titlebar(self.root, self.BG, self.TEXT))
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.bind("<Control-Return>", lambda _event: self.start_service())
+        # Production is deliberately started only by the visible START PRODUCTION button.
         self.root.bind("<Control-l>", lambda _event: self.show_console())
 
         sys.stdout = _SceneIQTextStream(self, self.stdout_original)
@@ -7774,17 +7775,17 @@ class SceneIQApp:
 
         self.root.after(80, self._process_events)
         self.root.after(120, self._activate_window)
-        self.root.after(350, self.start_service)
+        # Dashboard polling may refresh queue data, but it never starts a producer.
         self.root.after(500, self._refresh_dashboard)
-        self.log("SceneIQ desktop interface initialized.", "INFO")
+        self.log("SceneIQ desktop interface initialized. Production has not been started.", "INFO")
         self.log(f"Ready script: {READY_SCRIPT}", "INFO")
         self.log(f"Project images: {IMAGES_PATH}", "INFO")
-        self.set_status("STARTING VIDEO PRODUCER", self.CYAN)
+        self.set_status("SCENEIQ READY • PRODUCTION NOT STARTED", self.CYAN)
         self._set_visual_state(
-            "ready", "SCENEIQ IS READY",
-            "The desktop control center is open. The video service will start separately and load eligible projects without blocking this window.",
+            "ready", "READY WHEN YOU ARE",
+            "SceneIQ is at Home. Open Production to view the video queue, then click Start Production when you are ready. No video production starts automatically.",
             self.CYAN,
-            detail="Window and production service use separate processes.",
+            detail="Video and image production start only from their respective command buttons.",
         )
 
     def _create_desktop_session(self):
@@ -7816,8 +7817,8 @@ class SceneIQApp:
                 "created_at": now,
                 "last_updated_at": now,
                 "session_dir": session_dir,
-                "service_status": "Starting desktop window",
-                "message": "SceneIQ desktop control center is ready. The producer service will start after the window is displayed.",
+                "service_status": "Ready — production not started",
+                "message": "SceneIQ is idle on the Home view. Click Start Production when you are ready to begin the video queue.",
                 "shutdown_path": shutdown_path,
                 "heartbeat_path": heartbeat_path,
                 "jobs": [],
@@ -7863,6 +7864,167 @@ class SceneIQApp:
         y = max(0, (screen_height - height) // 2)
         self.root.geometry(f"{width}x{height}+{x}+{y}")
 
+    def _load_home_gif_frames(self):
+        """Select one random GIF from the AI cover folder and prepare animation frames."""
+        import random
+        from pathlib import Path
+        try:
+            from PIL import Image, ImageSequence, ImageTk
+        except Exception:
+            return []
+
+        cover_dir = Path(r"C:\xampp\htdocs\AI automation\ai cover")
+        try:
+            candidates = [
+                path for path in cover_dir.rglob("*")
+                if path.is_file() and path.suffix.casefold() == ".gif"
+            ] if cover_dir.is_dir() else []
+        except Exception:
+            candidates = []
+        if not candidates:
+            self.home_gif_path = None
+            return []
+
+        chosen = random.choice(candidates)
+        self.home_gif_path = str(chosen)
+        prepared = []
+        try:
+            resampling = getattr(Image, "Resampling", Image)
+            resample_filter = getattr(resampling, "LANCZOS", getattr(Image, "LANCZOS", 1))
+            with Image.open(chosen) as opened:
+                frame_total = max(1, int(getattr(opened, "n_frames", 1)))
+                stride = max(1, (frame_total + 47) // 48)
+                for index, frame in enumerate(ImageSequence.Iterator(opened)):
+                    if index % stride:
+                        continue
+                    rendered = frame.convert("RGBA")
+                    rendered.thumbnail((430, 255), resample_filter)
+                    duration = int(frame.info.get("duration", opened.info.get("duration", 120)) or 120)
+                    prepared.append((ImageTk.PhotoImage(rendered), max(60, min(duration, 1200))))
+                if not prepared:
+                    opened.seek(0)
+                    rendered = opened.convert("RGBA")
+                    rendered.thumbnail((430, 255), resample_filter)
+                    prepared.append((ImageTk.PhotoImage(rendered), 120))
+        except Exception:
+            self.home_gif_path = None
+            return []
+        return prepared
+
+    def _create_home_view(self, parent, producer_title, description):
+        """Create an animated, in-window home page using the selected cover GIF."""
+        import tkinter as tk
+
+        view = tk.Frame(parent, bg=self.PANEL, bd=0, relief="flat", highlightthickness=0)
+        view.place(relx=0, rely=0, relwidth=1, relheight=1)
+        header = tk.Frame(view, bg=self.PANEL_ALT, bd=0, highlightthickness=0)
+        header.pack(fill="x")
+        tk.Label(
+            header, text=f"SCENEIQ  /  {producer_title.upper()} HOME",
+            bg=self.PANEL_ALT, fg=self.CYAN, font=("Consolas", 9, "bold"), anchor="w",
+        ).pack(side="left", padx=18, pady=13)
+        tk.Label(
+            header, text="●  HOME", bg=self.PANEL_ALT, fg=self.GREEN,
+            font=("Consolas", 8, "bold"),
+        ).pack(side="right", padx=18)
+
+        content = tk.Frame(view, bg=self.PANEL, bd=0, highlightthickness=0)
+        content.pack(fill="both", expand=True, padx=22, pady=16)
+        tk.Label(
+            content, text="SCENEIQ", bg=self.PANEL, fg=self.TEXT,
+            font=("Segoe UI", 25, "bold"),
+        ).pack(pady=(4, 1))
+        tk.Label(
+            content, text=producer_title.upper(), bg=self.PANEL, fg=self.CYAN,
+            font=("Consolas", 10, "bold"),
+        ).pack(pady=(0, 9))
+
+        art_shell = tk.Frame(
+            content, bg=self.PANEL_ALT, highlightthickness=1,
+            highlightbackground=self.BORDER, bd=0,
+        )
+        art_shell.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        art_canvas = tk.Canvas(
+            art_shell, bg=self.PANEL_ALT, highlightthickness=0, bd=0,
+            height=300, relief="flat",
+        )
+        art_canvas.pack(fill="both", expand=True, padx=8, pady=8)
+        if self.home_gif_frames:
+            self._animate_home_gif(art_canvas, 0)
+        else:
+            self._draw_home_robot(art_canvas)
+
+        tk.Label(
+            content, text=description, bg=self.PANEL, fg=self.MUTED,
+            font=("Segoe UI", 9), justify="center", wraplength=680,
+        ).pack(fill="x", pady=(3, 8))
+        tk.Label(
+            content, text="AUTOMATION CONTROL CENTER  •  READY",
+            bg=self.PANEL, fg=self.GREEN, font=("Consolas", 8, "bold"),
+        ).pack(pady=(0, 3))
+        return view
+
+    def _animate_home_gif(self, canvas, frame_index=0):
+        """Display the next frame of the selected GIF without creating another window."""
+        if self._closing or not self.home_gif_frames:
+            return
+        try:
+            if not canvas.winfo_exists():
+                return
+            frame, duration = self.home_gif_frames[frame_index % len(self.home_gif_frames)]
+            canvas.delete("sceneiq-home-art")
+            width = max(1, canvas.winfo_width())
+            height = max(1, canvas.winfo_height())
+            canvas.create_image(
+                width // 2, height // 2, image=frame,
+                anchor="center", tags="sceneiq-home-art",
+            )
+            canvas.image = frame
+            canvas.after(duration, lambda: self._animate_home_gif(canvas, frame_index + 1))
+        except Exception:
+            return
+
+    def _draw_home_robot(self, canvas):
+        """Draw the existing SCiQ robot motif when no cover GIF is available."""
+        try:
+            canvas.delete("all")
+            canvas.create_oval(175, 28, 325, 178, outline="#145A7A", width=3)
+            canvas.create_oval(193, 32, 307, 140, fill="#DCEBFA", outline="#38C8F4", width=3)
+            canvas.create_oval(205, 50, 295, 119, fill="#071426", outline="#2FCBF7", width=2)
+            canvas.create_arc(220, 68, 245, 91, start=195, extent=150, style="arc", outline="#55E1FF", width=4)
+            canvas.create_arc(255, 68, 280, 91, start=195, extent=150, style="arc", outline="#55E1FF", width=4)
+            canvas.create_oval(181, 72, 202, 105, fill="#123D5E", outline="#39D3F8", width=2)
+            canvas.create_oval(298, 72, 319, 105, fill="#123D5E", outline="#39D3F8", width=2)
+            canvas.create_line(250, 139, 250, 164, fill="#9EBBD0", width=7)
+            canvas.create_oval(210, 153, 290, 205, fill="#D8E8F6", outline="#37CFF4", width=3)
+            canvas.create_text(250, 179, text="SCiQ", fill="#087DAB", font=("Segoe UI", 11, "bold"))
+        except Exception:
+            pass
+
+    def show_video_home(self):
+        """Return the Video Producer tab to its default animated home view."""
+        if self._closing or not hasattr(self, "video_home_view"):
+            return
+        self._cancel_console_timer()
+        self._cancel_worker_console_refresh()
+        self.console_view_active = False
+        self.show_main_page("video")
+        self.video_home_view.tkraise()
+
+    def show_image_home(self):
+        """Return the Image Producer tab to its default animated home view."""
+        if self._closing or not hasattr(self, "image_home_view"):
+            return
+        self.show_main_page("image")
+        self.image_home_view.tkraise()
+
+    def show_production_view(self):
+        """Open the video production grid without starting the production service."""
+        if self._closing:
+            return
+        self.show_main_page("video")
+        self.show_status_view()
+
     def _activate_window(self):
         """Ensure the normal desktop window is visible and not iconified."""
         if self._closing:
@@ -7891,10 +8053,64 @@ class SceneIQApp:
             bordercolor="#1B2A3F", lightcolor=self.CYAN,
             darkcolor=self.CYAN,
         )
+        # All application scrollbars share the same dark SCiQ palette.  The
+        # clam theme honors troughcolor/background on Windows, avoiding the
+        # white native scrollbar trough in both orientations.
         style.configure(
             "SceneIQ.Vertical.TScrollbar",
-            background=self.PANEL_ALT, troughcolor=self.BG,
-            bordercolor=self.BG, arrowcolor=self.MUTED,
+            background=self.PANEL_ALT,
+            troughcolor=self.BG,
+            bordercolor=self.BG,
+            arrowcolor=self.CYAN,
+            darkcolor=self.PANEL_ALT,
+            lightcolor=self.PANEL_ALT,
+            relief="flat",
+            borderwidth=0,
+            gripcount=0,
+            arrowsize=12,
+        )
+        style.map(
+            "SceneIQ.Vertical.TScrollbar",
+            background=[("pressed", self.CYAN), ("active", "#244B66")],
+            arrowcolor=[("pressed", self.BG), ("active", self.CYAN)],
+        )
+        style.configure(
+            "SceneIQ.Horizontal.TScrollbar",
+            background=self.PANEL_ALT,
+            troughcolor=self.BG,
+            bordercolor=self.BG,
+            arrowcolor=self.CYAN,
+            darkcolor=self.PANEL_ALT,
+            lightcolor=self.PANEL_ALT,
+            relief="flat",
+            borderwidth=0,
+            gripcount=0,
+            arrowsize=12,
+        )
+        style.map(
+            "SceneIQ.Horizontal.TScrollbar",
+            background=[("pressed", self.CYAN), ("active", "#244B66")],
+            arrowcolor=[("pressed", self.BG), ("active", self.CYAN)],
+        )
+        # Keep the generic ttk style themed too, for any existing ttk widgets
+        # that use the default TScrollbar name.
+        style.configure(
+            "TScrollbar",
+            background=self.PANEL_ALT,
+            troughcolor=self.BG,
+            bordercolor=self.BG,
+            arrowcolor=self.CYAN,
+            darkcolor=self.PANEL_ALT,
+            lightcolor=self.PANEL_ALT,
+            relief="flat",
+            borderwidth=0,
+            gripcount=0,
+            arrowsize=12,
+        )
+        style.map(
+            "TScrollbar",
+            background=[("pressed", self.CYAN), ("active", "#244B66")],
+            arrowcolor=[("pressed", self.BG), ("active", self.CYAN)],
         )
         self.root.option_add("*Font", "{Segoe UI} 10")
         self.root.option_add("*Button.highlightThickness", 0)
@@ -7984,26 +8200,71 @@ class SceneIQApp:
         body = tk.Frame(outer, bg=self.BG)
         body.pack(fill="both", expand=True)
 
-        # Compact fixed command deck. No separate vertical scroll area is needed;
-        # controls are sized to fit the regular application window.
+        # Scrollable command deck. The full controls stay in this same side
+        # panel, while a themed vertical rail exposes every command on shorter
+        # windows and at higher display scaling.
         side_shell = tk.Frame(
             body, bg=self.PANEL, width=250, bd=0, relief="flat", highlightthickness=0,
         )
         side_shell.pack(side="left", fill="y", padx=(0, 14))
         side_shell.pack_propagate(False)
-        side = tk.Frame(side_shell, bg=self.PANEL, bd=0, relief="flat", highlightthickness=0)
-        side.pack(fill="both", expand=True)
+        self.command_deck_canvas = tk.Canvas(
+            side_shell, bg=self.PANEL, bd=0, highlightthickness=0,
+            relief="flat", borderwidth=0,
+        )
+        self.command_deck_scrollbar = ttk.Scrollbar(
+            side_shell, orient="vertical",
+            command=self.command_deck_canvas.yview,
+            style="SceneIQ.Vertical.TScrollbar",
+        )
+        self.command_deck_canvas.configure(
+            yscrollcommand=self.command_deck_scrollbar.set,
+        )
+        self.command_deck_scrollbar.pack(side="right", fill="y")
+        self.command_deck_canvas.pack(side="left", fill="both", expand=True)
+        side = tk.Frame(
+            self.command_deck_canvas, bg=self.PANEL, bd=0,
+            relief="flat", highlightthickness=0,
+        )
+        self.command_deck_window = self.command_deck_canvas.create_window(
+            (0, 0), window=side, anchor="nw",
+        )
+
+        def _refresh_command_deck_scrollregion(_event=None):
+            try:
+                self.command_deck_canvas.configure(
+                    scrollregion=self.command_deck_canvas.bbox("all")
+                )
+            except Exception:
+                pass
+
+        def _resize_command_deck_content(event):
+            try:
+                self.command_deck_canvas.itemconfigure(
+                    self.command_deck_window, width=max(1, int(event.width))
+                )
+                _refresh_command_deck_scrollregion()
+            except Exception:
+                pass
+
+        side.bind("<Configure>", _refresh_command_deck_scrollregion, add="+")
+        self.command_deck_canvas.bind("<Configure>", _resize_command_deck_content, add="+")
         tk.Label(side, text="COMMAND DECK", bg=self.PANEL, fg=self.CYAN,
                  font=("Consolas", 10, "bold")).pack(anchor="w", padx=16, pady=(8, 5))
 
         # Edit the READY_SCRIPT queue directly in this same desktop window.
-        # This button intentionally sits immediately above Start Producer.
+        # Production navigation and Start Production sit directly below Configuration.
         self.configuration_button = self._make_button(
             side, "⚙   CONFIGURATION", self.show_configuration_editor, self.BLUE
         )
         self.configuration_button.pack(fill="x", padx=14, pady=2)
 
-        self.start_button = self._make_button(side, "▶   START PRODUCER", self.start_service, self.GREEN)
+        self.production_button = self._make_button(
+            side, "▦   PRODUCTION", self.show_production_view, self.CYAN
+        )
+        self.production_button.pack(fill="x", padx=14, pady=2)
+
+        self.start_button = self._make_button(side, "▶   START PRODUCTION", self.start_service, self.GREEN)
         self.start_button.pack(fill="x", padx=14, pady=2)
         self.pause_all_button = self._make_button(side, "Ⅱ   PAUSE ALL VIDEOS", self.pause_all, self.AMBER, state="disabled")
         self.pause_all_button.pack(fill="x", padx=14, pady=2)
@@ -8048,6 +8309,11 @@ class SceneIQApp:
         workspace = tk.Frame(body, bg=self.BG)
         workspace.pack(side="left", fill="both", expand=True)
         self.workspace = workspace
+        self.video_home_view = self._create_home_view(
+            workspace,
+            "Video Producer",
+            "Welcome to SceneIQ. Open Production to view the video queue, then click START PRODUCTION to begin. Nothing renders until you start it.",
+        )
 
         self.status_view = tk.Frame(workspace, bg=self.PANEL, bd=0, relief="flat", highlightthickness=0)
         self.status_view.place(relx=0, rely=0, relwidth=1, relheight=1)
@@ -8059,25 +8325,32 @@ class SceneIQApp:
         ).pack(side="left", padx=18, pady=13)
         self.hero_state_chip = tk.Label(
             hero_top, text="● READY", bg=self.PANEL_ALT, fg=self.CYAN,
-            font=("Consolas", 9, "bold"),
+            font=("Consolas", 8, "bold"),
         )
-        self.hero_state_chip.pack(side="right", padx=18)
+        self.hero_state_chip.pack(side="right", padx=(8, 16))
+        self.video_production_back_button = tk.Button(
+            hero_top, text="←  BACK TO HOME", command=self.show_video_home,
+            bg="#202C3E", fg=self.TEXT, activebackground="#2B3B52",
+            activeforeground=self.TEXT, relief="flat", bd=0,
+            padx=12, pady=7, font=("Segoe UI", 8, "bold"), cursor="hand2",
+        )
+        self.video_production_back_button.pack(side="right", padx=(4, 8), pady=5)
 
         hero_content = tk.Frame(self.status_view, bg=self.PANEL)
-        hero_content.pack(fill="x", padx=22, pady=(16, 10))
+        hero_content.pack(fill="x", padx=16, pady=(5, 3))
         hero_content.grid_columnconfigure(0, weight=6)
         hero_content.grid_columnconfigure(1, weight=4)
         info = tk.Frame(hero_content, bg=self.PANEL)
         info.grid(row=0, column=0, sticky="nsew", padx=(0, 15))
         self.hero_title = tk.Label(
             info, text="READY FOR VIDEO PRODUCTION", bg=self.PANEL, fg=self.TEXT,
-            font=("Segoe UI", 20, "bold"), anchor="w", justify="left", wraplength=470,
+            font=("Segoe UI", 14, "bold"), anchor="w", justify="left", wraplength=470,
         )
         self.hero_title.pack(fill="x", pady=(0, 7))
         self.hero_description = tk.Label(
             info,
-            text="SceneIQ will load the ready-script queue and render videos in an isolated background service. This window stays available for controls and monitoring.",
-            bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 9), anchor="w",
+            text="Open Production to view the queue. Start Production begins rendering when you are ready.",
+            bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 8), anchor="w",
             justify="left", wraplength=490,
         )
         self.hero_description.pack(fill="x")
@@ -8085,18 +8358,18 @@ class SceneIQApp:
         summary = tk.Frame(hero_content, bg=self.PANEL_ALT, bd=0, relief="flat", highlightthickness=0)
         summary.grid(row=0, column=1, sticky="nsew")
         tk.Label(summary, text="PRODUCTION SNAPSHOT", bg=self.PANEL_ALT, fg=self.CYAN,
-                 font=("Consolas", 8, "bold")).pack(anchor="w", padx=14, pady=(11, 5))
+                 font=("Consolas", 7, "bold")).pack(anchor="w", padx=12, pady=(6, 2))
         self.hero_queue_value = tk.Label(summary, text="0 PROJECTS", bg=self.PANEL_ALT, fg=self.TEXT,
                                          font=("Segoe UI", 15, "bold"))
-        self.hero_queue_value.pack(anchor="w", padx=14)
+        self.hero_queue_value.pack(anchor="w", padx=12)
         self.hero_detail = tk.Label(
             summary, text="Waiting for the service to report its queue.", bg=self.PANEL_ALT, fg=self.MUTED,
             font=("Segoe UI", 8), anchor="w", justify="left", wraplength=270,
         )
-        self.hero_detail.pack(fill="x", padx=14, pady=(4, 11))
+        self.hero_detail.pack(fill="x", padx=12, pady=(1, 5))
 
         queue_header = tk.Frame(self.status_view, bg=self.PANEL)
-        queue_header.pack(fill="x", padx=22, pady=(3, 7))
+        queue_header.pack(fill="x", padx=16, pady=(1, 3))
         tk.Label(queue_header, text="VIDEO PROJECTS", bg=self.PANEL, fg=self.CYAN,
                  font=("Consolas", 9, "bold")).pack(side="left")
         self.queue_count_label = tk.Label(queue_header, text="0 PROJECTS", bg=self.PANEL, fg=self.MUTED,
@@ -8104,12 +8377,11 @@ class SceneIQApp:
         self.queue_count_label.pack(side="right")
 
         grid_shell = tk.Frame(self.status_view, bg=self.PANEL)
-        grid_shell.pack(fill="both", expand=True, padx=15, pady=(0, 14))
+        grid_shell.pack(fill="both", expand=True, padx=11, pady=(0, 8))
         self.canvas = tk.Canvas(grid_shell, bg=self.PANEL, highlightthickness=0, borderwidth=0)
-        vertical_scroll = tk.Scrollbar(
+        vertical_scroll = ttk.Scrollbar(
             grid_shell, orient="vertical", command=self.canvas.yview,
-            bg="#142238", troughcolor="#091321", activebackground=self.CYAN,
-            relief="flat", bd=0, highlightthickness=0, width=10,
+            style="SceneIQ.Vertical.TScrollbar",
         )
         self.canvas.configure(yscrollcommand=vertical_scroll.set)
         self.canvas.pack(side="left", fill="both", expand=True)
@@ -8156,7 +8428,7 @@ class SceneIQApp:
         self.root.bind_all("<Button-5>", self._on_video_mousewheel_linux, add="+")
         self.empty_label = tk.Label(
             self.grid_frame,
-            text="The desktop window is active. Video projects will appear here when the producer reads ready_script.json.",
+            text="No video production has started. Click START PRODUCTION when you are ready to process the queue.",
             bg=self.PANEL, fg=self.MUTED, font=("Segoe UI", 10), padx=18, pady=22,
             justify="left", wraplength=730,
         )
@@ -8175,7 +8447,13 @@ class SceneIQApp:
             console_header, text="SESSION OUTPUT", bg=self.PANEL_ALT,
             fg=self.MUTED, font=("Consolas", 8),
         )
-        self.console_countdown_label.pack(side="right", padx=15)
+        self.console_countdown_label.pack(side="right", padx=12)
+        tk.Button(
+            console_header, text="←  BACK TO HOME", command=self.show_video_home,
+            bg="#202C3E", fg=self.TEXT, activebackground="#2B3B52",
+            relief="flat", bd=0, padx=12, pady=7,
+            font=("Segoe UI", 8, "bold"), cursor="hand2",
+        ).pack(side="right", padx=(4, 8), pady=5)
         log_wrap = tk.Frame(self.console_view, bg=self.PANEL)
         log_wrap.pack(fill="both", expand=True, padx=12, pady=12)
         self.log_text = tk.Text(
@@ -8183,10 +8461,9 @@ class SceneIQApp:
             selectbackground="#1A4861", relief="flat", bd=0, highlightthickness=0,
             wrap="word", font=("Consolas", 9), padx=13, pady=12, state="disabled",
         )
-        scrollbar = tk.Scrollbar(
-            log_wrap, command=self.log_text.yview,
-            bg="#142238", troughcolor="#091321", activebackground=self.CYAN,
-            relief="flat", bd=0, highlightthickness=0, width=10,
+        scrollbar = ttk.Scrollbar(
+            log_wrap, orient="vertical", command=self.log_text.yview,
+            style="SceneIQ.Vertical.TScrollbar",
         )
         def _sync_video_console_scrollbar(first, last):
             try:
@@ -8238,6 +8515,12 @@ class SceneIQApp:
             bg=self.PANEL_ALT, fg=self.CYAN,
             font=("Consolas", 10, "bold"), anchor="w",
         ).pack(side="left", padx=18, pady=13)
+        tk.Button(
+            config_header, text="←  BACK TO HOME", command=self.show_video_home,
+            bg="#202C3E", fg=self.TEXT, activebackground="#2B3B52",
+            relief="flat", bd=0, padx=12, pady=7,
+            font=("Segoe UI", 8, "bold"), cursor="hand2",
+        ).pack(side="right", padx=10, pady=5)
         tk.Label(
             self.configuration_view,
             text=(
@@ -8262,18 +8545,15 @@ class SceneIQApp:
             font=("Consolas", 9), padx=13, pady=12, bd=0,
             highlightthickness=0, tabs=(36,),
         )
-        config_y_scroll = tk.Scrollbar(
-            config_editor_shell, command=self.configuration_text.yview,
-            bg="#142238", troughcolor="#091321",
-            activebackground=self.CYAN, relief="flat", bd=0,
-            highlightthickness=0, width=10,
+        config_y_scroll = ttk.Scrollbar(
+            config_editor_shell, orient="vertical",
+            command=self.configuration_text.yview,
+            style="SceneIQ.Vertical.TScrollbar",
         )
-        config_x_scroll = tk.Scrollbar(
+        config_x_scroll = ttk.Scrollbar(
             config_editor_shell, orient="horizontal",
             command=self.configuration_text.xview,
-            bg="#142238", troughcolor="#091321",
-            activebackground=self.CYAN, relief="flat", bd=0,
-            highlightthickness=0, width=10,
+            style="SceneIQ.Horizontal.TScrollbar",
         )
         self.configuration_text.configure(
             yscrollcommand=config_y_scroll.set,
@@ -8307,9 +8587,9 @@ class SceneIQApp:
                  font=("Consolas", 8)).pack(side="left")
         tk.Label(footer, text="VISIBLE WINDOW  /  ISOLATED RENDER SERVICE", bg=self.BG, fg=self.MUTED,
                  font=("Consolas", 8)).pack(side="right")
-        self.show_status_view()
         self._build_image_interface(self.image_tab)
         self.show_main_page("video")
+        self.show_video_home()
 
     def show_main_page(self, page):
         """Instantly raise a pre-built producer page without rebuilding widgets."""
@@ -8427,6 +8707,11 @@ class SceneIQApp:
 
         self.image_workspace = tk.Frame(body, bg=self.BG, bd=0, relief="flat", highlightthickness=0)
         self.image_workspace.pack(side="left", fill="both", expand=True)
+        self.image_home_view = self._create_home_view(
+            self.image_workspace,
+            "Image Producer",
+            "Welcome to the Image Producer. Start Image Production from the command deck when you are ready. The worker stays idle until you click the button.",
+        )
 
         # One console only, always inside the Image Producer tab.
         self.image_console_view = tk.Frame(
@@ -8444,7 +8729,13 @@ class SceneIQApp:
             console_header, text="WAITING FOR START", bg=self.PANEL_ALT,
             fg=self.MUTED, font=("Consolas", 8),
         )
-        self.image_console_state.pack(side="right", padx=15)
+        self.image_console_state.pack(side="right", padx=12)
+        tk.Button(
+            console_header, text="←  BACK TO HOME", command=self.show_image_home,
+            bg="#202C3E", fg=self.TEXT, activebackground="#2B3B52",
+            relief="flat", bd=0, padx=12, pady=7,
+            font=("Segoe UI", 8, "bold"), cursor="hand2",
+        ).pack(side="right", padx=(4, 8), pady=5)
 
         log_wrap = tk.Frame(self.image_console_view, bg=self.PANEL)
         log_wrap.pack(fill="both", expand=True, padx=11, pady=11)
@@ -8454,11 +8745,9 @@ class SceneIQApp:
             relief="flat", wrap="word", font=("Consolas", 9),
             padx=12, pady=11, state="disabled",
         )
-        image_log_scroll = tk.Scrollbar(
-            log_wrap, command=self.image_console_text.yview,
-            bg="#142238", troughcolor="#091321",
-            activebackground=self.CYAN, relief="flat", bd=0,
-            highlightthickness=0, width=10,
+        image_log_scroll = ttk.Scrollbar(
+            log_wrap, orient="vertical", command=self.image_console_text.yview,
+            style="SceneIQ.Vertical.TScrollbar",
         )
         def _sync_image_console_scrollbar(first, last):
             try:
@@ -8505,6 +8794,12 @@ class SceneIQApp:
             bg=self.PANEL_ALT, fg=self.CYAN,
             font=("Consolas", 9, "bold"), anchor="w",
         ).pack(side="left", padx=15, pady=12)
+        tk.Button(
+            image_config_header, text="←  BACK TO HOME", command=self.show_image_home,
+            bg="#202C3E", fg=self.TEXT, activebackground="#2B3B52",
+            relief="flat", bd=0, padx=12, pady=7,
+            font=("Segoe UI", 8, "bold"), cursor="hand2",
+        ).pack(side="right", padx=10, pady=5)
         tk.Label(
             self.image_configuration_view,
             text=(
@@ -8528,16 +8823,15 @@ class SceneIQApp:
             relief="flat", bd=0, highlightthickness=0, wrap="none", undo=True,
             font=("Consolas", 9), padx=12, pady=10,
         )
-        image_config_y = tk.Scrollbar(
-            image_editor_shell, command=self.image_configuration_text.yview,
-            bg="#142238", troughcolor="#091321", relief="flat",
-            bd=0, highlightthickness=0, width=10,
+        image_config_y = ttk.Scrollbar(
+            image_editor_shell, orient="vertical",
+            command=self.image_configuration_text.yview,
+            style="SceneIQ.Vertical.TScrollbar",
         )
-        image_config_x = tk.Scrollbar(
+        image_config_x = ttk.Scrollbar(
             image_editor_shell, orient="horizontal",
             command=self.image_configuration_text.xview,
-            bg="#142238", troughcolor="#091321", relief="flat",
-            bd=0, highlightthickness=0, width=10,
+            style="SceneIQ.Horizontal.TScrollbar",
         )
         self.image_configuration_text.configure(
             yscrollcommand=image_config_y.set, xscrollcommand=image_config_x.set
@@ -8568,10 +8862,11 @@ class SceneIQApp:
             "SceneIQ Image Producer is ready. Press START IMAGE PRODUCTION to launch the isolated Google Flow worker.\n"
             "Image-only shortcuts: Ctrl+Shift+F12 = restart workflow | Alt+/ = stop image production.\n"
         )
-        self.show_image_console()
+        self.show_image_home()
 
     def show_image_console(self):
         if hasattr(self, "image_console_view"):
+            self.show_main_page("image")
             self.image_console_view.tkraise()
 
     def show_image_configuration_editor(self):
@@ -8595,6 +8890,7 @@ class SceneIQApp:
         self.image_configuration_text.delete("1.0", "end")
         self.image_configuration_text.insert("1.0", formatted)
         self.image_configuration_feedback.configure(text=feedback, fg=color)
+        self.show_main_page("image")
         self.image_configuration_view.tkraise()
 
     def save_image_configuration_editor(self):
@@ -8617,7 +8913,7 @@ class SceneIQApp:
                 fg=self.GREEN,
             )
             self._append_image_log("✅ Image Producer panel.json configuration saved.\n")
-            self.show_image_console()
+            self.show_image_home()
         except Exception as exc:
             self.image_configuration_feedback.configure(
                 text=f"Could not save panel.json: {type(exc).__name__}: {exc}",
@@ -8625,7 +8921,7 @@ class SceneIQApp:
             )
 
     def cancel_image_configuration_editor(self):
-        self.show_image_console()
+        self.show_image_home()
 
     def _append_image_log(self, value):
         if not value or self._closing:
@@ -8909,8 +9205,11 @@ class SceneIQApp:
             return False
 
     def _scroll_target_under_pointer(self, event):
-        # Only the project list needs wheel scrolling. The compact command deck
-        # is fixed in place and has no redundant vertical scroll rail.
+        # Route the mouse wheel to the canvas physically under the pointer.
+        # Both the project grid and the command deck can scroll independently.
+        command_deck_canvas = getattr(self, "command_deck_canvas", None)
+        if self._pointer_is_over_canvas(event, command_deck_canvas):
+            return command_deck_canvas
         if self._pointer_is_over_canvas(event, getattr(self, "canvas", None)):
             return self.canvas
         return None
@@ -8996,7 +9295,7 @@ class SceneIQApp:
             self.hero_detail.configure(text=self._safe_gui_text(detail or description))
 
     def show_status_view(self):
-        """Return to the normal dashboard with cards, stages and progress bars."""
+        """Show the live video-production grid with cards, stages and progress bars."""
         self._cancel_console_timer()
         self._cancel_worker_console_refresh()
         self.console_view_active = False
@@ -9041,6 +9340,7 @@ class SceneIQApp:
         if current_json:
             self.configuration_text.insert("1.0", current_json)
         self.configuration_feedback.configure(text=feedback, fg=feedback_color)
+        self.show_main_page("video")
         self.configuration_view.tkraise()
         self.configuration_text.focus_set()
         self.log(f"Opened ready-script configuration editor: {self.configuration_file_path}", "INFO")
@@ -9100,7 +9400,7 @@ class SceneIQApp:
             fg=self.GREEN,
         )
         self.set_status("READY SCRIPT CONFIGURATION SAVED", self.GREEN)
-        self.show_status_view()
+        self.show_video_home()
 
     def cancel_configuration_editor(self):
         """Discard editor contents and return without touching READY_SCRIPT."""
@@ -9108,7 +9408,7 @@ class SceneIQApp:
             "Configuration editing cancelled. ready_script.json was left unchanged.",
             "INFO",
         )
-        self.show_status_view()
+        self.show_video_home()
 
     def show_console(self):
         """Show the combined desktop/service console from the command deck."""
@@ -9126,6 +9426,7 @@ class SceneIQApp:
         self.console_countdown_label.configure(text="SESSION OUTPUT • USE BACK TO RETURN")
         self.console_copy_button.configure(text="COPY ALL CONSOLE RESULTS")
         self._replace_console_text("".join(self.log_history) or "SceneIQ console is empty.", follow_end=True)
+        self.show_main_page("video")
         self.console_view.tkraise()
 
     def show_video_console(self, worker_id):
@@ -9414,6 +9715,8 @@ class SceneIQApp:
         import time
         if self._closing or self._closing_requested:
             return
+        self.show_main_page("video")
+        self.show_status_view()
         if self._service_starting or (self.process is not None and self.process.poll() is None):
             self.log("The video producer service is already running or starting; duplicate launch ignored.", "INFO")
             return
@@ -9477,7 +9780,7 @@ class SceneIQApp:
             self.set_status("PRODUCER START FAILED", self.RED)
             self._set_visual_state(
                 "aborted", "VIDEO SERVICE COULD NOT START",
-                "The desktop window is still available. Open the console for the process launch error, correct it, then press Start Producer again.",
+                "The desktop window is still available. Open the console for the process launch error, correct it, then press Start Production again.",
                 self.RED, detail="The GUI and video service are separate; the window remains active.",
             )
             return
@@ -9573,7 +9876,7 @@ class SceneIQApp:
             self.set_status("VIDEO SERVICE STOPPED", self.AMBER)
             self._set_visual_state(
                 "stopped", "VIDEO PRODUCER IS STOPPED",
-                "The video service has exited, but the desktop control center remains open. Press Start Producer to launch it again.",
+                "The video service has exited, but the desktop control center remains open. Press Start Production to launch it again.",
                 self.AMBER, detail="The window is still active and can restart the service.",
             )
             self.log("Video producer service exited normally.", "INFO")
@@ -9905,11 +10208,62 @@ class SceneIQApp:
                     "WARNING",
                 )
 
-    def show_video_issue(self, worker_id):
-        """Show one video's compact, borderless failure dialog and copyable result."""
-        import os
+    def _build_video_issue_view(self):
+        """Create the issue/report reader inside the existing video workspace."""
         import tkinter as tk
-        from tkinter import ttk
+
+        self.issue_view = tk.Frame(
+            self.workspace, bg=self.PANEL, bd=0, relief="flat", highlightthickness=0,
+        )
+        self.issue_view.place(relx=0, rely=0, relwidth=1, relheight=1)
+        header = tk.Frame(self.issue_view, bg="#3B1E2A", bd=0, highlightthickness=0)
+        header.pack(fill="x")
+        title_group = tk.Frame(header, bg="#3B1E2A")
+        title_group.pack(side="left", fill="x", expand=True, padx=14, pady=9)
+        tk.Label(
+            title_group, text="VIDEO PRODUCTION ISSUE / REPORT",
+            bg="#3B1E2A", fg="#FF9AAA", font=("Segoe UI", 10, "bold"), anchor="w",
+        ).pack(anchor="w")
+        self.issue_subtitle_label = tk.Label(
+            title_group, text="", bg="#3B1E2A", fg=self.TEXT,
+            font=("Segoe UI", 8), justify="left", wraplength=500, anchor="w",
+        )
+        self.issue_subtitle_label.pack(anchor="w", pady=(2, 0))
+        tk.Button(
+            header, text="←  BACK TO HOME", command=self.show_video_home,
+            bg="#202C3E", fg=self.TEXT, activebackground="#2B3B52",
+            relief="flat", bd=0, padx=12, pady=7,
+            font=("Segoe UI", 8, "bold"), cursor="hand2",
+        ).pack(side="right", padx=10, pady=8)
+
+        body = tk.Frame(self.issue_view, bg=self.PANEL, padx=10, pady=9)
+        body.pack(fill="both", expand=True)
+        self.issue_text = tk.Text(
+            body, bg="#070C15", fg="#DCE7F5", insertbackground=self.CYAN,
+            selectbackground="#1A4861", wrap="word", relief="flat",
+            font=("Segoe UI", 9), padx=10, pady=9, bd=0, highlightthickness=0,
+            state="disabled",
+        )
+        scroll = ttk.Scrollbar(
+            body, orient="vertical", command=self.issue_text.yview,
+            style="SceneIQ.Vertical.TScrollbar",
+        )
+        self.issue_text.configure(yscrollcommand=scroll.set)
+        self.issue_text.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        footer = tk.Frame(self.issue_view, bg=self.PANEL_ALT, padx=10, pady=8)
+        footer.pack(fill="x")
+        self.issue_copy_button = tk.Button(
+            footer, text="COPY ISSUE RESULT", command=lambda: self._copy_text(self.issue_details),
+            bg="#172E49", fg=self.CYAN, activebackground="#214767",
+            relief="flat", bd=0, padx=13, pady=8,
+            font=("Segoe UI", 8, "bold"), cursor="hand2",
+        )
+        self.issue_copy_button.pack(side="left")
+
+    def show_video_issue(self, worker_id):
+        """Show one video's issue report in the existing SceneIQ workspace."""
+        import os
 
         job = next((item for item in self.latest_jobs if str(item.get("worker_id")) == str(worker_id)), {})
         status = self.latest_statuses.get(str(worker_id), {})
@@ -9945,76 +10299,18 @@ class SceneIQApp:
             f"TRACEBACK / DIAGNOSTICS\n{traceback_text or 'No Python traceback was produced for this issue.'}\n\n"
             f"LATEST WORKER LOG\n{log_tail or 'No worker log content is available.'}"
         )
-
-        window = tk.Toplevel(self.root)
-        # Remove the operating-system title bar and its X button. Every close
-        # action is presented in the dialog footer instead.
-        window.overrideredirect(True)
-        window.geometry("560x390")
-        window.minsize(500, 340)
-        window.configure(bg=self.BORDER)
-        window.transient(self.root)
-        shell = tk.Frame(window, bg=self.BG, highlightthickness=1, highlightbackground=self.BORDER)
-        shell.pack(fill="both", expand=True, padx=1, pady=1)
-        header = tk.Frame(shell, bg="#3B1E2A", padx=14, pady=10)
-        header.pack(fill="x")
-        tk.Label(header, text="VIDEO PRODUCTION ISSUE", bg="#3B1E2A", fg="#FF9AAA",
-                 font=("Segoe UI", 11, "bold")).pack(anchor="w")
-        tk.Label(header, text=self._safe_gui_text(f"{title}  •  {stage}"), bg="#3B1E2A", fg=self.TEXT,
-                 font=("Segoe UI", 9), justify="left", wraplength=510).pack(anchor="w", pady=(3, 0))
-        body = tk.Frame(shell, bg=self.BG, padx=10, pady=9)
-        body.pack(fill="both", expand=True)
-        text = tk.Text(body, bg="#070C15", fg="#DCE7F5", insertbackground=self.CYAN,
-                       selectbackground="#1A4861", wrap="word", relief="flat",
-                       font=("Segoe UI", 9), padx=9, pady=8)
-        scroll = ttk.Scrollbar(body, orient="vertical", command=text.yview)
-        text.configure(yscrollcommand=scroll.set)
-        scroll.pack(side="right", fill="y")
-        text.pack(side="left", fill="both", expand=True)
-        text.insert("1.0", details)
-        text.configure(state="disabled")
-        footer = tk.Frame(shell, bg=self.BG, padx=10, pady=9)
-        footer.pack(fill="x")
-        tk.Button(
-            footer, text="COPY ISSUE RESULT", command=lambda: self._copy_text(details),
-            bg="#172E49", fg=self.CYAN, activebackground="#214767",
-            relief="flat", bd=0, padx=13, pady=8,
-            font=("Segoe UI", 8, "bold"), cursor="hand2",
-        ).pack(side="left")
-
-        def close_issue_dialog():
-            try:
-                window.grab_release()
-            except Exception:
-                pass
-            try:
-                window.destroy()
-            except Exception:
-                pass
-
-        tk.Button(
-            footer, text="CLOSE", command=close_issue_dialog,
-            bg="#202C3E", fg=self.TEXT, activebackground="#2B3B52",
-            relief="flat", bd=0, padx=18, pady=8,
-            font=("Segoe UI", 8, "bold"), cursor="hand2",
-        ).pack(side="right")
-        window.bind("<Escape>", lambda _event: close_issue_dialog())
-        try:
-            window.update_idletasks()
-            parent_x = self.root.winfo_rootx()
-            parent_y = self.root.winfo_rooty()
-            parent_w = max(1, self.root.winfo_width())
-            parent_h = max(1, self.root.winfo_height())
-            dialog_w = max(560, window.winfo_reqwidth())
-            dialog_h = max(390, window.winfo_reqheight())
-            dialog_x = parent_x + max(0, (parent_w - dialog_w) // 2)
-            dialog_y = parent_y + max(0, (parent_h - dialog_h) // 2)
-            window.geometry(f"{dialog_w}x{dialog_h}+{dialog_x}+{dialog_y}")
-            window.grab_set()
-            window.lift()
-            window.focus_force()
-        except Exception:
-            pass
+        if not hasattr(self, "issue_view"):
+            self._build_video_issue_view()
+        self.issue_details = details
+        self.issue_subtitle_label.configure(
+            text=self._safe_gui_text(f"{title}  •  {stage}")
+        )
+        self.issue_text.configure(state="normal")
+        self.issue_text.delete("1.0", "end")
+        self.issue_text.insert("1.0", details)
+        self.issue_text.configure(state="disabled")
+        self.show_main_page("video")
+        self.issue_view.tkraise()
 
     def _copy_text(self, value):
         try:
@@ -10127,7 +10423,7 @@ class SceneIQApp:
                 else:
                     self.set_status("PRODUCER SERVICE ACTIVE", self.CYAN)
                     self._set_visual_state("ready", "WAITING FOR VIDEO WORK",
-                        "The service is active and watching for new projects or individual restart commands.",
+                        "Service active • waiting for the next video job.",
                         self.CYAN, detail=summary)
             elif not self._closing_requested and not self.startup_failed:
                 self.set_status("VIDEO PRODUCER READY", self.CYAN)
@@ -10161,157 +10457,31 @@ class SceneIQApp:
         except Exception as exc:
             self.log(f"Could not write graceful shutdown request: {exc}", "WARNING")
 
-    def _confirm_exit_with_custom_modal(self):
-        """Show a centered, movable, borderless exit prompt with only Cancel and Exit."""
-        import tkinter as tk
-
-        video_active = self.process is not None and self.process.poll() is None
-        image_active = self.image_process is not None and self.image_process.poll() is None
-        if video_active and image_active:
-            message = (
-                "Video Producer and Image Producer are currently active. Exiting SCiQ "
-                "will request both isolated workers to stop safely. Completed video "
-                "renders, generated images and saved workflow progress will be retained."
-            )
-        elif video_active:
-            message = (
-                "Video production is currently active. Exiting SCiQ will request the "
-                "Video Producer to stop at its next safe checkpoint. Completed renders "
-                "and saved progress will be retained."
-            )
-        elif image_active:
-            message = (
-                "Image production is currently active. Exiting SCiQ will request the "
-                "Image Producer to stop safely. Generated images and saved workflow "
-                "progress will be retained."
-            )
-        else:
-            message = "Are you sure you want to exit SCiQ? No production workers are currently running."
-
-        result = {"confirmed": False}
-        window = tk.Toplevel(self.root)
-        window.overrideredirect(True)
-        window.configure(bg=self.BG)
-        window.transient(self.root)
-        window.resizable(False, False)
-
-        shell = tk.Frame(
-            window, bg=self.BG, bd=0, relief="flat",
-            highlightthickness=1, highlightbackground="#15577A",
-        )
-        shell.pack(fill="both", expand=True)
-
-        header = tk.Frame(shell, bg="#0B1C31", bd=0, highlightthickness=0, padx=18, pady=13)
-        header.pack(fill="x")
-        tk.Label(
-            header, text="SCiQ  /  EXIT CONFIRMATION", bg="#0B1C31", fg=self.CYAN,
-            font=("Segoe UI", 11, "bold"), anchor="w",
-        ).pack(fill="x")
-
-        body = tk.Frame(shell, bg=self.BG, padx=20, pady=18)
-        body.pack(fill="both", expand=True)
-        tk.Label(
-            body, text=message, bg=self.BG, fg=self.TEXT,
-            font=("Segoe UI", 9), justify="left", anchor="w", wraplength=500,
-        ).pack(fill="both", expand=True)
-
-        footer = tk.Frame(shell, bg=self.BG, padx=18, pady=14)
-        footer.pack(fill="x")
-
-        def finish(confirmed=False):
-            result["confirmed"] = bool(confirmed)
-            try:
-                window.grab_release()
-            except Exception:
-                pass
-            try:
-                window.destroy()
-            except Exception:
-                pass
-
-        # Exactly two actions: Cancel at the left edge, Exit at the right edge.
-        tk.Button(
-            footer, text="CANCEL", command=lambda: finish(False),
-            bg="#172A40", fg=self.TEXT, activebackground="#24425F",
-            activeforeground=self.TEXT, relief="flat", bd=0,
-            padx=25, pady=10, font=("Segoe UI", 9, "bold"), cursor="hand2",
-        ).pack(side="left")
-        tk.Button(
-            footer, text="EXIT SCiQ", command=lambda: finish(True),
-            bg="#542A39", fg="#FFE8ED", activebackground="#74384C",
-            activeforeground="#FFFFFF", relief="flat", bd=0,
-            padx=25, pady=10, font=("Segoe UI", 9, "bold"), cursor="hand2",
-        ).pack(side="right")
-
-        # The title strip is the drag handle, keeping this borderless modal portable.
-        drag_state = {"x": 0, "y": 0, "left": 0, "top": 0}
-        def drag_start(event):
-            drag_state["x"] = int(event.x_root)
-            drag_state["y"] = int(event.y_root)
-            drag_state["left"] = int(window.winfo_x())
-            drag_state["top"] = int(window.winfo_y())
-        def drag_move(event):
-            dx = int(event.x_root) - drag_state["x"]
-            dy = int(event.y_root) - drag_state["y"]
-            window.geometry(f"+{drag_state['left'] + dx}+{drag_state['top'] + dy}")
-        header.bind("<ButtonPress-1>", drag_start)
-        header.bind("<B1-Motion>", drag_move)
-
-        window.bind("<Escape>", lambda _event: finish(False))
-        window.bind("<Return>", lambda _event: finish(True))
-        window.update_idletasks()
-        width = max(540, int(window.winfo_reqwidth()))
-        height = max(220, int(window.winfo_reqheight()))
-        # Center against the physical screen, not the parent window's coordinates.
-        screen_width = int(window.winfo_screenwidth())
-        screen_height = int(window.winfo_screenheight())
-        x = max(0, (screen_width - width) // 2)
-        y = max(0, (screen_height - height) // 2)
-        window.geometry(f"{width}x{height}+{x}+{y}")
-        try:
-            window.grab_set()
-            window.lift()
-            window.focus_force()
-        except Exception:
-            pass
-        self.root.wait_window(window)
-        return result["confirmed"]
-
     def on_close(self):
+        """Exit immediately without a confirmation dialog, requesting worker stops first."""
         if self._closing or self._closing_requested:
             return
 
-        # SCiQ always uses the same centered custom confirmation dialog.
-        if not self._confirm_exit_with_custom_modal():
-            return
-
+        self._closing_requested = True
         video_active = self.process is not None and self.process.poll() is None
         image_active = self.image_process is not None and self.image_process.poll() is None
-        if not video_active and not image_active:
-            self._close_application()
-            return
-
-        self._closing_requested = True
-        self._close_started_at = __import__("time").monotonic()
 
         if video_active:
-            self.stop_all()
+            try:
+                self.stop_all()
+            except Exception:
+                pass
             self._write_shutdown_request()
-            self.set_status("STOPPING VIDEO AND IMAGE PRODUCERS", self.AMBER)
-            self._set_visual_state(
-                "stopped", "SCiQ IS STOPPING SAFELY",
-                "SCiQ is asking both isolated producers to stop at safe checkpoints. Completed video renders and image workflow progress are retained.",
-                self.AMBER,
-                detail="The shared window will close after both producer processes exit.",
-            )
 
         if image_active:
-            self.stop_image_producer(from_close=True)
+            try:
+                self.stop_image_producer(from_close=True)
+            except Exception:
+                pass
 
-        try:
-            self.root.after(350, self._poll_close)
-        except Exception:
-            self._poll_close()
+        # Close this one shared window immediately. Worker processes have already
+        # received their safe-stop requests and can finish independently.
+        self._close_application()
 
     def _focus_sceneiq_window(self):
         """Return foreground focus to SCiQ after the Image Producer Alt+/ shortcut only."""
@@ -10493,7 +10663,7 @@ def _sceneiq_worker_entry(manifest_path, shutdown_path, heartbeat_path):
 
 
 def main():
-    """Create the one visible SceneIQ desktop window and start its isolated service."""
+    """Create the one visible SceneIQ desktop window and wait for the user's start command."""
     import tkinter as tk
     import traceback
     try:

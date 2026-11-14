@@ -135,6 +135,109 @@ def _windows_dark_titlebar(window, background="#07111F", foreground="#EAF5FF"):
         return False
 
 
+_PACKAGE_SKIP_DIRS = {
+    "__pycache__", ".git", ".venv", "venv", "env", "site-packages",
+    "node_modules", "build", "dist", "_update_backups", "temp", "tmp",
+}
+
+
+def _sceneiq_downloads_folder() -> Path:
+    """Resolve the current Windows user's Downloads folder."""
+    try:
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+            value, _kind = winreg.QueryValueEx(key, "{374DE290-123F-4565-9164-39C4925E467B}")
+            candidate = Path(os.path.expandvars(value)).expanduser()
+            if candidate.is_dir():
+                return candidate
+    except Exception:
+        pass
+    profile = Path(os.environ.get("USERPROFILE", str(Path.home())))
+    for candidate in (profile / "Downloads", Path.home() / "Downloads"):
+        if candidate.is_dir():
+            return candidate
+    return profile / "Downloads"
+
+
+def _sceneiq_is_complete_package(folder: Path) -> bool:
+    """Reject partial folders; only accept a syntactically complete producer pair."""
+    video_path = folder / "sceneiqvideoproduction.py"
+    image_path = folder / "sceniqimageproduction.py"
+    try:
+        if not video_path.is_file() or not image_path.is_file():
+            return False
+        video_source = video_path.read_text(encoding="utf-8-sig")
+        image_source = image_path.read_text(encoding="utf-8-sig")
+        if len(video_source) < 300_000 or len(image_source) < 300_000:
+            return False
+        video_tree = ast.parse(video_source, filename=str(video_path))
+        image_tree = ast.parse(image_source, filename=str(image_path))
+        video_names = {
+            node.name for node in video_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+        image_names = {
+            node.name for node in image_tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+        required_video = {"SceneIQApp", "video_producer_service_loop", "_sceneiq_worker_entry"}
+        required_image = {"sceneiq_image_producer_loop", "main", "_sceneiq_on_stop_hotkey"}
+        if not required_video.issubset(video_names) or not required_image.issubset(image_names):
+            return False
+        compile(video_source, str(video_path), "exec")
+        compile(image_source, str(image_path), "exec")
+        return True
+    except Exception:
+        return False
+
+
+def _sceneiq_package_stamp(folder: Path) -> tuple[int, int, int]:
+    """Use folder and producer timestamps to rank extracted package folders."""
+    try:
+        folder_stat = folder.stat()
+        folder_stamp = int(getattr(folder_stat, "st_birthtime", folder_stat.st_ctime) * 1_000_000_000)
+    except OSError:
+        folder_stamp = 0
+    file_stamps = []
+    for name in ("sceneiqvideoproduction.py", "sceniqimageproduction.py"):
+        try:
+            stat_result = (folder / name).stat()
+            file_stamps.append((int(stat_result.st_mtime_ns), int(stat_result.st_size)))
+        except OSError:
+            file_stamps.append((0, 0))
+    return (folder_stamp, max((item[0] for item in file_stamps), default=0), sum(item[1] for item in file_stamps))
+
+
+def _sceneiq_find_latest_download_folder() -> Path | None:
+    """Find the newest extracted SceneIQ folder in Downloads, not the installed copy."""
+    downloads = _sceneiq_downloads_folder()
+    if not downloads.is_dir():
+        return None
+    try:
+        installed = INSTALL_DIR.resolve()
+    except Exception:
+        installed = INSTALL_DIR
+    matches: list[Path] = []
+    for root, dirs, files in os.walk(downloads, topdown=True):
+        dirs[:] = [name for name in dirs if name.casefold() not in _PACKAGE_SKIP_DIRS and not name.startswith(".")]
+        names = {name.casefold() for name in files}
+        if "sceneiqvideoproduction.py" not in names or "sceniqimageproduction.py" not in names:
+            continue
+        folder = Path(root)
+        try:
+            resolved = folder.resolve()
+            if resolved == installed:
+                continue
+        except Exception:
+            pass
+        if _sceneiq_is_complete_package(folder):
+            matches.append(folder)
+    if not matches:
+        return None
+    return max(matches, key=_sceneiq_package_stamp)
+
+
 class SetupFailure(RuntimeError):
     pass
 
@@ -160,6 +263,11 @@ class SceneIQSetup:
         self.install_log: list[str] = []
         self.log_file = INSTALL_DIR / "sceneiq_setup.log"
         self.main_script = INSTALL_DIR / "sceneiqvideoproduction.py"
+        self.source_dir = SOURCE_DIR
+        self.source_video_script = SOURCE_VIDEO_SCRIPT
+        self.source_image_script = SOURCE_IMAGE_SCRIPT
+        self.handed_off = False
+        self.sceneiq_app = None
         self.python_console = self._python_console_executable()
         self._build_ui()
         self.root.after(180, lambda: _windows_dark_titlebar(self.root, self.BG, self.TEXT))
@@ -346,72 +454,133 @@ class SceneIQSetup:
         code = process.wait()
         return code, captured
 
+    def _select_source_package(self) -> Path:
+        """Select the newest downloaded package, or the folder running setup."""
+        if _VIDEO_OVERRIDE or _IMAGE_OVERRIDE:
+            if not (_VIDEO_OVERRIDE and _IMAGE_OVERRIDE):
+                raise SetupFailure("The selected SceneIQ update must contain both producer scripts.")
+            video_source = Path(_VIDEO_OVERRIDE).expanduser().resolve()
+            image_source = Path(_IMAGE_OVERRIDE).expanduser().resolve()
+            if video_source.parent != image_source.parent:
+                raise SetupFailure("The selected SceneIQ video and image producer scripts must be in the same downloaded folder.")
+            selected = video_source.parent
+            if not _sceneiq_is_complete_package(selected):
+                raise SetupFailure("The selected downloaded SceneIQ folder is incomplete or its producer scripts are invalid.")
+        else:
+            selected = _sceneiq_find_latest_download_folder() or SOURCE_DIR
+            if not _sceneiq_is_complete_package(selected):
+                raise SetupFailure(
+                    "No complete SceneIQ package was found in Downloads or beside the installer. "
+                    "Extract a complete folder containing sceneiqvideoproduction.py and sceniqimageproduction.py, then run Install SceneIQ again."
+                )
+
+        self.source_dir = selected.resolve()
+        self.source_video_script = self.source_dir / "sceneiqvideoproduction.py"
+        self.source_image_script = self.source_dir / "sceniqimageproduction.py"
+        return self.source_dir
+
+    def _copy_entire_package(self, source_dir: Path) -> tuple[int, int]:
+        """Recursively merge every package file and folder into INSTALL_DIR.
+
+        Existing files with matching names are overwritten. Destination-only
+        files are left in place; the extracted package is not used as a delete
+        manifest. User data present in the downloaded package is copied too.
+        """
+        source_dir = source_dir.resolve()
+        destination_root = INSTALL_DIR.resolve()
+        if source_dir == destination_root:
+            self._write_log("The selected package is already the installation folder; recursive copying is not needed.")
+            return 0, 0
+
+        copied_files = 0
+        copied_folders = 0
+        destination_root.mkdir(parents=True, exist_ok=True)
+        for root, dirs, files in os.walk(source_dir, topdown=True):
+            current = Path(root)
+            relative = current.relative_to(source_dir)
+            target_folder = destination_root / relative
+            if target_folder.exists() and not target_folder.is_dir():
+                target_folder.unlink()
+
+            # Never walk into the destination if it happens to sit under the
+            # selected source tree; this prevents recursive self-copying.
+            safe_dirs = []
+            for directory in dirs:
+                source_child = current / directory
+                destination_child = target_folder / directory
+                try:
+                    if source_child.resolve() == destination_root:
+                        continue
+                except Exception:
+                    pass
+                if destination_child.exists() and not destination_child.is_dir():
+                    destination_child.unlink()
+                safe_dirs.append(directory)
+            dirs[:] = safe_dirs
+
+            target_folder.mkdir(parents=True, exist_ok=True)
+            copied_folders += 1
+            for filename in files:
+                source_file = current / filename
+                destination_file = target_folder / filename
+                try:
+                    if source_file.resolve() == destination_file.resolve():
+                        continue
+                except Exception:
+                    pass
+                destination_file.parent.mkdir(parents=True, exist_ok=True)
+                if destination_file.is_dir():
+                    shutil.rmtree(destination_file)
+                try:
+                    shutil.copy2(source_file, destination_file)
+                except PermissionError:
+                    # Windows may retain the read-only attribute from an older
+                    # extracted package. Clear it and retry the overwrite.
+                    try:
+                        if destination_file.exists():
+                            destination_file.chmod(0o666)
+                        shutil.copy2(source_file, destination_file)
+                    except Exception as exc:
+                        raise SetupFailure(
+                            f"Could not overwrite {destination_file.name} in the SceneIQ installation folder: {exc}"
+                        ) from exc
+                except Exception as exc:
+                    raise SetupFailure(
+                        f"Could not copy {source_file} into the SceneIQ installation folder: {exc}"
+                    ) from exc
+                copied_files += 1
+
+        self._write_log(
+            f"Copied the complete downloaded SceneIQ package from '{source_dir}' to '{destination_root}'. "
+            f"Files overwritten/copied: {copied_files}; folders refreshed: {copied_folders}."
+        )
+        return copied_files, copied_folders
+
     def _install_layout(self):
-        """Install both producer engines and support tools without touching user data."""
+        """Copy the latest complete package, then prepare the application layout."""
+        source_dir = self._select_source_package()
         INSTALL_DIR.mkdir(parents=True, exist_ok=True)
         for folder in REQUIRED_DIRECTORIES:
             folder.mkdir(parents=True, exist_ok=True)
 
-        destinations = [
-            (SOURCE_VIDEO_SCRIPT, INSTALL_DIR / "sceneiqvideoproduction.py", "video"),
-            (SOURCE_IMAGE_SCRIPT, INSTALL_DIR / "sceniqimageproduction.py", "image"),
-        ]
-        # A complete SceneIQ install/update always requires a matched script pair.
-        missing_sources = [str(source) for source, _dest, _kind in destinations if not source.is_file()]
-        if missing_sources:
-            raise SetupFailure(
-                "The complete SceneIQ package must include both sceneiqvideoproduction.py "
-                "and sceniqimageproduction.py in the same extracted folder. Missing: "
-                + "; ".join(missing_sources)
-            )
+        self._set_progress(9, "COPYING LATEST SCENEIQ PACKAGE", "Copying every file and folder from the newest extracted SceneIQ package.")
+        self._copy_entire_package(source_dir)
 
-        backup_dir = INSTALL_DIR / "_update_backups"
-        for source, destination, kind in destinations:
-            source_text = source.read_text(encoding="utf-8-sig")
-            compile(source_text, str(source), "exec")
-            if os.path.normcase(os.path.abspath(source)) == os.path.normcase(os.path.abspath(destination)):
-                self._write_log(f"Installed {kind} producer is already the selected source file.")
-                continue
-            if destination.is_file():
-                backup_dir.mkdir(parents=True, exist_ok=True)
-                stamp = time.strftime("%Y%m%d_%H%M%S")
-                backup_path = backup_dir / f"{destination.stem}_{stamp}{destination.suffix}"
-                shutil.copy2(destination, backup_path)
-                self._write_log(f"Previous {kind} producer backed up as {backup_path.name}.")
-            staged = destination.with_name(destination.name + ".installing")
-            shutil.copy2(source, staged)
-            compile(staged.read_text(encoding="utf-8-sig"), str(staged), "exec")
-            os.replace(staged, destination)
-            self._write_log(f"Installed {kind} producer: {destination.name}")
+        # The recursive copy above includes both engines and every support
+        # component. Keep these explicit checks to fail safely before installing
+        # dependencies if a file was missing or could not be copied.
+        for filename in ("sceneiqvideoproduction.py", "sceniqimageproduction.py"):
+            required = INSTALL_DIR / filename
+            if not required.is_file():
+                raise SetupFailure(f"Required SceneIQ package file was not copied: {filename}")
+            compile(required.read_text(encoding="utf-8-sig"), str(required), "exec")
 
-        support_files = (
-            "sceniq_setup.pyw", "sceniq_updater.pyw",
-            "Start_SceneIQ.vbs", "Update_SceneIQ.vbs", "Install_SceneIQ.vbs",
-            "SceneIQ_Launcher.bat", "SceneIQ_Launcher_NoConsole.vbs",
-            "requirements-sceneiq.txt", "README_SceneIQ_Desktop_Installer.txt",
-            "SceneIQ.ico", "SCiQ_Brand.png", "SceneIQ_AppIcon.png",
-            "Robot(1).gif", "Mapping for machine learning(1).gif",
-        )
-        for filename in support_files:
-            source = SOURCE_DIR / filename
-            destination = INSTALL_DIR / filename
-            if source.is_file() and os.path.normcase(os.path.abspath(source)) != os.path.normcase(os.path.abspath(destination)):
-                self._copy_file(source, destination)
-                self._write_log(f"Application component refreshed: {filename}")
-
-        # Existing project configuration and working folders are user-owned.
-        # Never replace, reset, rewrite or seed panel.json / ready_script.json here.
         for data_name in ("panel.json", "ready_script.json"):
             data_path = INSTALL_DIR / data_name
-            self._write_log(
-                f"Preserving existing {data_name}." if data_path.exists()
-                else f"{data_name} is not present yet; setup will not create or overwrite it."
-            )
-
-        for required in (INSTALL_DIR / "sceneiqvideoproduction.py", INSTALL_DIR / "sceniqimageproduction.py"):
-            if not required.is_file():
-                raise SetupFailure(f"Required producer file was not installed: {required.name}")
-            compile(required.read_text(encoding="utf-8-sig"), str(required), "exec")
+            if data_path.exists():
+                self._write_log(f"Package copy completed; {data_name} now matches the selected downloaded package.")
+            else:
+                self._write_log(f"{data_name} was not included in the selected downloaded package.")
 
     def _create_desktop_shortcuts(self):
         """Create and verify SceneIQ and Update SceneIQ shortcuts on Desktop and Start Menu."""
@@ -764,7 +933,7 @@ class SceneIQSetup:
         self.thread.start()
 
     def _poll_events(self):
-        if not self.root.winfo_exists():
+        if self.handed_off or not self.root.winfo_exists():
             return
         try:
             while True:
@@ -810,26 +979,9 @@ class SceneIQSetup:
         self.percent_label.configure(text="100%")
         self.status_label.configure(text="SETUP COMPLETE", fg=self.GREEN)
         self.heading.configure(text="SceneIQ is ready")
-        self.subheading.configure(text=message + " Opening the main control center shortly.")
-        self._append_log("SUCCESS — Environment confirmed. Desktop and Start Menu shortcuts have been verified.")
-        details = getattr(self, "shortcut_summary", "SceneIQ shortcuts have been created.")
-        self.subheading.configure(text=message + "\n\n" + details + "\n\nOpening the main control center shortly.")
-        try:
-            messagebox.showinfo(
-                "SceneIQ installation complete",
-                "SCiQ / SceneIQ has been installed successfully.\n\n"
-                "You can now find it on your Desktop as 'SceneIQ' or in Windows Search / Start Menu.\n"
-                "The updater is available as 'Update SceneIQ'.\n\n"
-                "The main SceneIQ window will open automatically.",
-                parent=self.root,
-            )
-        except Exception:
-            pass
-        self.action_button.configure(
-            text="OPEN SCENEIQ NOW", command=self.open_sceneiq,
-            bg="#0B704A", fg="#FFFFFF", state="normal",
-        )
-        self.root.after(700, self.open_sceneiq)
+        self.subheading.configure(text="Opening the SceneIQ control center in this same window…")
+        self._append_log("SUCCESS — Environment confirmed. SceneIQ is opening in this window.")
+        self.root.after(350, self.open_sceneiq)
 
     def _show_failure(self, payload: dict):
         self.failed = True
@@ -868,30 +1020,43 @@ class SceneIQSetup:
         self.start_setup()
 
     def open_sceneiq(self):
-        if not self.completed:
+        if not self.completed or self.handed_off:
             return
         try:
             app_path = INSTALL_DIR / "sceneiqvideoproduction.py"
             if not app_path.is_file():
                 raise FileNotFoundError("The main SceneIQ script is not installed.")
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"
-            subprocess.Popen(
-                [sys.executable, "-X", "utf8", str(app_path)],
-                cwd=str(INSTALL_DIR),
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=CREATE_NO_WINDOW,
-                close_fds=True,
-            )
-            self.root.destroy()
+
+            # Import the desktop class without invoking its standalone main().
+            # SceneIQApp accepts an existing Tk root, so the installer window is
+            # reused rather than opening a second application window/process.
+            install_text = str(INSTALL_DIR)
+            if install_text not in sys.path:
+                sys.path.insert(0, install_text)
+            import multiprocessing
+            multiprocessing.freeze_support()
+            # Import by its real module name so Windows multiprocessing spawn
+            # can import the same worker target in child processes.
+            module = importlib.import_module("sceneiqvideoproduction")
+            app_class = getattr(module, "SceneIQApp", None)
+            if app_class is None:
+                raise AttributeError("The installed SceneIQ script does not expose SceneIQApp.")
+
+            for widget in list(self.root.winfo_children()):
+                try:
+                    widget.destroy()
+                except Exception:
+                    pass
+            self.root.title("SCiQ — SceneIQ Image & Video Studio")
+            self.root.configure(bg="#080D18")
+            self.sceneiq_app = app_class(self.root)
+            self.root._sceneiq_app = self.sceneiq_app
+            self.handed_off = True
         except Exception as exc:
             self.failed = True
             messagebox.showerror(
                 "Could not open SceneIQ",
-                f"The environment check passed, but the main window could not be opened.\n\n{type(exc).__name__}: {exc}",
+                f"The environment check passed, but the SceneIQ window could not be opened in the installer window.\n\n{type(exc).__name__}: {exc}",
                 parent=self.root,
             )
 

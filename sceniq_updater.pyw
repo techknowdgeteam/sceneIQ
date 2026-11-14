@@ -166,6 +166,9 @@ def running_sceneiq_processes() -> list:
     targets = [
         os.path.normcase(str((INSTALL_DIR / VIDEO_SCRIPT_NAME).resolve())),
         os.path.normcase(str((INSTALL_DIR / IMAGE_SCRIPT_NAME).resolve())),
+        # After installation, the SceneIQ desktop is hosted by the setup Tk
+        # root, so its process command line references sceniq_setup.pyw.
+        os.path.normcase(str(SETUP_SCRIPT.resolve())),
     ]
     found = []
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
@@ -176,7 +179,7 @@ def running_sceneiq_processes() -> list:
             if not joined:
                 continue
             normalized = os.path.normcase(joined)
-            if any(target in normalized for target in targets) and "sceniq_updater.pyw" not in normalized and "sceniq_setup.pyw" not in normalized:
+            if any(target in normalized for target in targets) and "sceniq_updater.pyw" not in normalized:
                 found.append(proc)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -333,7 +336,7 @@ class UpdaterWindow:
         stat = candidate.stat()
         modified = time.strftime("%d %b %Y • %H:%M", time.localtime(stat.st_mtime))
         self.status.configure(text="LATEST SCENEIQ UPDATE FOUND", fg=self.GREEN)
-        self.message.configure(text="A complete matched SceneIQ producer pair is ready. Confirm below to replace both engines and refresh the desktop shortcuts.")
+        self.message.configure(text="A complete downloaded SceneIQ folder is ready. Confirm below to copy every file and folder into the installation directory, overwriting matching files, then run setup.")
         self.detail.configure(
             text=f"Source folder: {candidate.parent.name}\nVideo script: {candidate.name}\nImage script: {image_candidate.name}\nModified: {modified} • Video size: {stat.st_size / (1024 * 1024):.2f} MB"
         )
@@ -367,7 +370,7 @@ class UpdaterWindow:
 
         yes = messagebox.askyesno(
             "Confirm SceneIQ update",
-            "Install BOTH producer scripts from the newest valid SceneIQ folder in Downloads?\n\nThe current video and image scripts will be backed up and replaced. Setup components and shortcuts will be refreshed. panel.json, ready_script.json, project images, generated images/videos and working data will not be deleted or overwritten.",
+            "Copy EVERY file and folder from the newest valid SceneIQ folder in Downloads into the installation directory, overwriting files with matching names, then run the setup checks?\n\nThe selected downloaded folder is the source of the update.",
             parent=self.root,
         )
         if not yes:
@@ -395,7 +398,7 @@ class UpdaterWindow:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), close_fds=True,
             )
             self.status.configure(text="SCENEIQ UPDATE SETUP STARTED", fg=self.GREEN)
-            self.message.configure(text="The SceneIQ setup window is verifying and installing both producer engines. This update-center window will close.")
+            self.message.configure(text="The SceneIQ setup window is copying the full downloaded folder, checking dependencies and opening the desktop when ready. This update-center window will close.")
             self.root.after(900, self.root.destroy)
         except Exception as exc:
             self.installing = False
