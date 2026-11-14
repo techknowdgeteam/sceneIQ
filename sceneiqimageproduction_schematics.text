@@ -1,0 +1,599 @@
+SCENEIQ IMAGE PRODUCTION — ENGINE SCHEMATICS
+============================================
+
+Document purpose
+----------------
+This document describes the image-production engine in the uploaded
+sceniqimageproduction.py script. It explains the input contract, the structures
+it recognises, the way it turns each scene into a Google Flow prompt, the
+browser/download workflow, and the hand-off to SceneIQ Video Production.
+
+This is a description of the uploaded implementation, not a proposed redesign.
+The desktop window/installer is not the image-generation engine. The engine is
+an independent Python process that automates Google Flow in Microsoft Edge.
+
+1. WHAT THIS ENGINE DOES
+------------------------
+SceneIQ Image Production creates the visual assets for a project. Its normal
+job is to:
+
+  1. Read the active project from panel.json.
+  2. Confirm that the selected image engine is Google Flow.
+  3. Read the project title, optional category, operator mode and scene script.
+  4. Choose the single-operation or multiple-operation Google Flow workflow.
+  5. Locate or create the project's image folder.
+  6. Configure the Google Flow image workspace for a landscape 16:9 output.
+  7. Turn each scene record into the prompt payload expected by Google Flow.
+  8. Submit prompts, wait for generation, locate the resulting image cards and
+     download the correct image for each scene.
+  9. Verify the saved files and preserve valid scene images already present.
+ 10. Generate the separate project thumbnail after the scene images are ready.
+ 11. Verify the complete image set and append the project record to
+     ready_script.json for the video engine.
+
+It does NOT assemble video, mix narration, render captions, apply video
+transitions, or encode MP4 files. Those jobs belong to
+sceneiqvideoproduction.py.
+
+2. ENGINE BOUNDARIES, FILES AND EXTERNAL DEPENDENCIES
+----------------------------------------------------
+Main configured paths in the uploaded script:
+
+  PANEL_PATH       C:\xampp\htdocs\AI automation\scenIQ\panel.json
+  READY_SCRIPT     C:\xampp\htdocs\AI automation\scenIQ\ready_script.json
+  IMAGES_PATH      C:\xampp\htdocs\AI automation\scenIQ\project
+  INPUT_IMAGES     C:\xampp\htdocs\AI automation\scenIQ\input_images
+  GUI_IMAGES       C:\xampp\htdocs\AI automation\gui_images
+  GOOGLE_FLOW_URL  https://flow.google.com/#overview
+  SUBSCRIBE_STICKERS ...\scenIQ\subscribe
+  Edge executable  C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
+
+The image engine relies on a Windows desktop session, Microsoft Edge, Google
+Flow being accessible and signed in, GUI reference images in GUI_IMAGES, and
+Python packages including PyAutoGUI, Pillow, OpenCV, NumPy, pyperclip, keyboard,
+pywin32 and psutil. Some detection paths also use object detection support.
+These are operational dependencies: a valid JSON file alone cannot generate an
+image if the browser workspace or desktop automation environment is missing.
+
+The image module imports and controls its own workflow. It does not import or
+start the video renderer. The progress HUD is a transparent, click-through
+status display; technical detail remains in the console. Image-only shortcuts
+are registered in the image worker:
+
+  Ctrl+Shift+F12  Restart the image workflow from its entry point.
+  Alt+/           Stop the Image Producer process/workflow.
+
+The producer also receives local command-centre control events. These controls
+do not make the image engine share a worker with the video engine.
+
+3. INPUT FILE: panel.json
+-------------------------
+panel.json is the active input and control document. The engine reads it as
+JSON. The practical root should be a JSON object or list containing a project
+record and its script. Avoid storing the script as a JSON-looking text string:
+the script must be a real JSON object or array after json.load().
+
+The parser is deliberately tolerant of wrappers. Project details may be nested
+inside an "automation" object, a "project_name" object, a "script_json" object,
+a "value" object, or another wrapper. It recursively walks dictionaries and
+lists and normalises field names by removing punctuation/underscores/spaces and
+ignoring letter case for many lookups. Therefore these variants are often
+recognised as the same key:
+
+  project_title / projectTitle / project-title / PROJECT TITLE
+  project_category / projectCategory / projectcategory
+  characters_reference / charactersReference / character-reference
+
+Even though aliases are supported, use the canonical field names shown in the
+examples. They make the data unambiguous and easier to maintain.
+
+3.1 Project-level fields
+
+  automation.project_title
+      Human-readable project name. Used to identify the project and name its
+      folder. Provide it explicitly; do not rely on a fallback title.
+
+  automation.project_category
+      Optional category used as the parent folder. When supplied, the preferred
+      folder is IMAGES_PATH/<category>/<project_title>.
+
+  automation.image_generation_engine
+      Must resolve to "Google Flow" for this engine. Other selected engine names
+      cause the Google Flow function to exit/skip.
+
+  automation.engineoperator
+      Selects the Google Flow execution style. "Single operator" selects the
+      sequential single-operation function. Values containing "multiple", values
+      starting with "multi", or recognised terms such as "manyworkers",
+      "manyoperators", "parallelworkers" or "paralleloperators" select the
+      multiple-operation function. If omitted, the default is Single operator.
+
+  script
+      The project scene script. It must resolve to a non-empty JSON list or
+      dictionary containing discoverable scene records.
+
+  Thumbnail
+      A separate project-level image-generation prompt for the YouTube/project
+      thumbnail. It is not a timed scene and is not one of the entry_N prompts.
+      It is read after the scene images have been checked. If Thumbnail.png is
+      missing/invalid and this prompt is empty, the engine cannot complete the
+      thumbnail phase and will not transfer the project as complete.
+
+  currently_running / status / operation_status
+      Runtime status fields maintained by the producer/controller. They are
+      not scene prompts. The engine updates them as it works.
+
+3.2 Recommended current scene format
+
+Use one object per scene, in the exact order in which you want the image files
+numbered and later paired with video scenes. The basic structure is:
+
+{
+  "automation": {
+    "project_title": "Example Project",
+    "project_category": "Documentary",
+    "image_generation_engine": "Google Flow",
+    "engineoperator": "Single operator"
+  },
+  "script": [
+    {
+      "shot_number": 1,
+      "characters_reference": "The recurring character is ...",
+      "scene_Image_generation": "Wide cinematic scene showing ...",
+      "dialogue": "The spoken line for this scene.",
+      "start": "00:00",
+      "stop": "00:05"
+    },
+    {
+      "shot_number": 2,
+      "characters_reference": "The same recurring character is ...",
+      "scene_Image_generation": "The character now stands ...",
+      "dialogue": "The next spoken line.",
+      "start": "00:05",
+      "stop": "00:10"
+    }
+  ],
+  "Thumbnail": "A compelling landscape thumbnail showing ..."
+}
+
+Required scene-prompt pair for the current format:
+
+  characters_reference
+      Character/subject continuity information for this individual scene.
+
+  scene_Image_generation
+      The actual visual description/instruction for this individual scene.
+
+The new-format scene detector requires both fields (the code recognises some
+case/punctuation variants). Both values are carried into the JSON prompt sent
+to Google Flow. They may be text or JSON-compatible structured values, but
+plain descriptive text is easiest to inspect and maintain.
+
+Important: the root-level characters_prompt / characters_visual_prompt fields
+are intentionally not sent as part of the current two-field scene prompt. Do
+not assume the image engine automatically merges a root-level character list
+into every scene. Put the character identity/reference details needed by Flow
+inside each scene's characters_reference value. Repeat or reuse the description
+consistently across scenes when continuity matters.
+
+3.3 What happens to other scene fields?
+
+For the current new scene-by-scene format, the image engine serialises ONLY:
+
+  characters_reference
+  scene_Image_generation
+
+Fields such as shot_number, dialogue, narration, voiceover, spoken_text, start,
+stop, duration, audio_focus, transition_to_next, keyframes, video_effects and
+caption/overlay information are NOT included in the Google Flow image prompt.
+They can still be useful to the separate video engine later, but they do not
+change what the image engine sends for that new-format scene.
+
+The shot_number value does not choose the output filename. The traversal order
+of the recognised scene records determines the numbering:
+
+  first recognised scene  -> entry_1
+  second recognised scene -> entry_2
+  third recognised scene  -> entry_3
+  ...
+
+Consequently, maintain the same scene order in the script and expected video
+sequence. Do not assume shot_number=10 creates entry_10 if it is the first
+record encountered.
+
+3.4 Older nested/batch format
+
+The image engine also retains support for older nested structures containing an
+"entries" list. A legacy entry containing scene_pov_prompt is recognised. The
+legacy prompt formatter serialises the entry data while excluding the literal
+keys start, stop, duration and audio_focus. The newer two-field rule applies
+when the entry contains the current character-reference and image-prompt pair.
+
+Legacy illustration:
+
+{
+  "automation": {
+    "project_title": "Example Project",
+    "image_generation_engine": "Google Flow"
+  },
+  "script_json": {
+    "script": [
+      {
+        "batch": 1,
+        "entries": [
+          {"scene_pov_prompt": "A wide shot of ...", "dialogue": "..."},
+          {"scene_pov_prompt": "A close-up of ...", "dialogue": "..."}
+        ]
+      }
+    ]
+  },
+  "Thumbnail": "A clear project thumbnail prompt ..."
+}
+
+The exact old structure may be nested differently; the parser searches for
+script and entries containers rather than requiring only this wrapper. For new
+projects, prefer the current two-field scene format.
+
+4. HOW SCENEIQ UNDERSTANDS THE INPUT
+------------------------------------
+The image engine is a structure-aware JSON reader plus a GUI automation engine.
+It does not interpret the entire project using an AI reasoning step. It finds
+known keys, collects scene dictionaries, formats approved values and submits
+them to Google Flow.
+
+The practical input interpretation is:
+
+  JSON root/wrappers
+      Recursively searched for the project and script information.
+
+  automation
+      Preferred location for project title, category, engine and operator mode.
+
+  script
+      Recursively walked to find current-format scene objects or legacy entries.
+
+  characters_reference
+      Passed as character/subject reference context for that scene.
+
+  scene_Image_generation
+      Passed as the scene-specific image-generation description.
+
+  Thumbnail
+      Separate prompt used only for the final thumbnail image.
+
+Unknown metadata is not automatically converted into visual instructions. For
+the current format, unknown/additional fields are left out of the prompt. Use
+the two recognised scene prompt fields for the image content you need generated.
+
+5. PROJECT FOLDER AND IMAGE FILE CONTRACT
+-----------------------------------------
+The preferred new folder layout is:
+
+  project/<project_category>/<project_title>/
+      entry_1.png
+      entry_2.png
+      entry_3.png
+      ...
+      Thumbnail.png
+
+Historical layouts are also recognised:
+
+  project/<project_title>/
+  project/Uncategorized/<project_title>/
+
+When a category is known, the resolver tries the category/title folder first,
+then compatible historical locations. If the category is absent, the flat
+legacy folder is preferred. It may reuse a uniquely matching categorized
+folder, but it refuses to choose arbitrarily if multiple matches are ambiguous.
+Folder names are sanitised for Windows path safety; the folder resolver also
+tries readable and normalised variants of the project title.
+
+The image folder is treated as a controlled output area. The cleanup/validation
+logic keeps the expected entry_N scene images and canonical Thumbnail.png and
+removes unrelated files from that project image folder. Do not store unrelated
+assets in the same folder and expect them to be preserved by the image engine.
+
+Recognised scene image extensions include PNG, JPG/JPEG, GIF, WEBP, BMP and
+TIFF in image-side verification. Scene files must exist, be non-empty and be
+valid images. The thumbnail must be a valid PNG named exactly:
+
+  Thumbnail.png
+
+A valid later image is preserved when an earlier entry is missing. For example,
+if entry_1 and entry_3 exist but entry_2 is missing, the engine regenerates the
+missing entry_2 without deliberately resetting the already-valid entry_3.
+
+6. IMAGE PRODUCTION WORKFLOW — STEP BY STEP
+-------------------------------------------
+
+A. Read and validate the project
+   - Read PANEL_PATH as JSON.
+   - Locate the project title, category, engine/operator settings and script.
+   - Confirm image_generation_engine resolves to Google Flow.
+   - Collect scene entries and calculate the expected entry count.
+   - Claim/update the runtime status fields.
+
+B. Select the operation function
+   - Single operator: sequentially prepares one scene, submits it, confirms the
+     prompt, waits for render completion, downloads and verifies the image, then
+     proceeds to the next missing scene.
+   - Multiple operator: submits prompts in batches (the implementation uses a
+     bounded batch, up to six prompts), then identifies and downloads the new
+     image cards in their correct prompt order. It uses OpenCV card detection,
+     YOLO/object confirmation and perceptual image fingerprints to distinguish
+     genuine new scene cards from old items.
+
+   "Multiple operator" describes the alternate batch workflow selected by the
+   engineoperator setting. It does not mean the script uses the video engine or
+   that each scene is assigned a new independent video worker.
+
+C. Detect and prepare Google Flow
+   - Inspect the existing Edge window and identify a known Flow state such as
+     the prompt workspace or New Project chooser.
+   - Reuse the current workspace when it is already recognised; navigate to
+     GOOGLE_FLOW_URL if no supported state is visible.
+   - Configure the Nano Banana workspace for 16:9. The multiple-operation path
+     additionally selects the one-image-per-prompt setting and closes the
+     settings panel. The exact UI controls are located using GUI reference
+     images, OpenCV/template matching and PyAutoGUI fallbacks.
+
+D. Prepare each prompt
+   - Build the scene payload as described in section 3.
+   - For a current-format scene, output a JSON object with the canonical keys
+     characters_reference and scene_Image_generation.
+   - Paste this JSON into the Google Flow prompt field and submit it.
+   - Confirm that the prompt was accepted; an unconfirmed send is not treated
+     as a completed job.
+
+E. Wait for generation and identify the image
+   - Wait for the render indicator/workflow state to change within bounded
+     timeouts. Rendering has a ten-minute ceiling before controlled recovery.
+   - In the multiple-operation flow, scan overlapping visible gallery regions,
+     confirm image-card content and map the new cards to the submitted prompts.
+   - The script does not use a generic rendering-progress indicator as the
+     multiple-operation image count/completion proof.
+
+F. Download and validate
+   - Reveal the card's download control and trigger the download.
+   - Snapshot the relevant Windows/Edge download locations before download,
+     detect the new or updated file, handle temporary download files and wait
+     for stable, valid image data.
+   - Save/rename the verified result to the expected entry_N filename.
+   - A scene is not considered complete merely because a click or download was
+     attempted; the saved target file must be present and valid.
+
+G. Resume missing work
+   - Inspect entry numbers from 1 through the expected scene count.
+   - Skip already-valid entries and generate only missing entries.
+   - Audit the full entry range after scene generation.
+   - Do not start thumbnail generation while any required scene image is missing.
+
+H. Generate the thumbnail
+   - Read the separate project-level Thumbnail prompt.
+   - If a valid Thumbnail.png already exists, retain it.
+   - Otherwise submit the thumbnail prompt after all entry_N images are valid.
+   - Force/verify PNG output under the canonical name Thumbnail.png.
+
+I. Final cleanup and hand-off
+   - Clean and validate the image folder one final time.
+   - Verify every expected entry_N image and Thumbnail.png.
+   - Append a completed project snapshot to READY_SCRIPT without discarding
+     projects already in that file.
+   - Read back READY_SCRIPT and verify that the project was written.
+   - Only after successful hand-off, remove the completed project payload from
+     PANEL_PATH while retaining controller/runtime status information.
+
+7. GOOGLE FLOW GUI CONTROL AND RECOVERY
+---------------------------------------
+The engine operates the visible Google Flow interface; it does not call a
+Google Flow image API in this script. PyAutoGUI/clipboard actions enter prompts,
+click controls and download the resulting assets. OpenCV and reference images
+help recognise page states, prompt boxes, buttons, render states and gallery
+cards. Windows/Edge download discovery is used to establish that a file really
+arrived.
+
+It checks for the prompt workspace and New Project state before navigating.
+The UI waits are bounded (the single-operation code documents a normal 40-second
+stage timeout and a ten-minute render ceiling; some navigation checks have a
+separate window). Failed stages can trigger a full workflow restart with fresh
+panel.json state. A restart starts from the workflow entry point rather than
+assuming an interrupted scene phase was completed. Existing valid output files
+are independently checked to determine which scene images remain missing.
+
+A single blocked operating-system or PyAutoGUI call cannot always be forcibly
+interrupted safely; the recovery system controls the stages around those calls.
+The progress HUD is informational and does not replace file verification.
+
+8. HOW THE IMAGE ENGINE COMMUNICATES WITH THE VIDEO ENGINE
+---------------------------------------------------------
+The two engines are independent processes. Their shared data contract is disk:
+
+  Image Producer input
+      panel.json + Google Flow GUI + project image folder
+
+  Image Producer output
+      project/<category>/<title>/entry_N.*
+      project/<category>/<title>/Thumbnail.png
+      ready_script.json (completed project snapshot)
+
+  Video Producer input
+      ready_script.json + corresponding entry_N images + matching narration
+      audio file (normally discovered in the user's Downloads folder)
+
+The image transfer supports these READY_SCRIPT container shapes:
+
+  [project_record, project_record, ...]
+
+  {"projects": [project_record, project_record, ...]}
+
+  {single_project_record_fields...}
+
+Existing records are preserved when a new completed project is appended. The
+record contains the original project script and metadata so the Video Producer
+can read the scene-level narration/timing/editing fields that the image engine
+did not send to Google Flow.
+
+This means the project script has two roles:
+  - Image role: characters_reference + scene_Image_generation make each image.
+  - Video role: dialogue/narration, timing, transitions, keyframes, effects and
+    overlays guide the assembly of the images into a video.
+
+9. EXPECTATIONS, VALIDATION AND COMMON INPUT MISTAKES
+----------------------------------------------------
+For reliable production, provide:
+
+  - A valid JSON object/list in panel.json.
+  - An explicit project title and (preferably) a project category.
+  - image_generation_engine set to Google Flow.
+  - engineoperator set to Single operator or a recognised multiple-operation
+    value.
+  - A non-empty script with one discoverable scene object per intended image.
+  - Both characters_reference and scene_Image_generation on every current-
+    format scene.
+  - A non-empty Thumbnail prompt if Thumbnail.png does not already exist.
+  - Stable scene ordering, because traversal order determines entry_N numbering.
+  - Access to the Google Flow prompt workspace, GUI reference-image folder and
+    Windows/Edge download locations.
+
+Avoid these mistakes:
+
+  1. Supplying only scene_Image_generation without characters_reference in the
+     current schema. The current-format formatter requires the pair.
+  2. Putting all character details only in root-level characters_prompt and
+     assuming it is automatically merged into each prompt. It is not.
+  3. Expecting dialogue, timing, shot_number or transitions to alter the image
+     prompt. Those fields are excluded from the current two-field prompt.
+  4. Reordering the script after image generation without renumbering/matching
+     the image files, because entry_N is the positional scene mapping.
+  5. Putting unrelated files in the project image folder that cleanup may remove.
+  6. Assuming a generated thumbnail can replace a missing scene image. The
+     thumbnail is a separate final job.
+  7. Assuming READY_SCRIPT is updated before image files are verified. The
+     transfer is gated by valid scene images and Thumbnail.png.
+
+10. CORE FUNCTION BREAKDOWN
+---------------------------
+
+_sceneiq_normalize_key(value)
+    Normalises a key/value for robust JSON key matching by removing non-
+    alphanumeric characters and case-folding it.
+
+_sceneiq_walk_json(node)
+    Recursively walks dictionary/list values so the engine can find project
+    metadata and script containers under different wrapper structures.
+
+_sceneiq_find_field(node, aliases, default)
+    Finds the first non-empty value whose key matches one of the supplied
+    aliases after normalisation.
+
+_sceneiq_find_named_object(node, wanted_name)
+    Finds a named nested dictionary such as automation.
+
+_sceneiq_safe_path_component(value, fallback)
+    Removes/replaces Windows-invalid path characters and prevents unsafe or
+    empty folder-name components.
+
+_sceneiq_project_title_variants(project_title)
+    Produces safe original and normalised title variants for old/new folder
+    names.
+
+_sceneiq_resolve_project_folder_path(...)
+    Locates the project folder in category/title, flat legacy or old
+    Uncategorized layouts. It does not choose between ambiguous category
+    matches arbitrarily.
+
+_sceneiq_resolve_project_images_folder(...)
+    Image-side wrapper around the resolver; creates the destination folder when
+    no existing matching folder is found.
+
+_sceneiq_get_automation_settings(panel_data)
+    Returns the automation settings object when present.
+
+_sceneiq_get_project_metadata(panel_data)
+    Reads title, category, image engine, operator mode and script metadata,
+    preferring automation values and then searching the wider JSON tree.
+
+_sceneiq_select_image_engine_operation(panel_data)
+    Chooses the multiple-operation function or the single-operation function
+    according to engineoperator. A different selected engine returns no Google
+    Flow function.
+
+AutomationHUD / _NullAutomationHUD
+    Shows a sanitised, transparent progress indicator in the image parent
+    process. Spawned child workers use the no-op HUD so they do not create
+    competing GUI windows.
+
+_sceneiq_register_global_hotkeys() and _sceneiq_unregister_global_hotkeys()
+    Register and remove the Image Producer's Ctrl+Shift+F12 and Alt+/ shortcuts.
+
+sceneiq_google_flow_images_generation_engine_single_operation()
+    The sequential Google Flow implementation. It reads panel.json, collects
+    scenes, prepares the approved prompt fields, submits one prompt at a time,
+    confirms generation, downloads/verifies each image, generates the thumbnail
+    last and transfers the completed project.
+
+sceneiq_google_flow_images_generation_engine_mp_opertion()
+    The multiple-operation/batch Google Flow implementation. It submits a
+    bounded group of prompts and uses gallery/card detection and image identity
+    checks to map/download the resulting images to the correct entry numbers.
+    The function name includes the spelling "mp_opertion" in the uploaded code.
+
+_sceneiq_image_gui_command_listener(...)
+    Listens for the desktop command/control channel and relays pause, resume,
+    restart or stop requests to the image worker.
+
+sceneiq_image_producer_loop(...)
+    Watches the active panel configuration, detects a new/changed project
+    signature, selects the engine operation and launches it. It avoids starting
+    duplicate work for an unchanged project signature.
+
+main(...)
+    Starts the isolated Image Producer worker, registers its image-only
+    shortcuts, prints the configured paths and runs the producer loop.
+
+11. QUICK SCHEMATIC
+-------------------
+
+  panel.json
+      |
+      v
+  Read project metadata + script
+      |
+      +--> engine != Google Flow? --> wait/skip
+      |
+      v
+  Collect ordered scene records
+      |
+      v
+  Select single or multiple operation
+      |
+      v
+  Find/create project image folder
+      |
+      v
+  Detect Google Flow workspace + configure 16:9
+      |
+      v
+  For each missing scene:
+      |   extract characters_reference + scene_Image_generation
+      |   submit prompt -> confirm -> wait -> locate result -> download
+      |   verify file -> save as entry_N
+      v
+  Verify every entry_N
+      |
+      v
+  Generate/verify Thumbnail.png
+      |
+      v
+  Final image-folder audit
+      |
+      v
+  Append and verify completed project in ready_script.json
+      |
+      v
+  Remove completed project payload from panel.json
+      |
+      v
+  Video Producer can now consume the project
+
+END OF IMAGE PRODUCTION SCHEMATICS
