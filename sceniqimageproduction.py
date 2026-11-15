@@ -264,6 +264,184 @@ def _sceneiq_resolve_project_images_folder(project_title, project_category=None)
         create_if_missing=True,
     )
 
+
+# -----------------------------------------------------------------------------
+# Per-project queue isolation and YouTube-details handoff
+# -----------------------------------------------------------------------------
+def _sceneiq_direct_project_title(record):
+    """Read a project's own title without accidentally taking a nested script title."""
+    if not isinstance(record, dict):
+        return None
+
+    def title_from_mapping(mapping):
+        if not isinstance(mapping, dict):
+            return None
+        for key, value in mapping.items():
+            if re.sub(r"[^a-z0-9]", "", str(key).casefold()) in {"projecttitle", "projectname"}:
+                if isinstance(value, dict):
+                    for nested_key, nested_value in value.items():
+                        if re.sub(r"[^a-z0-9]", "", str(nested_key).casefold()) in {"projecttitle", "title", "name"} and nested_value not in (None, "", [], {}):
+                            value = nested_value
+                            break
+                if isinstance(value, (str, int, float)) and str(value).strip():
+                    return str(value).strip()
+        return None
+
+    value = title_from_mapping(record)
+    if value:
+        return value
+    for key, value in record.items():
+        if re.sub(r"[^a-z0-9]", "", str(key).casefold()) == "automation" and isinstance(value, dict):
+            title = title_from_mapping(value)
+            if title:
+                return title
+    # A small number of legacy records wrap the project_name object.
+    for key, value in record.items():
+        if re.sub(r"[^a-z0-9]", "", str(key).casefold()) in {"projectname", "project"} and isinstance(value, dict):
+            title = title_from_mapping(value)
+            if title:
+                return title
+    return None
+
+
+def _sceneiq_is_project_record(record):
+    """A queue item must own both a project title and a script payload."""
+    if not isinstance(record, dict) or not _sceneiq_direct_project_title(record):
+        return False
+    for key, value in record.items():
+        if re.sub(r"[^a-z0-9]", "", str(key).casefold()) in {"script", "scriptjson"} and isinstance(value, (dict, list)) and bool(value):
+            return True
+    return False
+
+
+def _sceneiq_select_current_project_record(data):
+    """Return (record, parent_container, parent_key_or_index) for the first queued job."""
+    def search(node, parent=None, parent_key=None):
+        if _sceneiq_is_project_record(node):
+            return node, parent, parent_key
+        if isinstance(node, list):
+            # Prefer a direct queue item over descending into its children.
+            for index, child in enumerate(node):
+                if _sceneiq_is_project_record(child):
+                    return child, node, index
+            for index, child in enumerate(node):
+                if isinstance(child, (dict, list)):
+                    found = search(child, node, index)
+                    if found[0] is not None:
+                        return found
+        elif isinstance(node, dict):
+            for key, child in node.items():
+                if isinstance(child, list):
+                    for index, item in enumerate(child):
+                        if _sceneiq_is_project_record(item):
+                            return item, child, index
+            for key, child in node.items():
+                if isinstance(child, (dict, list)):
+                    found = search(child, node, key)
+                    if found[0] is not None:
+                        return found
+        return None, None, None
+
+    return search(data)
+
+
+def _sceneiq_iter_project_records(data):
+    """Yield every independent project record in a queue, without yielding its nested script as a job."""
+    records = []
+    seen = set()
+
+    def visit(node):
+        if _sceneiq_is_project_record(node):
+            identity = id(node)
+            if identity not in seen:
+                seen.add(identity)
+                records.append(node)
+            return
+        if isinstance(node, dict):
+            for child in node.values():
+                if isinstance(child, (dict, list)):
+                    visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                if isinstance(child, (dict, list)):
+                    visit(child)
+
+    visit(data)
+    return records
+
+
+def _sceneiq_extract_youtube_details(project_record):
+    """Find the YouTube details object belonging to this project only."""
+    wanted = {"youtubedetails", "youtubemetadata", "youtubeinformation"}
+    def visit(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                normalized = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+                if normalized in wanted and value not in (None, "", [], {}):
+                    return value
+            for value in node.values():
+                found = visit(value)
+                if found is not None:
+                    return found
+        elif isinstance(node, list):
+            for value in node:
+                found = visit(value)
+                if found is not None:
+                    return found
+        return None
+    return visit(project_record)
+
+
+def _sceneiq_ensure_youtube_details_file(project_record, project_folder):
+    """Create edited/youtubedetails.text from this project's own READY/PANEL record."""
+    import json
+    import os
+
+    edited_folder = os.path.join(project_folder, "edited")
+    os.makedirs(edited_folder, exist_ok=True)
+    destination = os.path.join(edited_folder, "youtubedetails.text")
+    try:
+        if os.path.isfile(destination) and os.path.getsize(destination) > 0:
+            return destination
+    except OSError:
+        pass
+
+    details = _sceneiq_extract_youtube_details(project_record)
+    if isinstance(details, str):
+        content = details
+    elif details is not None:
+        content = json.dumps(details, ensure_ascii=False, indent=4)
+    else:
+        # Keep the expected handoff file present even for a legacy record that
+        # predates YouTube metadata; do not borrow details from another project.
+        content = ""
+        print(
+            f"⚠️ [YOUTUBE-DETAILS] No youtube_details field was found for this project; "
+            f"creating an empty placeholder at {destination}."
+        )
+
+    temporary = destination + f".incoming_{os.getpid()}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+            if content and not content.endswith("\n"):
+                handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        if not os.path.isfile(destination):
+            raise IOError("YouTube details text file was not created")
+        if details is not None and os.path.getsize(destination) <= 0:
+            raise IOError("YouTube details text file is empty after writing")
+        print(f"✅ [YOUTUBE-DETAILS] Saved this project's YouTube details: {destination}")
+        return destination
+    finally:
+        try:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        except OSError:
+            pass
+
 def _sceneiq_get_automation_settings(panel_data):
     automation = _sceneiq_find_named_object(panel_data, "automation")
     if isinstance(automation, dict):
@@ -1253,6 +1431,16 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
 
     def _set_currently_running(value, status=None, operation_status=None):
         data = _load_panel()
+        # After a queue item is transferred, the first remaining project is the
+        # next job. Never stamp the previous job's "completed" state onto it.
+        if str(status or "").strip().casefold() == "completed":
+            next_record, _next_parent, _next_key = _sceneiq_select_current_project_record(data)
+            if next_record is not None:
+                print(
+                    f"ℹ️ [PROJECT-QUEUE] Preserving the next queued project "
+                    f"'{_sceneiq_direct_project_title(next_record)}' without inheriting the previous completion status."
+                )
+                return True
         container = _find_status_container(data)
 
         if container is None:
@@ -1278,74 +1466,61 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
         return _save_panel(data)
 
     def _transfer_completed_project_to_ready_script(images_folder, expected_entries):
-        """
-        Append a completed project snapshot to READY_SCRIPT without overwriting
-        existing projects. Only remove project_name from PANEL_PATH after the
-        append has been successfully written and verified.
-        """
+        """Transfer ONLY the active project after its complete image set is verified."""
         import copy
 
-        # Verify the exact scene-image naming convention and the required
-        # video-level thumbnail before the project can be marked complete.
         image_extensions = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
         found_entries = set()
         if os.path.isdir(images_folder):
             for filename in os.listdir(images_folder):
-                match = re.fullmatch(
-                    r"entry_(\d+)\.(png|jpg|jpeg|gif|webp|bmp|tiff)",
-                    filename,
-                    re.IGNORECASE
-                )
+                match = re.fullmatch(r"entry_(\d+)\.(png|jpg|jpeg|gif|webp|bmp|tiff)", filename, re.IGNORECASE)
                 if not match:
                     continue
                 number = int(match.group(1))
                 full_path = os.path.join(images_folder, filename)
                 try:
-                    if (
-                        1 <= number <= expected_entries
-                        and os.path.isfile(full_path)
-                        and os.path.getsize(full_path) > 0
-                        and os.path.splitext(filename)[1].lower() in image_extensions
-                    ):
+                    if 1 <= number <= expected_entries and os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
                         found_entries.add(number)
                 except OSError:
                     pass
 
-        missing = [
-            f"entry_{number}"
-            for number in range(1, expected_entries + 1)
-            if number not in found_entries
-        ]
-
+        missing = [f"entry_{number}" for number in range(1, expected_entries + 1) if number not in found_entries]
         thumbnail_path = os.path.join(images_folder, "Thumbnail.png")
         if not os.path.isfile(thumbnail_path) or os.path.getsize(thumbnail_path) <= 0:
             missing.append("Thumbnail.png")
-
         if missing:
             print("❌ [READY-SCRIPT] Transfer cancelled; missing required image(s): " + ", ".join(missing))
             update_operation_status(
                 "Project was not transferred because one or more scene images or Thumbnail.png are missing",
-                is_error=True
+                is_error=True,
             )
             return False
 
-        # Re-read the source so status updates made during the workflow are retained.
         try:
             with open(PANEL_PATH, "r", encoding="utf-8") as source_file:
                 source_data = json.load(source_file)
             if not isinstance(source_data, (dict, list)):
-                print("❌ [READY-SCRIPT] Source panel is not a JSON object/list.")
-                return False
+                raise TypeError("panel.json root must be a JSON object or list")
 
-            source_title = _find_project_title(source_data)
-            project_snapshot = copy.deepcopy(source_data)
+            source_record, source_parent, source_parent_key = _sceneiq_select_current_project_record(source_data)
+            if source_record is None:
+                # Legacy single-project wrappers remain supported.
+                source_record = source_data
+                source_parent = None
+                source_parent_key = None
+            source_title = _sceneiq_direct_project_title(source_record) or _find_project_title(source_record)
+            expected_title = str(project_title or "").strip()
+            if expected_title and source_title and expected_title.casefold() != source_title.casefold():
+                raise RuntimeError(
+                    f"The active queue item changed during generation (expected '{expected_title}', "
+                    f"found '{source_title}'). Refusing to transfer another project."
+                )
+
+            # Snapshot only this selected job, never its sibling queue records.
+            project_snapshot = copy.deepcopy(source_record)
             snapshot_status_container = _find_status_container(project_snapshot)
-            if snapshot_status_container is None:
-                if isinstance(project_snapshot, dict):
-                    snapshot_status_container = project_snapshot
-                elif isinstance(project_snapshot, list):
-                    snapshot_status_container = {"_automation_status": True}
-                    project_snapshot.append(snapshot_status_container)
+            if snapshot_status_container is None and isinstance(project_snapshot, dict):
+                snapshot_status_container = project_snapshot
             if isinstance(snapshot_status_container, dict):
                 snapshot_status_container["currently_running"] = "sceneiq_google_flow_images_generation_engine_successful"
                 snapshot_status_container["status"] = "completed"
@@ -1356,79 +1531,95 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
             ready_dir = os.path.dirname(READY_SCRIPT)
             if ready_dir:
                 os.makedirs(ready_dir, exist_ok=True)
-
             if os.path.exists(READY_SCRIPT) and os.path.getsize(READY_SCRIPT) > 0:
                 with open(READY_SCRIPT, "r", encoding="utf-8") as ready_file:
                     ready_data = json.load(ready_file)
             else:
                 ready_data = {"projects": []}
 
-            # Supported append formats: a JSON list, {"projects": [...]}, or a
-            # legacy single-project object. Preserve existing metadata/projects.
             if isinstance(ready_data, list):
                 ready_data.append(project_snapshot)
             elif isinstance(ready_data, dict):
-                if isinstance(ready_data.get("projects"), list):
-                    ready_data["projects"].append(project_snapshot)
+                projects_key = next(
+                    (key for key, value in ready_data.items() if _normalise_key(key) in {"projects", "jobs", "queue"} and isinstance(value, list)),
+                    None,
+                )
+                if projects_key is not None:
+                    ready_data[projects_key].append(project_snapshot)
                 elif _find_field(ready_data, ("project_title", "projectTitle", "project_name", "projectName")) is not None:
-                    existing_project = ready_data
-                    ready_data = {"projects": [existing_project, project_snapshot]}
+                    ready_data = {"projects": [ready_data, project_snapshot]}
                 else:
                     ready_data["projects"] = [project_snapshot]
             else:
                 raise ValueError("ready_script.json must contain a JSON object or list")
 
-            with open(READY_SCRIPT, "w", encoding="utf-8") as ready_file:
-                json.dump(ready_data, ready_file, indent=4, ensure_ascii=False)
-                ready_file.flush()
-                os.fsync(ready_file.fileno())
+            temporary_ready = READY_SCRIPT + f".incoming_{os.getpid()}.tmp"
+            try:
+                with open(temporary_ready, "w", encoding="utf-8") as ready_file:
+                    json.dump(ready_data, ready_file, indent=4, ensure_ascii=False)
+                    ready_file.flush()
+                    os.fsync(ready_file.fileno())
+                os.replace(temporary_ready, READY_SCRIPT)
+            finally:
+                try:
+                    if os.path.exists(temporary_ready):
+                        os.remove(temporary_ready)
+                except OSError:
+                    pass
 
-            # Verify the appended project can be read back before touching source.
             with open(READY_SCRIPT, "r", encoding="utf-8") as verify_file:
                 verified_data = json.load(verify_file)
-            if isinstance(verified_data, list):
-                verified = any(
-                    isinstance(item, (dict, list))
-                    and _find_field(item, ("project_title", "projectTitle", "project_name", "projectName")) is not None
-                    and _find_project_title(item) == source_title
-                    for item in verified_data
-                )
-            else:
-                verified = any(
-                    isinstance(item, (dict, list))
-                    and _find_field(item, ("project_title", "projectTitle", "project_name", "projectName")) is not None
-                    and _find_project_title(item) == source_title
-                    for item in verified_data.get("projects", [])
-                )
+            verified = any(
+                (_sceneiq_direct_project_title(item) or _find_project_title(item)).casefold() == str(source_title).casefold()
+                for item in _sceneiq_iter_project_records(verified_data)
+                if isinstance(item, dict)
+            )
             if not verified:
-                raise IOError("Could not verify the project in ready_script.json")
+                raise IOError(f"Could not verify project '{source_title}' in ready_script.json")
 
-            # Remove only the completed project payload while preserving the
-            # original root type (dictionary OR list) and its wrapper structure.
-            if isinstance(source_data, (dict, list)):
+            # Remove exactly the selected queue item. Do not recursively remove
+            # title/script fields from the remaining jobs.
+            if isinstance(source_parent, list):
+                del source_parent[source_parent_key]
+                remaining_record, _remaining_parent, _remaining_key = _sceneiq_select_current_project_record(source_data)
+                if remaining_record is not None:
+                    print(
+                        f"➡️ [PROJECT-QUEUE] '{source_title}' transferred alone. "
+                        f"Next job remains queued: '{_sceneiq_direct_project_title(remaining_record)}'."
+                    )
+            elif isinstance(source_parent, dict):
+                source_parent.pop(source_parent_key, None)
+            else:
                 _remove_project_payload(source_data)
                 source_status_container = _find_status_container(source_data)
-                if source_status_container is None:
-                    if isinstance(source_data, dict):
-                        source_status_container = source_data
-                    else:
-                        source_status_container = {"_automation_status": True}
-                        source_data.append(source_status_container)
-                source_status_container["currently_running"] = "sceneiq_google_flow_images_generation_engine_successful"
-                source_status_container["status"] = "completed"
-                source_status_container["operation_status"] = f"Project transferred to ready script: {source_title}"
-            with open(PANEL_PATH, "w", encoding="utf-8") as source_file:
-                json.dump(source_data, source_file, indent=4, ensure_ascii=False)
+                if source_status_container is None and isinstance(source_data, dict):
+                    source_status_container = source_data
+                if isinstance(source_status_container, dict):
+                    source_status_container["currently_running"] = "sceneiq_google_flow_images_generation_engine_successful"
+                    source_status_container["status"] = "completed"
+                    source_status_container["operation_status"] = f"Project transferred to ready script: {source_title}"
+
+            temporary_source = PANEL_PATH + f".incoming_{os.getpid()}.tmp"
+            try:
+                with open(temporary_source, "w", encoding="utf-8") as source_file:
+                    json.dump(source_data, source_file, indent=4, ensure_ascii=False)
+                    source_file.flush()
+                    os.fsync(source_file.fileno())
+                os.replace(temporary_source, PANEL_PATH)
+            finally:
+                try:
+                    if os.path.exists(temporary_source):
+                        os.remove(temporary_source)
+                except OSError:
+                    pass
 
             print(
-                f"✅ [READY-SCRIPT] Appended completed project "
-                f"'{source_title}' "
-                f"to {READY_SCRIPT}; removed completed project payload from {PANEL_PATH}"
+                f"✅ [READY-SCRIPT] Appended only '{source_title}' to {READY_SCRIPT}; "
+                f"removed only that job from {PANEL_PATH}."
             )
             return True
-
         except Exception as exc:
-            print(f"❌ [READY-SCRIPT] Failed to transfer completed project: {exc}")
+            print(f"❌ [READY-SCRIPT] Failed to transfer the active project: {exc}")
             traceback.print_exc()
             update_operation_status(f"Failed to transfer completed project: {exc}", is_error=True)
             return False
@@ -1447,6 +1638,21 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
     try:
         with open(PANEL_PATH, 'r', encoding='utf-8') as file:
             panel_data = json.load(file)
+
+        active_project_record, active_project_parent, active_project_parent_key = (
+            _sceneiq_select_current_project_record(panel_data)
+        )
+        if active_project_record is not None:
+            if isinstance(panel_data, list) and active_project_parent is panel_data:
+                print(
+                    f"🎯 [PROJECT-QUEUE] Isolated first project job "
+                    f"'{_sceneiq_direct_project_title(active_project_record)}' "
+                    f"from {len(panel_data)} queued item(s)."
+                )
+            panel_data = active_project_record
+        else:
+            # Preserve compatibility with legacy single-project wrapper formats.
+            active_project_record = panel_data
 
         image_generation_engine = _find_engine(panel_data)
 
@@ -6058,6 +6264,14 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
                 project_title,
                 project_category=project_category,
             )
+            youtube_details_path = _sceneiq_ensure_youtube_details_file(
+                active_project_record if isinstance(active_project_record, (dict, list)) else panel_data,
+                images_folder,
+            )
+            if not youtube_details_path or not os.path.isfile(youtube_details_path):
+                raise IOError(
+                    f"Could not prepare YouTube details for the current project '{project_title}'."
+                )
             print(f"🎬 [MAIN] Starting Google Flow image generation workflow...")
             print(f"🖥️ [MAIN] GUI Images path: {GUI_IMAGES}")
             print(f"📁 [MAIN] Project: '{project_title}'")
@@ -6482,6 +6696,13 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
                 panel_data = _load_panel()
                 if not panel_data:
                     raise ValueError("panel.json is empty, missing, or could not be read")
+                active_project_record, active_project_parent, active_project_parent_key = (
+                    _sceneiq_select_current_project_record(panel_data)
+                )
+                if active_project_record is not None:
+                    panel_data = active_project_record
+                else:
+                    active_project_record = panel_data
                 image_generation_engine = _find_engine(panel_data)
                 if image_generation_engine.lower() != "google flow":
                     print(f"ℹ️ [ENGINE] Image generation engine changed to '{image_generation_engine}'; Google Flow worker will stop.")
@@ -6492,6 +6713,7 @@ def sceneiq_google_flow_images_generation_engine_mp_opertion():
                     )
                     break
                 project_title = _find_project_title(panel_data)
+                project_category = _find_field(panel_data, ("projectcategory", "project_category", "projectCategory"))
                 script_data = _find_script_data(panel_data)
                 all_entries.clear()
                 _collect_scene_entries(script_data)
@@ -7129,6 +7351,16 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
 
     def _set_currently_running(value, status=None, operation_status=None):
         data = _load_panel()
+        # After a queue item is transferred, the first remaining project is the
+        # next job. Never stamp the previous job's "completed" state onto it.
+        if str(status or "").strip().casefold() == "completed":
+            next_record, _next_parent, _next_key = _sceneiq_select_current_project_record(data)
+            if next_record is not None:
+                print(
+                    f"ℹ️ [PROJECT-QUEUE] Preserving the next queued project "
+                    f"'{_sceneiq_direct_project_title(next_record)}' without inheriting the previous completion status."
+                )
+                return True
         container = _find_status_container(data)
 
         if container is None:
@@ -7154,74 +7386,61 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
         return _save_panel(data)
 
     def _transfer_completed_project_to_ready_script(images_folder, expected_entries):
-        """
-        Append a completed project snapshot to READY_SCRIPT without overwriting
-        existing projects. Only remove project_name from PANEL_PATH after the
-        append has been successfully written and verified.
-        """
+        """Transfer ONLY the active project after its complete image set is verified."""
         import copy
 
-        # Verify the exact scene-image naming convention and the required
-        # video-level thumbnail before the project can be marked complete.
         image_extensions = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
         found_entries = set()
         if os.path.isdir(images_folder):
             for filename in os.listdir(images_folder):
-                match = re.fullmatch(
-                    r"entry_(\d+)\.(png|jpg|jpeg|gif|webp|bmp|tiff)",
-                    filename,
-                    re.IGNORECASE
-                )
+                match = re.fullmatch(r"entry_(\d+)\.(png|jpg|jpeg|gif|webp|bmp|tiff)", filename, re.IGNORECASE)
                 if not match:
                     continue
                 number = int(match.group(1))
                 full_path = os.path.join(images_folder, filename)
                 try:
-                    if (
-                        1 <= number <= expected_entries
-                        and os.path.isfile(full_path)
-                        and os.path.getsize(full_path) > 0
-                        and os.path.splitext(filename)[1].lower() in image_extensions
-                    ):
+                    if 1 <= number <= expected_entries and os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
                         found_entries.add(number)
                 except OSError:
                     pass
 
-        missing = [
-            f"entry_{number}"
-            for number in range(1, expected_entries + 1)
-            if number not in found_entries
-        ]
-
+        missing = [f"entry_{number}" for number in range(1, expected_entries + 1) if number not in found_entries]
         thumbnail_path = os.path.join(images_folder, "Thumbnail.png")
         if not os.path.isfile(thumbnail_path) or os.path.getsize(thumbnail_path) <= 0:
             missing.append("Thumbnail.png")
-
         if missing:
             print("❌ [READY-SCRIPT] Transfer cancelled; missing required image(s): " + ", ".join(missing))
             update_operation_status(
                 "Project was not transferred because one or more scene images or Thumbnail.png are missing",
-                is_error=True
+                is_error=True,
             )
             return False
 
-        # Re-read the source so status updates made during the workflow are retained.
         try:
             with open(PANEL_PATH, "r", encoding="utf-8") as source_file:
                 source_data = json.load(source_file)
             if not isinstance(source_data, (dict, list)):
-                print("❌ [READY-SCRIPT] Source panel is not a JSON object/list.")
-                return False
+                raise TypeError("panel.json root must be a JSON object or list")
 
-            source_title = _find_project_title(source_data)
-            project_snapshot = copy.deepcopy(source_data)
+            source_record, source_parent, source_parent_key = _sceneiq_select_current_project_record(source_data)
+            if source_record is None:
+                # Legacy single-project wrappers remain supported.
+                source_record = source_data
+                source_parent = None
+                source_parent_key = None
+            source_title = _sceneiq_direct_project_title(source_record) or _find_project_title(source_record)
+            expected_title = str(project_title or "").strip()
+            if expected_title and source_title and expected_title.casefold() != source_title.casefold():
+                raise RuntimeError(
+                    f"The active queue item changed during generation (expected '{expected_title}', "
+                    f"found '{source_title}'). Refusing to transfer another project."
+                )
+
+            # Snapshot only this selected job, never its sibling queue records.
+            project_snapshot = copy.deepcopy(source_record)
             snapshot_status_container = _find_status_container(project_snapshot)
-            if snapshot_status_container is None:
-                if isinstance(project_snapshot, dict):
-                    snapshot_status_container = project_snapshot
-                elif isinstance(project_snapshot, list):
-                    snapshot_status_container = {"_automation_status": True}
-                    project_snapshot.append(snapshot_status_container)
+            if snapshot_status_container is None and isinstance(project_snapshot, dict):
+                snapshot_status_container = project_snapshot
             if isinstance(snapshot_status_container, dict):
                 snapshot_status_container["currently_running"] = "sceneiq_google_flow_images_generation_engine_successful"
                 snapshot_status_container["status"] = "completed"
@@ -7232,79 +7451,95 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
             ready_dir = os.path.dirname(READY_SCRIPT)
             if ready_dir:
                 os.makedirs(ready_dir, exist_ok=True)
-
             if os.path.exists(READY_SCRIPT) and os.path.getsize(READY_SCRIPT) > 0:
                 with open(READY_SCRIPT, "r", encoding="utf-8") as ready_file:
                     ready_data = json.load(ready_file)
             else:
                 ready_data = {"projects": []}
 
-            # Supported append formats: a JSON list, {"projects": [...]}, or a
-            # legacy single-project object. Preserve existing metadata/projects.
             if isinstance(ready_data, list):
                 ready_data.append(project_snapshot)
             elif isinstance(ready_data, dict):
-                if isinstance(ready_data.get("projects"), list):
-                    ready_data["projects"].append(project_snapshot)
+                projects_key = next(
+                    (key for key, value in ready_data.items() if _normalise_key(key) in {"projects", "jobs", "queue"} and isinstance(value, list)),
+                    None,
+                )
+                if projects_key is not None:
+                    ready_data[projects_key].append(project_snapshot)
                 elif _find_field(ready_data, ("project_title", "projectTitle", "project_name", "projectName")) is not None:
-                    existing_project = ready_data
-                    ready_data = {"projects": [existing_project, project_snapshot]}
+                    ready_data = {"projects": [ready_data, project_snapshot]}
                 else:
                     ready_data["projects"] = [project_snapshot]
             else:
                 raise ValueError("ready_script.json must contain a JSON object or list")
 
-            with open(READY_SCRIPT, "w", encoding="utf-8") as ready_file:
-                json.dump(ready_data, ready_file, indent=4, ensure_ascii=False)
-                ready_file.flush()
-                os.fsync(ready_file.fileno())
+            temporary_ready = READY_SCRIPT + f".incoming_{os.getpid()}.tmp"
+            try:
+                with open(temporary_ready, "w", encoding="utf-8") as ready_file:
+                    json.dump(ready_data, ready_file, indent=4, ensure_ascii=False)
+                    ready_file.flush()
+                    os.fsync(ready_file.fileno())
+                os.replace(temporary_ready, READY_SCRIPT)
+            finally:
+                try:
+                    if os.path.exists(temporary_ready):
+                        os.remove(temporary_ready)
+                except OSError:
+                    pass
 
-            # Verify the appended project can be read back before touching source.
             with open(READY_SCRIPT, "r", encoding="utf-8") as verify_file:
                 verified_data = json.load(verify_file)
-            if isinstance(verified_data, list):
-                verified = any(
-                    isinstance(item, (dict, list))
-                    and _find_field(item, ("project_title", "projectTitle", "project_name", "projectName")) is not None
-                    and _find_project_title(item) == source_title
-                    for item in verified_data
-                )
-            else:
-                verified = any(
-                    isinstance(item, (dict, list))
-                    and _find_field(item, ("project_title", "projectTitle", "project_name", "projectName")) is not None
-                    and _find_project_title(item) == source_title
-                    for item in verified_data.get("projects", [])
-                )
+            verified = any(
+                (_sceneiq_direct_project_title(item) or _find_project_title(item)).casefold() == str(source_title).casefold()
+                for item in _sceneiq_iter_project_records(verified_data)
+                if isinstance(item, dict)
+            )
             if not verified:
-                raise IOError("Could not verify the project in ready_script.json")
+                raise IOError(f"Could not verify project '{source_title}' in ready_script.json")
 
-            # Remove only the completed project payload while preserving the
-            # original root type (dictionary OR list) and its wrapper structure.
-            if isinstance(source_data, (dict, list)):
+            # Remove exactly the selected queue item. Do not recursively remove
+            # title/script fields from the remaining jobs.
+            if isinstance(source_parent, list):
+                del source_parent[source_parent_key]
+                remaining_record, _remaining_parent, _remaining_key = _sceneiq_select_current_project_record(source_data)
+                if remaining_record is not None:
+                    print(
+                        f"➡️ [PROJECT-QUEUE] '{source_title}' transferred alone. "
+                        f"Next job remains queued: '{_sceneiq_direct_project_title(remaining_record)}'."
+                    )
+            elif isinstance(source_parent, dict):
+                source_parent.pop(source_parent_key, None)
+            else:
                 _remove_project_payload(source_data)
                 source_status_container = _find_status_container(source_data)
-                if source_status_container is None:
-                    if isinstance(source_data, dict):
-                        source_status_container = source_data
-                    else:
-                        source_status_container = {"_automation_status": True}
-                        source_data.append(source_status_container)
-                source_status_container["currently_running"] = "sceneiq_google_flow_images_generation_engine_successful"
-                source_status_container["status"] = "completed"
-                source_status_container["operation_status"] = f"Project transferred to ready script: {source_title}"
-            with open(PANEL_PATH, "w", encoding="utf-8") as source_file:
-                json.dump(source_data, source_file, indent=4, ensure_ascii=False)
+                if source_status_container is None and isinstance(source_data, dict):
+                    source_status_container = source_data
+                if isinstance(source_status_container, dict):
+                    source_status_container["currently_running"] = "sceneiq_google_flow_images_generation_engine_successful"
+                    source_status_container["status"] = "completed"
+                    source_status_container["operation_status"] = f"Project transferred to ready script: {source_title}"
+
+            temporary_source = PANEL_PATH + f".incoming_{os.getpid()}.tmp"
+            try:
+                with open(temporary_source, "w", encoding="utf-8") as source_file:
+                    json.dump(source_data, source_file, indent=4, ensure_ascii=False)
+                    source_file.flush()
+                    os.fsync(source_file.fileno())
+                os.replace(temporary_source, PANEL_PATH)
+            finally:
+                try:
+                    if os.path.exists(temporary_source):
+                        os.remove(temporary_source)
+                except OSError:
+                    pass
 
             print(
-                f"✅ [READY-SCRIPT] Appended completed project "
-                f"'{source_title}' "
-                f"to {READY_SCRIPT}; removed completed project payload from {PANEL_PATH}"
+                f"✅ [READY-SCRIPT] Appended only '{source_title}' to {READY_SCRIPT}; "
+                f"removed only that job from {PANEL_PATH}."
             )
             return True
-
         except Exception as exc:
-            print(f"❌ [READY-SCRIPT] Failed to transfer completed project: {exc}")
+            print(f"❌ [READY-SCRIPT] Failed to transfer the active project: {exc}")
             traceback.print_exc()
             update_operation_status(f"Failed to transfer completed project: {exc}", is_error=True)
             return False
@@ -7323,6 +7558,21 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
     try:
         with open(PANEL_PATH, 'r', encoding='utf-8') as file:
             panel_data = json.load(file)
+
+        active_project_record, active_project_parent, active_project_parent_key = (
+            _sceneiq_select_current_project_record(panel_data)
+        )
+        if active_project_record is not None:
+            if isinstance(panel_data, list) and active_project_parent is panel_data:
+                print(
+                    f"🎯 [PROJECT-QUEUE] Isolated first project job "
+                    f"'{_sceneiq_direct_project_title(active_project_record)}' "
+                    f"from {len(panel_data)} queued item(s)."
+                )
+            panel_data = active_project_record
+        else:
+            # Preserve compatibility with legacy single-project wrapper formats.
+            active_project_record = panel_data
 
         image_generation_engine = _find_engine(panel_data)
 
@@ -10288,6 +10538,14 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
                 project_title,
                 project_category=project_category,
             )
+            youtube_details_path = _sceneiq_ensure_youtube_details_file(
+                active_project_record if isinstance(active_project_record, (dict, list)) else panel_data,
+                images_folder,
+            )
+            if not youtube_details_path or not os.path.isfile(youtube_details_path):
+                raise IOError(
+                    f"Could not prepare YouTube details for the current project '{project_title}'."
+                )
             print(f"🎬 [MAIN] Starting Google Flow image generation workflow...")
             print(f"🖥️ [MAIN] GUI Images path: {GUI_IMAGES}")
             print(f"📁 [MAIN] Project: '{project_title}'")
@@ -10715,6 +10973,13 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
                 panel_data = _load_panel()
                 if not panel_data:
                     raise ValueError("panel.json is empty, missing, or could not be read")
+                active_project_record, active_project_parent, active_project_parent_key = (
+                    _sceneiq_select_current_project_record(panel_data)
+                )
+                if active_project_record is not None:
+                    panel_data = active_project_record
+                else:
+                    active_project_record = panel_data
                 image_generation_engine = _find_engine(panel_data)
                 if image_generation_engine.lower() != "google flow":
                     print(f"ℹ️ [ENGINE] Image generation engine changed to '{image_generation_engine}'; Google Flow worker will stop.")
@@ -10725,6 +10990,7 @@ def sceneiq_google_flow_images_generation_engine_single_operation():
                     )
                     break
                 project_title = _find_project_title(panel_data)
+                project_category = _find_field(panel_data, ("projectcategory", "project_category", "projectCategory"))
                 script_data = _find_script_data(panel_data)
                 all_entries.clear()
                 _collect_scene_entries(script_data)

@@ -193,6 +193,180 @@ def _sceneiq_resolve_project_folder_path(
         return os.path.abspath(destination)
     return None
 
+def _sceneiq_direct_project_title(record):
+    """Read a project's own title without accidentally taking a nested script title."""
+    if not isinstance(record, dict):
+        return None
+
+    def title_from_mapping(mapping):
+        if not isinstance(mapping, dict):
+            return None
+        for key, value in mapping.items():
+            if re.sub(r"[^a-z0-9]", "", str(key).casefold()) in {"projecttitle", "projectname"}:
+                if isinstance(value, dict):
+                    for nested_key, nested_value in value.items():
+                        if re.sub(r"[^a-z0-9]", "", str(nested_key).casefold()) in {"projecttitle", "title", "name"} and nested_value not in (None, "", [], {}):
+                            value = nested_value
+                            break
+                if isinstance(value, (str, int, float)) and str(value).strip():
+                    return str(value).strip()
+        return None
+
+    value = title_from_mapping(record)
+    if value:
+        return value
+    for key, value in record.items():
+        if re.sub(r"[^a-z0-9]", "", str(key).casefold()) == "automation" and isinstance(value, dict):
+            title = title_from_mapping(value)
+            if title:
+                return title
+    # A small number of legacy records wrap the project_name object.
+    for key, value in record.items():
+        if re.sub(r"[^a-z0-9]", "", str(key).casefold()) in {"projectname", "project"} and isinstance(value, dict):
+            title = title_from_mapping(value)
+            if title:
+                return title
+    return None
+
+
+def _sceneiq_is_project_record(record):
+    """A queue item must own both a project title and a script payload."""
+    if not isinstance(record, dict) or not _sceneiq_direct_project_title(record):
+        return False
+    for key, value in record.items():
+        if re.sub(r"[^a-z0-9]", "", str(key).casefold()) in {"script", "scriptjson"} and isinstance(value, (dict, list)) and bool(value):
+            return True
+    return False
+
+
+def _sceneiq_select_current_project_record(data):
+    """Return (record, parent_container, parent_key_or_index) for the first queued job."""
+    def search(node, parent=None, parent_key=None):
+        if _sceneiq_is_project_record(node):
+            return node, parent, parent_key
+        if isinstance(node, list):
+            # Prefer a direct queue item over descending into its children.
+            for index, child in enumerate(node):
+                if _sceneiq_is_project_record(child):
+                    return child, node, index
+            for index, child in enumerate(node):
+                if isinstance(child, (dict, list)):
+                    found = search(child, node, index)
+                    if found[0] is not None:
+                        return found
+        elif isinstance(node, dict):
+            for key, child in node.items():
+                if isinstance(child, list):
+                    for index, item in enumerate(child):
+                        if _sceneiq_is_project_record(item):
+                            return item, child, index
+            for key, child in node.items():
+                if isinstance(child, (dict, list)):
+                    found = search(child, node, key)
+                    if found[0] is not None:
+                        return found
+        return None, None, None
+
+    return search(data)
+
+
+def _sceneiq_iter_project_records(data):
+    """Yield every independent project record in a queue, without yielding its nested script as a job."""
+    records = []
+    seen = set()
+
+    def visit(node):
+        if _sceneiq_is_project_record(node):
+            identity = id(node)
+            if identity not in seen:
+                seen.add(identity)
+                records.append(node)
+            return
+        if isinstance(node, dict):
+            for child in node.values():
+                if isinstance(child, (dict, list)):
+                    visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                if isinstance(child, (dict, list)):
+                    visit(child)
+
+    visit(data)
+    return records
+
+
+def _sceneiq_extract_youtube_details(project_record):
+    """Find the YouTube details object belonging to this project only."""
+    wanted = {"youtubedetails", "youtubemetadata", "youtubeinformation"}
+    def visit(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                normalized = re.sub(r"[^a-z0-9]", "", str(key).casefold())
+                if normalized in wanted and value not in (None, "", [], {}):
+                    return value
+            for value in node.values():
+                found = visit(value)
+                if found is not None:
+                    return found
+        elif isinstance(node, list):
+            for value in node:
+                found = visit(value)
+                if found is not None:
+                    return found
+        return None
+    return visit(project_record)
+
+
+def _sceneiq_ensure_youtube_details_file(project_record, project_folder):
+    """Create edited/youtubedetails.text from this project's own READY/PANEL record."""
+    import json
+    import os
+
+    edited_folder = os.path.join(project_folder, "edited")
+    os.makedirs(edited_folder, exist_ok=True)
+    destination = os.path.join(edited_folder, "youtubedetails.text")
+    try:
+        if os.path.isfile(destination) and os.path.getsize(destination) > 0:
+            return destination
+    except OSError:
+        pass
+
+    details = _sceneiq_extract_youtube_details(project_record)
+    if isinstance(details, str):
+        content = details
+    elif details is not None:
+        content = json.dumps(details, ensure_ascii=False, indent=4)
+    else:
+        # Keep the expected handoff file present even for a legacy record that
+        # predates YouTube metadata; do not borrow details from another project.
+        content = ""
+        print(
+            f"⚠️ [YOUTUBE-DETAILS] No youtube_details field was found for this project; "
+            f"creating an empty placeholder at {destination}."
+        )
+
+    temporary = destination + f".incoming_{os.getpid()}.tmp"
+    try:
+        with open(temporary, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+            if content and not content.endswith("\n"):
+                handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        if not os.path.isfile(destination):
+            raise IOError("YouTube details text file was not created")
+        if details is not None and os.path.getsize(destination) <= 0:
+            raise IOError("YouTube details text file is empty after writing")
+        print(f"✅ [YOUTUBE-DETAILS] Saved this project's YouTube details: {destination}")
+        return destination
+    finally:
+        try:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        except OSError:
+            pass
+
 
 def process_single_video(
     target_project_title=None,
@@ -731,6 +905,13 @@ def process_single_video(
                     f"for '{candidate_title}' (category={candidate_category!r}); skipping."
                 )
                 continue
+            try:
+                _sceneiq_ensure_youtube_details_file(candidate, candidate_folder)
+            except Exception as youtube_exc:
+                print(
+                    f"⚠️ [YOUTUBE-DETAILS] Could not prepare metadata for "
+                    f"'{candidate_title}': {youtube_exc}"
+                )
             normalized_candidate_title = normalize_project_title(candidate_title)
             candidate_edited_folder = os.path.join(candidate_folder, "edited")
             expected_video = os.path.join(
@@ -4296,6 +4477,73 @@ def _video_producer_normalize_title(name):
     normalized = re.sub(r"_+", "_", normalized).strip("_")
     return normalized or "unnamed_project"
 
+
+
+def _video_producer_sync_youtube_details_for_ready_script(ready_script_path, images_root):
+    """Ensure every READY_SCRIPT project has its own edited/youtubedetails.text file.
+
+    All project records are visited irrespective of status (pending, aborted,
+    completed, currently working, or other labels). Existing non-empty files are
+    preserved; missing/empty files are rebuilt only from that project's record.
+    """
+    import json
+    import os
+
+    with open(ready_script_path, "r", encoding="utf-8") as handle:
+        ready_data = json.load(handle)
+
+    records = _sceneiq_iter_project_records(ready_data)
+    copied = 0
+    existing = 0
+    for record in records:
+        title = _sceneiq_direct_project_title(record)
+        if not title:
+            continue
+        category = None
+        for key, value in record.items():
+            if re.sub(r"[^a-z0-9]", "", str(key).casefold()) in {"projectcategory", "category"} and value not in (None, "", [], {}):
+                category = str(value).strip()
+                break
+        if category is None:
+            automation = next(
+                (value for key, value in record.items()
+                 if re.sub(r"[^a-z0-9]", "", str(key).casefold()) == "automation" and isinstance(value, dict)),
+                None,
+            )
+            if isinstance(automation, dict):
+                for key, value in automation.items():
+                    if re.sub(r"[^a-z0-9]", "", str(key).casefold()) in {"projectcategory", "category"} and value not in (None, "", [], {}):
+                        category = str(value).strip()
+                        break
+
+        try:
+            project_folder = _sceneiq_resolve_project_folder_path(
+                images_root,
+                title,
+                project_category=category,
+                create_if_missing=True,
+            )
+            details_path = os.path.join(project_folder, "edited", "youtubedetails.text")
+            try:
+                if os.path.isfile(details_path) and os.path.getsize(details_path) > 0:
+                    existing += 1
+                    continue
+            except OSError:
+                pass
+            _sceneiq_ensure_youtube_details_file(record, project_folder)
+            copied += 1
+        except Exception as project_youtube_exc:
+            print(
+                f"⚠️ [YOUTUBE-DETAILS] Could not prepare details for '{title}'; "
+                f"continuing with the next project: {project_youtube_exc}"
+            )
+
+    print(
+        f"📄 [YOUTUBE-DETAILS] READY_SCRIPT audit complete: {copied} file(s) created/repaired, "
+        f"{existing} existing file(s) retained, {len(records)} project record(s) inspected."
+    )
+    return {"projects_checked": len(records), "files_created": copied, "files_existing": existing}
+
 def _video_producer_collect_ready_titles(ready_script_path):
     """Return unique project records from READY_SCRIPT, including projectcategory."""
     import json
@@ -7083,6 +7331,16 @@ def video_producer_main(cpu_workers=None, gpu_workers=None, max_projects=None):
         ready_script_snapshot_path,
         timeout_seconds=float(os.environ.get("VIDEO_WORKSPACE_COPY_TIMEOUT_SECONDS", "900")),
     )
+    try:
+        _video_producer_sync_youtube_details_for_ready_script(
+            ready_script_snapshot_path,
+            images_path,
+        )
+    except Exception as youtube_audit_exc:
+        # Metadata repair is best-effort for legacy/corrupt records; do not let
+        # one unavailable details file stop otherwise-valid video rendering.
+        print(f"⚠️ [YOUTUBE-DETAILS] READY_SCRIPT metadata audit encountered an error: {youtube_audit_exc}")
+
     project_records = _video_producer_collect_ready_titles(ready_script_snapshot_path)
     if max_projects is not None:
         project_records = project_records[:max(0, int(max_projects))]
