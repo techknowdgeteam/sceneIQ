@@ -20,6 +20,131 @@ READY_SCRIPT = r"C:\xampp\htdocs\AI automation\scenIQ\ready_script.json"
 IMAGES_PATH = r"C:\xampp\htdocs\AI automation\scenIQ\project"
 SUBSCRIBE_STICKERS = r"C:\xampp\htdocs\AI automation\scenIQ\subscribe"
 
+
+
+def _video_producer_open_shared_text(path, encoding="utf-8", errors="strict", newline=None):
+    """Open a text file for reading while allowing Windows to replace it.
+
+    The normal Windows CRT ``open()`` share mode does not include delete sharing.
+    A dashboard polling JSON while a worker atomically replaces it can therefore
+    make ``os.replace`` fail with WinError 5/32. CreateFileW explicitly allows
+    read, write, and delete sharing so readers never pin a checkpoint/status file.
+    """
+    import os
+    import io
+
+    if os.name != "nt":
+        return open(path, "r", encoding=encoding, errors=errors, newline=newline)
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+
+    handle = create_file(
+        os.path.abspath(os.fspath(path)),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    handle_value = handle if isinstance(handle, int) else handle.value
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle_value in (None, invalid_handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    try:
+        fd = msvcrt.open_osfhandle(int(handle_value), os.O_RDONLY | os.O_BINARY)
+    except Exception:
+        kernel32.CloseHandle(handle)
+        raise
+    return io.open(fd, "r", encoding=encoding, errors=errors, newline=newline, closefd=True)
+
+
+def _video_producer_replace_with_retry(source_path, destination_path, timeout_seconds=None):
+    """Atomically replace a file, retrying transient Windows sharing violations.
+
+    Never falls back to truncating the destination: a failed checkpoint write must
+    not leave partially written JSON. The source and destination should be on the
+    same volume so replacement remains atomic.
+    """
+    import errno
+    import os
+    import stat
+    import time
+
+    if timeout_seconds is None:
+        try:
+            timeout_seconds = float(os.environ.get("VIDEO_FILE_REPLACE_WAIT_SECONDS", "12"))
+        except (TypeError, ValueError):
+            timeout_seconds = 12.0
+    timeout_seconds = max(0.25, float(timeout_seconds))
+    deadline = time.monotonic() + timeout_seconds
+    last_error = None
+    delay = 0.05
+
+    while True:
+        try:
+            os.replace(source_path, destination_path)
+            return destination_path
+        except OSError as exc:
+            last_error = exc
+            winerror = getattr(exc, "winerror", None)
+            retryable = (
+                winerror in {5, 32, 33}
+                or getattr(exc, "errno", None) in {
+                    errno.EACCES, errno.EPERM, errno.EBUSY, errno.ETXTBSY
+                }
+            )
+            if not retryable or time.monotonic() >= deadline:
+                break
+
+            # Internal SceneIQ JSON/video artifacts can inherit the Windows
+            # read-only attribute from copied files. Clear only that attribute;
+            # do not change ACLs or attempt to bypass folder permissions.
+            if winerror == 5 and os.path.exists(destination_path):
+                try:
+                    current_mode = os.stat(destination_path).st_mode
+                    if not (current_mode & stat.S_IWRITE):
+                        os.chmod(destination_path, stat.S_IREAD | stat.S_IWRITE)
+                except OSError:
+                    pass
+
+            time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            delay = min(0.5, delay * 1.6)
+
+    if last_error is None:
+        raise OSError(f"Could not replace '{destination_path}'")
+    if getattr(last_error, "winerror", None) in {5, 32, 33}:
+        raise PermissionError(
+            getattr(last_error, "errno", errno.EACCES),
+            "Windows kept the destination locked after retrying. Close any editor/player "
+            "holding the file and check folder permissions.",
+            os.fspath(destination_path),
+        ) from last_error
+    raise last_error
+
 def _sceneiq_normalize_key(value):
     return re.sub(r"[^a-z0-9]", "", str(value or "").casefold())
 
@@ -353,7 +478,7 @@ def _sceneiq_ensure_youtube_details_file(project_record, project_folder):
                 handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, destination)
+        _video_producer_replace_with_retry(temporary, destination)
         if not os.path.isfile(destination):
             raise IOError("YouTube details text file was not created")
         if details is not None and os.path.getsize(destination) <= 0:
@@ -466,6 +591,7 @@ def process_single_video(
             "log_path": worker_log_path,
             "status_path": worker_status_path,
             "preview_path": preview_image_path,
+            "checkpoint_dir": checkpoint_dir,
         }
         try:
             _video_producer_write_worker_status(worker_status_path, payload)
@@ -482,10 +608,7 @@ def process_single_video(
                         "whisper_device", "whisper_compute_type",
                     )
                 }
-                _video_producer_write_json_atomic(
-                    _awake_os.path.join(checkpoint_dir, "progress.json"),
-                    progress_snapshot,
-                )
+                _video_producer_write_progress_json(checkpoint_dir, progress_snapshot)
             except Exception as checkpoint_exc:
                 print(f"⚠️ [CHECKPOINT] Could not save progress snapshot: {checkpoint_exc}")
 
@@ -602,6 +725,9 @@ def process_single_video(
           a full-screen background, timed heading entrance, optional emphasis/hold,
           and optional exit animation. The project overlay palette is locked globally.
         - Captions always use the original producer's ASR-synchronized single-row typewriter style.
+        - Narration is silence-trimmed and re-exported before ASR; every scene is re-timed from dialogue.
+        - Enabled captions are rendered from ASR timing on every applicable frame.
+          Caption appearance is not used as a final render-failure gate.
           Per-scene caption_animation/caption_effect styling metadata is ignored.
         - A single caption renderer is used per frame. ASR words are de-duplicated
           only when duplicate word timestamps overlap, preventing double captions.
@@ -660,10 +786,13 @@ def process_single_video(
             normalized = re.sub(r"_+", "_", normalized).strip("_")
             return normalized or "unnamed_project"
         try:
+            source_ready_script_hash = _video_producer_file_signature(_ready_script_path)
             with open(_ready_script_path, "r", encoding="utf-8") as file:
                 ready_data = json.load(file)
+            if not source_ready_script_hash:
+                raise RuntimeError("Could not fingerprint the source READY_SCRIPT before timing repair.")
         except Exception as exc:
-            print(f"❌ Error reading READY_SCRIPT: {exc}")
+            print(f"❌ Error reading/fingerprinting READY_SCRIPT: {exc}")
             return None
         # Discover project records regardless of root shape or wrapper names.
         # This mirrors sceneiq_google_flow_images_generation_engine() and supports root lists,
@@ -864,7 +993,7 @@ def process_single_video(
                 shutil.copy2(source_path, temporary_path)
                 if not os.path.isfile(temporary_path) or os.path.getsize(temporary_path) <= 0:
                     raise IOError("The temporary thumbnail copy is missing or empty")
-                os.replace(temporary_path, destination_path)
+                _video_producer_replace_with_retry(temporary_path, destination_path)
                 try:
                     os.remove(source_path)
                 except OSError as remove_exc:
@@ -930,24 +1059,124 @@ def process_single_video(
                 None
             )
             if existing_video:
-                candidate_thumbnail_sources = [
-                    os.path.join(candidate_folder, "Thumbnail.png"),
-                    os.path.join(candidate_folder, "images", "Thumbnail.png"),
-                    os.path.join(legacy_folder, "Thumbnail.png"),
-                    os.path.join(legacy_folder, "images", "Thumbnail.png"),
-                ]
-                try:
-                    _move_thumbnail_to_edited_folder(
-                        candidate_thumbnail_sources,
-                        candidate_edited_folder,
-                    )
-                except Exception as thumbnail_exc:
-                    print(f"⚠️ [THUMBNAIL] Could not move thumbnail for skipped project: {thumbnail_exc}")
-                print(
-                    f"⏭️ [READY-SCRIPT] Video already exists; skipping "
-                    f"'{candidate_title}': {existing_video}"
+                existing_output_folder = os.path.dirname(existing_video)
+                existing_quality = _video_producer_read_json(
+                    os.path.join(existing_output_folder, "video_quality_audit.json"), {}
                 )
-                continue
+                raw_candidate_captions = _find_field(
+                    candidate, ("include_captions", "includeCaptions")
+                )
+                candidate_captions_enabled = (
+                    raw_candidate_captions is True
+                    or str(raw_candidate_captions or "").strip().casefold()
+                    in {"yes", "true", "1", "on", "enabled", "enable"}
+                )
+                raw_candidate_transitions = _find_field(
+                    candidate, ("include_transitions", "includeTransitions")
+                )
+                candidate_transitions_enabled = (
+                    str(raw_candidate_transitions).strip().casefold()
+                    not in {"no", "false", "0", "off", "disabled"}
+                    if raw_candidate_transitions not in (None, "") else True
+                )
+                candidate_script_hash = hashlib.sha256(
+                    json.dumps(
+                        candidate_script_data, ensure_ascii=False, sort_keys=True, default=str
+                    ).encode("utf-8")
+                ).hexdigest()
+                candidate_image_folders_for_audit = [
+                    os.path.join(candidate_folder, "images"), candidate_folder,
+                ]
+                if legacy_folder.casefold() != candidate_folder.casefold():
+                    candidate_image_folders_for_audit.extend([
+                        os.path.join(legacy_folder, "images"), legacy_folder,
+                    ])
+                candidate_image_folder_for_audit = next(
+                    (folder for folder in candidate_image_folders_for_audit if _has_entry_images(folder)),
+                    None,
+                )
+                candidate_image_signature = []
+                if candidate_image_folder_for_audit:
+                    audit_image_items = []
+                    for audit_filename in os.listdir(candidate_image_folder_for_audit):
+                        audit_match = re.match(r"entry[_-]?(\d+)", audit_filename, re.IGNORECASE)
+                        if not audit_match or os.path.splitext(audit_filename)[1].lower() not in {
+                            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"
+                        }:
+                            continue
+                        audit_path = os.path.join(candidate_image_folder_for_audit, audit_filename)
+                        try:
+                            audit_stat = os.stat(audit_path)
+                            if not os.path.isfile(audit_path) or audit_stat.st_size <= 0:
+                                continue
+                            audit_image_items.append((
+                                int(audit_match.group(1)), audit_filename,
+                                int(audit_stat.st_size),
+                                int(getattr(audit_stat, "st_mtime_ns", int(audit_stat.st_mtime * 1e9))),
+                            ))
+                        except OSError:
+                            continue
+                    audit_image_items.sort(key=lambda item: (item[0], item[1].casefold()))
+                    candidate_image_signature = [list(item[1:]) for item in audit_image_items]
+                candidate_audio_signature = None
+                try:
+                    candidate_audio_path = _video_producer_find_audio_source(candidate_title)
+                    if candidate_audio_path and os.path.isfile(candidate_audio_path):
+                        candidate_audio_path = os.path.abspath(os.fspath(candidate_audio_path))
+                        candidate_audio_stat = os.stat(candidate_audio_path)
+                        candidate_audio_signature = {
+                            "path": candidate_audio_path,
+                            "size": int(candidate_audio_stat.st_size),
+                            "mtime_ns": int(getattr(
+                                candidate_audio_stat, "st_mtime_ns", int(candidate_audio_stat.st_mtime * 1e9)
+                            )),
+                        }
+                except Exception:
+                    candidate_audio_signature = None
+                stored_audio_signature = (
+                    existing_quality.get("source_audio_signature")
+                    if isinstance(existing_quality, dict) else None
+                )
+                audio_signature_matches = bool(
+                    isinstance(stored_audio_signature, dict)
+                    and isinstance(candidate_audio_signature, dict)
+                    and stored_audio_signature.get("size") == candidate_audio_signature.get("size")
+                    and stored_audio_signature.get("mtime_ns") == candidate_audio_signature.get("mtime_ns")
+                )
+                existing_quality_is_current = bool(
+                    isinstance(existing_quality, dict)
+                    and existing_quality.get("passed") is True
+                    and existing_quality.get("policy_version") == 4
+                    and existing_quality.get("audio_trim_version") == "sceneiq_internal_silence_cut_v4"
+                    and bool(existing_quality.get("include_captions")) == candidate_captions_enabled
+                    and bool(existing_quality.get("include_transitions", True)) == candidate_transitions_enabled
+                    and existing_quality.get("source_script_hash") == candidate_script_hash
+                    and existing_quality.get("image_signature") == candidate_image_signature
+                    and audio_signature_matches
+                )
+                if existing_quality_is_current:
+                    candidate_thumbnail_sources = [
+                        os.path.join(candidate_folder, "Thumbnail.png"),
+                        os.path.join(candidate_folder, "images", "Thumbnail.png"),
+                        os.path.join(legacy_folder, "Thumbnail.png"),
+                        os.path.join(legacy_folder, "images", "Thumbnail.png"),
+                    ]
+                    try:
+                        _move_thumbnail_to_edited_folder(
+                            candidate_thumbnail_sources,
+                            candidate_edited_folder,
+                        )
+                    except Exception as thumbnail_exc:
+                        print(f"⚠️ [THUMBNAIL] Could not move thumbnail for skipped project: {thumbnail_exc}")
+                    print(
+                        f"⏭️ [READY-SCRIPT] Video already exists and has a current render audit; skipping "
+                        f"'{candidate_title}': {existing_video}"
+                    )
+                    continue
+                print(
+                    f"♻️ [READY-SCRIPT] Existing video for '{candidate_title}' has no current "
+                    "current audio-trim/render audit; it will be regenerated and the previous video preserved."
+                )
             candidate_image_folders = [
                 os.path.join(candidate_folder, "images"),
                 candidate_folder,
@@ -972,6 +1201,10 @@ def process_single_video(
             selected_script_data = candidate_script_data
             project_folder = candidate_folder
             source_folder = found_image_folder
+            source_project_tree_signature = _video_producer_tree_signature(project_folder)
+            if not source_project_tree_signature:
+                print(f"❌ [READY-SCRIPT] Could not fingerprint source project assets for '{project_title}'.")
+                return None
             _set_worker_status(
                 "Project assigned",
                 progress=0,
@@ -988,7 +1221,11 @@ def process_single_video(
             )
             return None
         def _setting_is_yes(value):
-            return str(value if value is not None else "").strip().casefold() == "yes"
+            if isinstance(value, bool):
+                return value
+            return str(value if value is not None else "").strip().casefold() in {
+                "yes", "true", "1", "on", "enabled", "enable"
+            }
         raw_transition_setting = _find_field(
             panel_data, ("include_transitions", "includeTransitions")
         )
@@ -1118,7 +1355,7 @@ def process_single_video(
                 if identity in seen_ids:
                     return
                 seen_ids.add(identity)
-                collected.append(dict(item))
+                collected.append({**item, "_sceneiq_source_entry": item})
             def walk(node):
                 if isinstance(node, list):
                     for child in node:
@@ -1206,9 +1443,9 @@ def process_single_video(
                 item["dialogue"] = source_dialogue if include_captions else ""
                 result.append(item)
                 running_cursor = max(running_cursor, stop)
-            # Preserve explicit timing order where present; for entries without
-            # timestamps, the walk order is retained through running_cursor.
-            result.sort(key=lambda item: item.get("start_seconds", 0.0))
+            # Preserve the order in which scene records appear in the script.
+            # Original start/stop values may be wrong; sorting by them here could
+            # reorder the storyboard before the dialogue-based timing repair runs.
             if include_captions:
                 print(f"📚 [CAPTIONS] Read {len(result)} scene entries from panel.json")
                 if result:
@@ -1309,61 +1546,279 @@ def process_single_video(
             detail=f"Opening {os.path.basename(audio_file_path)} and checking its duration and audio stream.",
         )
         print(f"🎵 Found verified narration audio: {os.path.basename(audio_file_path)}")
+
+        # AUDIO-FIRST POLICY (REVISED): remove only long INTERNAL silent gaps.
+        # Do not trim the first sound or the ending. The original speech samples
+        # are copied into a new timeline with atrim + asetpts + concat; no atempo,
+        # asetrate, pitch shift, or time-stretch filter is ever applied.
+        import subprocess
+        original_audio_file_path = os.path.abspath(os.fspath(audio_file_path))
+        os.makedirs(edited_folder, exist_ok=True)
+        try:
+            # A 0.60s default avoids treating tiny pauses, breaths, and consonant
+            # transitions as removable silence. Keep 0.22s at BOTH sides of each
+            # qualifying gap so speech does not sound unnaturally rushed.
+            silence_min_seconds = float(os.environ.get("SCENEIQ_SILENCE_MIN_SECONDS", "0.60"))
+            silence_keep_seconds = float(os.environ.get("SCENEIQ_SILENCE_RETAIN_SECONDS", "0.22"))
+            silence_threshold_db = float(os.environ.get("SCENEIQ_SILENCE_THRESHOLD_DB", "-55"))
+        except (TypeError, ValueError):
+            silence_min_seconds, silence_keep_seconds, silence_threshold_db = 0.60, 0.22, -55.0
+        silence_min_seconds = min(5.0, max(0.10, silence_min_seconds))
+        silence_keep_seconds = min(1.0, max(0.0, silence_keep_seconds))
+        silence_threshold_db = min(-10.0, max(-90.0, silence_threshold_db))
+        silence_filter = (
+            f"silencedetect=noise={silence_threshold_db:.1f}dB:d={silence_min_seconds:.3f};"
+            f"internal_gap_keep_each_side={silence_keep_seconds:.3f};"
+            "preserve_leading_audio=true;preserve_trailing_audio=true;"
+            "method=atrim_asetpts_concat_without_time_stretch"
+        )
+        audio_trim_version = "sceneiq_internal_silence_cut_v4"
+        trimmed_audio_path = os.path.join(
+            edited_folder, f"{normalized_project_title}_narration_trimmed.wav"
+        )
+        trim_metadata_path = trimmed_audio_path + ".json"
+        try:
+            original_stat = os.stat(original_audio_file_path)
+            original_audio_signature = {
+                "path": original_audio_file_path,
+                "size": int(original_stat.st_size),
+                "mtime_ns": int(getattr(original_stat, "st_mtime_ns", int(original_stat.st_mtime * 1e9))),
+            }
+        except OSError as exc:
+            raise RuntimeError(f"Cannot stat source narration before trimming: {exc}") from exc
+        trim_metadata = _video_producer_read_json(trim_metadata_path, {})
+        trim_cache_valid = (
+            isinstance(trim_metadata, dict)
+            and trim_metadata.get("trim_version") == audio_trim_version
+            and trim_metadata.get("source_signature") == original_audio_signature
+            and trim_metadata.get("silence_filter") == silence_filter
+            and os.path.isfile(trimmed_audio_path)
+            and os.path.getsize(trimmed_audio_path) > 4096
+        )
+
+        def _probe_audio_duration(path):
+            probe = None
+            try:
+                probe = AudioFileClip(path)
+                duration_value = float(probe.duration or 0.0)
+                if duration_value <= 0.05:
+                    raise RuntimeError(f"Audio duration is invalid after processing: {duration_value:.3f}s")
+                return duration_value
+            finally:
+                if probe is not None:
+                    try:
+                        probe.close()
+                    except Exception:
+                        pass
+
+        if trim_cache_valid:
+            try:
+                trimmed_audio_duration = _probe_audio_duration(trimmed_audio_path)
+                print(
+                    f"♻️ [AUDIO-TRIM] Reusing the internally silence-trimmed narration "
+                    f"({trimmed_audio_duration:.2f}s)."
+                )
+            except Exception:
+                trim_cache_valid = False
+
+        if not trim_cache_valid:
+            ffmpeg_exe_for_trim = None
+            try:
+                import imageio_ffmpeg
+                ffmpeg_exe_for_trim = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception:
+                ffmpeg_exe_for_trim = shutil.which("ffmpeg")
+            if not ffmpeg_exe_for_trim:
+                raise RuntimeError(
+                    "Audio silence trimming requires FFmpeg. Install imageio-ffmpeg "
+                    "with `python -m pip install --upgrade imageio-ffmpeg` or add FFmpeg to PATH."
+                )
+
+            original_audio_duration = _probe_audio_duration(original_audio_file_path)
+            detect_command = [
+                ffmpeg_exe_for_trim,
+                "-nostdin", "-hide_banner", "-loglevel", "info",
+                "-i", original_audio_file_path,
+                "-map", "0:a:0", "-af",
+                f"silencedetect=noise={silence_threshold_db:.1f}dB:d={silence_min_seconds:.6f}",
+                "-f", "null", "-",
+            ]
+            detect_result = subprocess.run(
+                detect_command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                check=False,
+            )
+            if detect_result.returncode != 0:
+                raise RuntimeError(
+                    "FFmpeg could not analyse narration silence: "
+                    + (detect_result.stderr.strip()[-3000:] or f"exit code {detect_result.returncode}")
+                )
+
+            # Parse FFmpeg's silence_start / silence_end pairs. Unclosed silence
+            # at EOF is deliberately ignored, so the original ending is retained.
+            detected_silences = []
+            pending_silence_start = None
+            for log_line in (detect_result.stderr or "").splitlines():
+                start_match = re.search(r"silence_start:\s*([0-9]+(?:\.[0-9]+)?)", log_line)
+                if start_match:
+                    try:
+                        pending_silence_start = float(start_match.group(1))
+                    except (TypeError, ValueError):
+                        pending_silence_start = None
+                end_match = re.search(r"silence_end:\s*([0-9]+(?:\.[0-9]+)?)", log_line)
+                if end_match and pending_silence_start is not None:
+                    try:
+                        silence_end = float(end_match.group(1))
+                        silence_start = pending_silence_start
+                        if silence_end > silence_start:
+                            detected_silences.append((silence_start, silence_end))
+                    except (TypeError, ValueError):
+                        pass
+                    pending_silence_start = None
+
+            # Only cut the middle of long INTERNAL gaps. Do not cut at t=0, do
+            # not cut the trailing silence after the final spoken word, and keep
+            # the selected amount of silence on both sides of every cut.
+            cut_ranges = []
+            edge_guard_seconds = 0.025
+            for silence_start, silence_end in detected_silences:
+                silence_length = silence_end - silence_start
+                if silence_length < silence_min_seconds:
+                    continue
+                if silence_start <= edge_guard_seconds:
+                    continue
+                if silence_end >= original_audio_duration - edge_guard_seconds:
+                    continue
+                cut_start = silence_start + silence_keep_seconds
+                cut_end = silence_end - silence_keep_seconds
+                if cut_end - cut_start >= 0.05:
+                    if cut_ranges and cut_start <= cut_ranges[-1][1]:
+                        cut_ranges[-1] = (cut_ranges[-1][0], max(cut_ranges[-1][1], cut_end))
+                    else:
+                        cut_ranges.append((cut_start, cut_end))
+
+            # Build the retained timeline in source order. Every retained section
+            # keeps its source samples and sample timing; concatenation removes
+            # only the selected silent samples, never accelerates the speech.
+            retained_ranges = []
+            source_cursor = 0.0
+            for cut_start, cut_end in cut_ranges:
+                cut_start = max(source_cursor, min(original_audio_duration, cut_start))
+                cut_end = max(cut_start, min(original_audio_duration, cut_end))
+                if cut_start - source_cursor >= 0.01:
+                    retained_ranges.append((source_cursor, cut_start))
+                source_cursor = max(source_cursor, cut_end)
+            if original_audio_duration - source_cursor >= 0.01:
+                retained_ranges.append((source_cursor, original_audio_duration))
+            if not retained_ranges:
+                retained_ranges = [(0.0, original_audio_duration)]
+                cut_ranges = []
+
+            filter_parts = []
+            for range_index, (range_start, range_end) in enumerate(retained_ranges):
+                filter_parts.append(
+                    f"[0:a:0]atrim=start={range_start:.6f}:end={range_end:.6f},"
+                    f"asetpts=PTS-STARTPTS[kept{range_index}]"
+                )
+            if len(retained_ranges) == 1:
+                filter_parts.append("[kept0]anull[outa]")
+            else:
+                retained_inputs = "".join(f"[kept{index}]" for index in range(len(retained_ranges)))
+                filter_parts.append(
+                    f"{retained_inputs}concat=n={len(retained_ranges)}:v=0:a=1[outa]"
+                )
+            filter_complex = ";".join(filter_parts)
+
+            temporary_trimmed_audio = trimmed_audio_path + f".partial_{os.getpid()}.wav"
+            try:
+                if os.path.isfile(temporary_trimmed_audio):
+                    os.remove(temporary_trimmed_audio)
+                trim_command = [
+                    ffmpeg_exe_for_trim,
+                    "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                    "-i", original_audio_file_path,
+                    "-filter_complex", filter_complex,
+                    "-map", "[outa]",
+                    "-ar", "48000",
+                    "-c:a", "pcm_s24le",
+                    "-f", "wav",
+                    temporary_trimmed_audio,
+                ]
+                trim_result = subprocess.run(
+                    trim_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    errors="replace",
+                    check=False,
+                )
+                if (
+                    trim_result.returncode != 0
+                    or not os.path.isfile(temporary_trimmed_audio)
+                    or os.path.getsize(temporary_trimmed_audio) <= 4096
+                ):
+                    raise RuntimeError(
+                        "FFmpeg could not cut and re-export the narration: "
+                        + (trim_result.stderr.strip()[-3000:] or f"exit code {trim_result.returncode}")
+                    )
+                trimmed_audio_duration = _probe_audio_duration(temporary_trimmed_audio)
+                _video_producer_replace_with_retry(
+                    temporary_trimmed_audio, trimmed_audio_path, timeout_seconds=30.0
+                )
+                removed_silence_seconds = sum(end - start for start, end in cut_ranges)
+                if not _video_producer_write_json_atomic(
+                    trim_metadata_path,
+                    {
+                        "trim_version": audio_trim_version,
+                        "source_signature": original_audio_signature,
+                        "silence_filter": silence_filter,
+                        "minimum_silence_seconds": silence_min_seconds,
+                        "retained_silence_each_side_seconds": silence_keep_seconds,
+                        "silence_threshold_db": silence_threshold_db,
+                        "original_duration_seconds": original_audio_duration,
+                        "cut_ranges_seconds": [list(item) for item in cut_ranges],
+                        "removed_silence_seconds": removed_silence_seconds,
+                        "preserved_leading_audio": True,
+                        "preserved_trailing_audio": True,
+                        "playback_speed_changed": False,
+                        "trimmed_audio": trimmed_audio_path,
+                        "trimmed_duration_seconds": trimmed_audio_duration,
+                        "updated_at": time.time(),
+                    },
+                ):
+                    raise RuntimeError("Could not save audio-trim metadata checkpoint")
+                print(
+                    f"✂️ [AUDIO-TRIM] Removed {removed_silence_seconds:.2f}s from "
+                    f"{len(cut_ranges)} long internal silent gap(s). Preserved the audio "
+                    f"beginning/end and original speech speed. Duration: "
+                    f"{original_audio_duration:.2f}s → {trimmed_audio_duration:.2f}s."
+                )
+            finally:
+                try:
+                    if os.path.isfile(temporary_trimmed_audio):
+                        os.remove(temporary_trimmed_audio)
+                except OSError:
+                    pass
+
+        if not os.path.isfile(trimmed_audio_path) or os.path.getsize(trimmed_audio_path) <= 4096:
+            raise RuntimeError("The internally silence-trimmed narration WAV is missing or empty; rendering is blocked.")
+        # ASR, scene timing, and final mux all consume this exact WAV. It contains
+        # source-rate speech sections; there is no audio speed-up stage.
+        audio_file_path = trimmed_audio_path
+        print(
+            f"✅ [AUDIO-TRIM] Active narration source: {audio_file_path} | "
+            f"duration={trimmed_audio_duration:.2f}s | playback speed unchanged"
+        )
+
+        # Render fingerprints are deliberately postponed until after the trimmed
+        # audio has been transcribed and scene timings have been repaired. Otherwise
+        # a checkpoint would be fingerprinted with stale scene times on every run.
         render_fingerprint = None
         render_segments_dir = None
-        if checkpoint_dir:
-            import hashlib
-            fingerprint_images = []
-            for item in image_files:
-                try:
-                    stat = os.stat(item["path"])
-                    fingerprint_images.append((
-                        item["filename"], stat.st_size,
-                        getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)),
-                    ))
-                except OSError:
-                    fingerprint_images.append((item["filename"], -1, -1))
-            try:
-                audio_stat = os.stat(audio_file_path)
-                audio_signature = (
-                    os.path.basename(audio_file_path), audio_stat.st_size,
-                    getattr(audio_stat, "st_mtime_ns", int(audio_stat.st_mtime * 1e9)),
-                )
-            except OSError:
-                audio_signature = (os.path.basename(audio_file_path), -1, -1)
-            fingerprint_payload = {
-                "project_title": project_title,
-                "project_category": target_project_category,
-                "script_entries": selected_script_data,
-                "images": fingerprint_images,
-                "audio": audio_signature,
-                "include_captions": include_captions,
-                "include_transitions": include_transitions,
-                "encoder": video_encoder,
-                "encoder_preset": encoder_preset,
-                "video_width": video_width,
-                "video_height": video_height,
-                "fps": 24,
-                "whisper_model": os.environ.get("WHISPER_MODEL", "small"),
-            }
-            encoded_fingerprint = json.dumps(
-                fingerprint_payload, ensure_ascii=False, sort_keys=True, default=str
-            ).encode("utf-8")
-            render_fingerprint = hashlib.sha256(encoded_fingerprint).hexdigest()
-            render_segments_dir = os.path.join(checkpoint_dir, "scene_segments")
-            fingerprint_path = os.path.join(checkpoint_dir, "render_fingerprint.json")
-            previous_fingerprint = _video_producer_read_json(fingerprint_path, {})
-            if not isinstance(previous_fingerprint, dict) or previous_fingerprint.get("fingerprint") != render_fingerprint:
-                if os.path.isdir(render_segments_dir):
-                    shutil.rmtree(render_segments_dir, ignore_errors=True)
-                os.makedirs(render_segments_dir, exist_ok=True)
-                _video_producer_write_json_atomic(
-                    fingerprint_path,
-                    {"fingerprint": render_fingerprint, "updated_at": time.time()},
-                )
-                print("🧹 [CHECKPOINT] Project inputs changed; old scene segments were invalidated.")
-            else:
-                os.makedirs(render_segments_dir, exist_ok=True)
+        fingerprint_path = None
         import sys
         caption_progress_state = {"started": False, "finished": False, "last_percent": -1}
 
@@ -1420,7 +1875,7 @@ def process_single_video(
                     print(f"♻️ [CHECKPOINT] Reusing {len(cached_audio_words)} saved narration word timestamps.")
                 else:
                     cached_audio_words = []
-        if include_captions or has_overlay_metadata:
+        if audio_file_path:
             _set_worker_status(
                 "Recognising the narration",
                 progress=10 if cached_audio_words else 0,
@@ -1434,7 +1889,9 @@ def process_single_video(
             # Stage/Step/Level/Example/Chapter overlays. Overlay timing is still available
             # when ordinary captions are switched OFF.
             audio_words = list(cached_audio_words)
-            if audio_file_path and os.path.isfile(audio_file_path) and not audio_words:
+            if audio_words:
+                print(f"✅ [ASR] Keeping {len(audio_words)} cached word timestamps for the trimmed narration.")
+            elif audio_file_path and os.path.isfile(audio_file_path):
                 try:
                     from faster_whisper import WhisperModel
                     whisper_model_name = os.environ.get("WHISPER_MODEL", "small")
@@ -1588,24 +2045,16 @@ def process_single_video(
                         "python -m pip install --upgrade faster-whisper"
                     )
                     print(f"   Import details: {exc}")
-                    if include_captions:
-                        return None
-                    audio_words = []
-                    print("⚠️ [INSTRUCTIONAL-OVERLAY] Cannot synchronize headings without Faster-Whisper; continuing without spoken overlays")
+                    return None
                 except Exception as exc:
                     _close_caption_progress()
                     print(f"❌ [ASR] Speech recognition failed: {exc}")
                     traceback.print_exc()
-                    if include_captions:
-                        return None
-                    audio_words = []
-                    print("⚠️ [INSTRUCTIONAL-OVERLAY] ASR failed; continuing without spoken-heading overlays")
+                    return None
             else:
-                audio_words = []
-                print("⚠️ [ASR] No audio file found; captions and speech-timed Stage/Step/Level/Example/Chapter overlays cannot be synchronized.")
+                raise RuntimeError("The trimmed narration is unavailable; ASR and scene timing cannot proceed.")
         else:
-            audio_words = []
-            print("⏭️ [CAPTIONS] Disabled and no dynamic heading metadata exists; skipping Faster-Whisper")
+            raise RuntimeError("No trimmed narration was supplied to the mandatory ASR stage.")
         def _deduplicate_overlapping_asr_words(words):
             """Remove only exact duplicate ASR tokens with overlapping timestamps.
 
@@ -1652,8 +2101,342 @@ def process_single_video(
             return cleaned
 
         audio_words = _deduplicate_overlapping_asr_words(audio_words)
-        if audio_words:
-            print(f"🧹 [ASR] Caption timeline contains {len(audio_words)} unique, timestamped word event(s)")
+        if not audio_words:
+            raise RuntimeError("ASR produced no word-level timestamps from the silence-trimmed narration.")
+        print(f"🧹 [ASR] Caption timeline contains {len(audio_words)} unique, timestamped word event(s)")
+
+        def _sceneiq_alignment_tokens(value):
+            value = str(value or "").casefold().replace("’", "'")
+            return re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", value)
+
+        def _sceneiq_format_script_time(seconds):
+            seconds = max(0.0, float(seconds))
+            whole_minutes = int(seconds // 60)
+            remainder = seconds - whole_minutes * 60
+            if whole_minutes >= 60:
+                hours = whole_minutes // 60
+                minutes = whole_minutes % 60
+                return f"{hours}:{minutes:02d}:{remainder:05.2f}"
+            return f"{whole_minutes}:{remainder:05.2f}"
+
+        def _sceneiq_align_scene_times_to_dialogue(scene_entries, recognized_words, narration_duration):
+            """Align ordered scene dialogue to ASR words from the trimmed narration."""
+            import difflib
+            if not scene_entries or not recognized_words or narration_duration <= 0:
+                raise RuntimeError("Scene dialogue alignment needs scene entries, ASR words, and a valid audio duration.")
+
+            expected_tokens = []
+            token_scene_owners = []
+            per_scene_tokens = []
+            for scene_index, scene_entry in enumerate(scene_entries):
+                scene_tokens = _sceneiq_alignment_tokens(scene_entry.get("source_dialogue") or "")
+                per_scene_tokens.append(scene_tokens)
+                expected_tokens.extend(scene_tokens)
+                token_scene_owners.extend([scene_index] * len(scene_tokens))
+            if not expected_tokens:
+                raise RuntimeError(
+                    "No scene dialogue/narration text was found, so the trimmed audio cannot be aligned to scene entries."
+                )
+
+            transcript_tokens = []
+            transcript_word_indices = []
+            for word_index, word_item in enumerate(recognized_words):
+                parts = _sceneiq_alignment_tokens(word_item.get("word", ""))
+                for part in parts:
+                    transcript_tokens.append(part)
+                    transcript_word_indices.append(word_index)
+            if not transcript_tokens:
+                raise RuntimeError("The ASR transcript contains no usable text tokens for scene alignment.")
+
+            matcher = difflib.SequenceMatcher(
+                None, expected_tokens, transcript_tokens, autojunk=False
+            )
+            matched_by_scene = {i: [] for i in range(len(scene_entries))}
+            matched_expected_by_scene = {i: 0 for i in range(len(scene_entries))}
+            for block in matcher.get_matching_blocks():
+                for offset in range(block.size):
+                    expected_index = block.a + offset
+                    transcript_index = block.b + offset
+                    scene_index = token_scene_owners[expected_index]
+                    matched_by_scene[scene_index].append(transcript_word_indices[transcript_index])
+                    matched_expected_by_scene[scene_index] += 1
+
+            total_matched = sum(matched_expected_by_scene.values())
+            global_coverage = total_matched / max(1, len(expected_tokens))
+            if global_coverage < 0.60:
+                raise RuntimeError(
+                    f"Scene dialogue does not sufficiently match the trimmed narration "
+                    f"({global_coverage:.0%} token coverage; minimum 60%). "
+                    "The project was stopped to avoid incorrect scene/caption timing."
+                )
+
+            scene_anchors = {}
+            alignment_details = []
+            for scene_index, scene_entry in enumerate(scene_entries):
+                expected_count = len(per_scene_tokens[scene_index])
+                matched_indices = sorted(set(matched_by_scene[scene_index]))
+                matched_count = matched_expected_by_scene[scene_index]
+                coverage = matched_count / max(1, expected_count)
+                if expected_count:
+                    minimum_matches = max(1, int(math.ceil(expected_count * 0.50)))
+                    if matched_count < minimum_matches or not matched_indices:
+                        entry_name = str(scene_entry.get("entry_id") or f"scene {scene_index + 1}")
+                        raise RuntimeError(
+                            f"Dialogue alignment failed for {entry_name}: "
+                            f"matched {matched_count}/{expected_count} words ({coverage:.0%}). "
+                            "The video was stopped instead of guessing this scene's timing."
+                        )
+                    first_word_index = matched_indices[0]
+                    last_word_index = matched_indices[-1]
+                    word_start = float(recognized_words[first_word_index]["start"])
+                    word_end = float(recognized_words[last_word_index]["end"])
+                    if word_end <= word_start:
+                        raise RuntimeError(f"Invalid ASR timing range for scene {scene_index + 1}.")
+                    scene_anchors[scene_index] = (word_start, word_end)
+                else:
+                    first_word_index = None
+                    last_word_index = None
+                alignment_details.append({
+                    "scene_index": scene_index,
+                    "entry_id": scene_entry.get("entry_id"),
+                    "expected_dialogue_words": expected_count,
+                    "matched_dialogue_words": matched_count,
+                    "dialogue_match_ratio": round(coverage, 4),
+                    "first_asr_word_index": first_word_index,
+                    "last_asr_word_index": last_word_index,
+                })
+
+            # Determine a speech-centre for every scene. Entries with dialogue use
+            # real ASR timestamps; silent/no-dialogue entries are interpolated
+            # between their nearest spoken scenes, weighted by dialogue length.
+            known_indices = sorted(scene_anchors)
+            if not known_indices:
+                raise RuntimeError("No scene could be anchored to the recognized narration.")
+            centres = {}
+            for scene_index, (start_value, end_value) in scene_anchors.items():
+                centres[scene_index] = (start_value + end_value) / 2.0
+
+            first_known = known_indices[0]
+            if first_known > 0:
+                total_weight = sum(max(1, len(per_scene_tokens[i])) for i in range(first_known + 1))
+                first_centre = centres[first_known]
+                for i in range(first_known):
+                    cumulative = sum(max(1, len(per_scene_tokens[j])) for j in range(i + 1))
+                    centres[i] = max(0.0, first_centre * cumulative / max(1, total_weight))
+
+            for left_index, right_index in zip(known_indices, known_indices[1:]):
+                if right_index - left_index <= 1:
+                    continue
+                left_centre = centres[left_index]
+                right_centre = centres[right_index]
+                weights = [max(1, len(per_scene_tokens[i])) for i in range(left_index + 1, right_index)]
+                total_weight = sum(weights) + 1
+                cumulative = 0
+                for offset, scene_index in enumerate(range(left_index + 1, right_index)):
+                    cumulative += weights[offset]
+                    centres[scene_index] = left_centre + (right_centre - left_centre) * cumulative / total_weight
+
+            last_known = known_indices[-1]
+            if last_known < len(scene_entries) - 1:
+                remaining_indices = list(range(last_known + 1, len(scene_entries)))
+                weights = [max(1, len(per_scene_tokens[i])) for i in remaining_indices]
+                total_weight = sum(weights) + 1
+                cumulative = 0
+                for offset, scene_index in enumerate(remaining_indices):
+                    cumulative += weights[offset]
+                    centres[scene_index] = centres[last_known] + (
+                        narration_duration - centres[last_known]
+                    ) * cumulative / total_weight
+
+            centre_values = [float(centres[i]) for i in range(len(scene_entries))]
+            if len(centre_values) > 1:
+                minimum_gap = 0.025
+                if narration_duration < minimum_gap * len(centre_values):
+                    raise RuntimeError("Narration is too short to assign a distinct timeline to every scene.")
+                # Keep interpolated and aligned centres strictly chronological.
+                for i in range(1, len(centre_values)):
+                    centre_values[i] = max(centre_values[i], centre_values[i - 1] + minimum_gap)
+                # If clamping exceeded the endpoint, compress the centre range evenly.
+                if centre_values[-1] > narration_duration:
+                    start_centre = max(0.0, centre_values[0])
+                    available = max(0.01, narration_duration - start_centre)
+                    span = max(0.001, centre_values[-1] - start_centre)
+                    centre_values = [
+                        start_centre + (value - start_centre) * available / span
+                        for value in centre_values
+                    ]
+
+            boundaries = [0.0]
+            for i in range(len(centre_values) - 1):
+                # When adjacent scenes both have speech anchors, place their cut
+                # halfway through the actual pause between the previous dialogue's
+                # last word and the next dialogue's first word. For unspoken scenes,
+                # retain centre-based interpolation between the nearest anchors.
+                previous_anchor = scene_anchors.get(i)
+                next_anchor = scene_anchors.get(i + 1)
+                if previous_anchor and next_anchor and next_anchor[0] >= previous_anchor[1]:
+                    boundary = (float(previous_anchor[1]) + float(next_anchor[0])) / 2.0
+                else:
+                    boundary = (centre_values[i] + centre_values[i + 1]) / 2.0
+                lower_bound = boundaries[-1] + 0.01
+                upper_bound = narration_duration - (len(centre_values) - i - 1) * 0.01
+                boundary = min(upper_bound, max(lower_bound, boundary))
+                boundaries.append(boundary)
+            boundaries.append(float(narration_duration))
+
+            repaired = []
+            for scene_index, scene_entry in enumerate(scene_entries):
+                start_value = max(0.0, boundaries[scene_index])
+                stop_value = max(start_value + 0.01, boundaries[scene_index + 1])
+                stop_value = min(float(narration_duration), stop_value)
+                duration_value = stop_value - start_value
+                if duration_value <= 0:
+                    raise RuntimeError(f"The repaired duration for scene {scene_index + 1} is invalid.")
+
+                original_start = scene_entry.get("start") or scene_entry.get("start_time") or scene_entry.get("scene_start")
+                original_stop = scene_entry.get("stop") or scene_entry.get("end") or scene_entry.get("stop_time") or scene_entry.get("scene_end")
+                formatted_start = _sceneiq_format_script_time(start_value)
+                formatted_stop = _sceneiq_format_script_time(stop_value)
+                scene_entry["start_seconds"] = start_value
+                scene_entry["stop_seconds"] = stop_value
+                scene_entry["duration_seconds"] = duration_value
+                scene_entry["start"] = formatted_start
+                scene_entry["stop"] = formatted_stop
+                scene_entry["duration"] = round(duration_value, 4)
+
+                source_entry = scene_entry.get("_sceneiq_source_entry")
+                if isinstance(source_entry, dict):
+                    start_key = next((k for k in ("start", "start_time", "scene_start") if k in source_entry), "start")
+                    stop_key = next((k for k in ("stop", "end", "stop_time", "scene_end") if k in source_entry), "stop")
+                    duration_key = next((k for k in ("duration", "duration_seconds", "scene_duration") if k in source_entry), "duration")
+                    source_entry[start_key] = formatted_start
+                    source_entry[stop_key] = formatted_stop
+                    source_entry[duration_key] = round(duration_value, 4)
+
+                repaired.append({
+                    **alignment_details[scene_index],
+                    "scene_index": scene_index + 1,
+                    "entry_id": scene_entry.get("entry_id"),
+                    "original_start": original_start,
+                    "original_stop": original_stop,
+                    "start": formatted_start,
+                    "stop": formatted_stop,
+                    "duration_seconds": round(duration_value, 4),
+                    "dialogue": scene_entry.get("source_dialogue", ""),
+                })
+            return {
+                "global_dialogue_match_ratio": round(global_coverage, 4),
+                "expected_dialogue_token_count": len(expected_tokens),
+                "matched_dialogue_token_count": total_matched,
+                "audio_word_count": len(recognized_words),
+                "audio_duration_seconds": float(narration_duration),
+                "scenes": repaired,
+            }
+
+        try:
+            timing_alignment_report = _sceneiq_align_scene_times_to_dialogue(
+                entries, audio_words, float(trimmed_audio_duration)
+            )
+            print(
+                f"🧭 [SCENE-TIMING] Rebuilt {len(entries)} scene start/stop values from "
+                f"trimmed-audio dialogue alignment. Matched "
+                f"{timing_alignment_report['matched_dialogue_token_count']}/"
+                f"{timing_alignment_report['expected_dialogue_token_count']} script words "
+                f"({timing_alignment_report['global_dialogue_match_ratio']:.0%})."
+            )
+            # Persist the repaired source scene records to the selected READY_SCRIPT
+            # so future resumes use the same dialogue-derived timeline.
+            if _ready_script_path and os.path.isfile(_ready_script_path):
+                if not _video_producer_write_json_atomic(_ready_script_path, ready_data):
+                    raise RuntimeError("Could not persist repaired scene times to READY_SCRIPT.")
+                print(f"💾 [SCENE-TIMING] Repaired scene start/stop/duration values saved to {_ready_script_path}")
+            timing_report_path = os.path.join(edited_folder, "scene_timing_repaired.json")
+            transcript_report_path = os.path.join(edited_folder, "narration_transcript.json")
+            if not _video_producer_write_json_atomic(timing_report_path, timing_alignment_report):
+                raise RuntimeError("Could not save the scene timing alignment audit.")
+            if not _video_producer_write_json_atomic(
+                transcript_report_path,
+                {
+                    "source_audio": original_audio_file_path,
+                    "trimmed_audio": audio_file_path,
+                    "duration_seconds": trimmed_audio_duration,
+                    "transcript": " ".join(str(item.get("word", "")).strip() for item in audio_words).strip(),
+                    "words": audio_words,
+                    "saved_at": time.time(),
+                },
+            ):
+                raise RuntimeError("Could not save the narration transcript audit.")
+            # Fingerprint only the final, dialogue-aligned timings. This lets a
+            # completed scene checkpoint be reused on the next run, while any
+            # changed audio, image, dialogue, timing or caption policy invalidates it.
+            if not checkpoint_dir:
+                checkpoint_dir = os.path.join(project_folder, ".video_producer_checkpoint")
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            render_segments_dir = os.path.join(checkpoint_dir, "scene_segments")
+            fingerprint_path = os.path.join(checkpoint_dir, "render_fingerprint.json")
+            import hashlib
+            fingerprint_images = []
+            for image_item in image_files:
+                try:
+                    image_stat = os.stat(image_item["path"])
+                    fingerprint_images.append((
+                        image_item["filename"], image_stat.st_size,
+                        getattr(image_stat, "st_mtime_ns", int(image_stat.st_mtime * 1e9)),
+                    ))
+                except OSError:
+                    fingerprint_images.append((image_item["filename"], -1, -1))
+            try:
+                trimmed_stat = os.stat(audio_file_path)
+                audio_signature = (
+                    os.path.basename(audio_file_path), trimmed_stat.st_size,
+                    getattr(trimmed_stat, "st_mtime_ns", int(trimmed_stat.st_mtime * 1e9)),
+                )
+            except OSError:
+                audio_signature = (os.path.basename(audio_file_path), -1, -1)
+            fingerprint_payload = {
+                "project_title": project_title,
+                "project_category": target_project_category,
+                "script_entries": selected_script_data,
+                "images": fingerprint_images,
+                "audio": audio_signature,
+                "original_audio": original_audio_file_path,
+                "audio_trim_version": audio_trim_version,
+                "silence_filter": silence_filter,
+                "caption_render_policy_version": 4,
+                "scene_dialogue_alignment_version": 2,
+                "include_captions": include_captions,
+                "include_transitions": include_transitions,
+                "encoder": video_encoder,
+                "encoder_preset": encoder_preset,
+                "video_width": video_width,
+                "video_height": video_height,
+                "fps": 24,
+                "whisper_model": os.environ.get("WHISPER_MODEL", "small"),
+            }
+            encoded_fingerprint = json.dumps(
+                fingerprint_payload, ensure_ascii=False, sort_keys=True, default=str
+            ).encode("utf-8")
+            render_fingerprint = hashlib.sha256(encoded_fingerprint).hexdigest()
+            previous_fingerprint = _video_producer_read_json(fingerprint_path, {})
+            if (
+                not isinstance(previous_fingerprint, dict)
+                or previous_fingerprint.get("fingerprint") != render_fingerprint
+            ):
+                if os.path.isdir(render_segments_dir):
+                    shutil.rmtree(render_segments_dir, ignore_errors=True)
+                os.makedirs(render_segments_dir, exist_ok=True)
+                if not _video_producer_write_json_atomic(
+                    fingerprint_path,
+                    {"fingerprint": render_fingerprint, "updated_at": time.time()},
+                ):
+                    raise RuntimeError("Could not save the aligned render fingerprint.")
+                print("🧹 [CHECKPOINT] Aligned project inputs changed; stale scene segments were invalidated.")
+            else:
+                os.makedirs(render_segments_dir, exist_ok=True)
+        except Exception as alignment_exc:
+            print(f"❌ [SCENE-TIMING] Strict dialogue alignment failed: {alignment_exc}")
+            traceback.print_exc()
+            return None
 
         def discover_transparent_subscribe_stickers():
             """Return only image files that contain a real transparent background."""
@@ -2330,6 +3113,7 @@ def process_single_video(
                     rows.append({
                         "words": [],
                         "tokens": [],
+                        "source_word_indices": [],
                         "start_time": token_start,
                     })
                 current_text = " ".join(rows[-1]["words"])
@@ -2340,6 +3124,7 @@ def process_single_video(
                     rows.append({
                         "words": [],
                         "tokens": [],
+                        "source_word_indices": [],
                         "start_time": token_start,
                     })
                 rows[-1]["words"].append(display_word)
@@ -2347,7 +3132,9 @@ def process_single_video(
                     "word": display_word,
                     "start": token_start,
                     "end": token_end,
+                    "source_indices": list(source_indices),
                 })
+                rows[-1]["source_word_indices"].extend(source_indices)
                 _update_caption_progress(((token_index + 1) / token_total) * 70)
             row_widths = []
             row_total = max(1, len(rows))
@@ -2517,10 +3304,13 @@ def process_single_video(
                     max((token["end"] for token in tokens), default=row_start) + 0.35,
                     row_start + 0.25,
                 )
+                visible_row_start = char_times[0] if char_times else row_start
                 events.append({
                     "row_id": row_id,
-                    "start_time": row_start,
-                    "end_time": max(row_start + 0.05, row_end),
+                    "start_time": visible_row_start,
+                    "speech_start_time": row_start,
+                    "end_time": max(visible_row_start + 0.05, row_end),
+                    "source_word_indices": sorted(set(row_info.get("source_word_indices", []))),
                     "slot_duration": slot_duration,
                     "text": full_text,
                     "char_times": char_times,
@@ -2544,12 +3334,41 @@ def process_single_video(
                 scene_cursor += max(0.001, float(item.get("duration", 0.1)))
             _update_caption_progress(100, finish=True)
             print(caption_plan_summary)
+            covered_source_word_indices = sorted({
+                source_index
+                for event in events
+                for source_index in event.get("source_word_indices", [])
+            })
+            required_source_word_indices = sorted({
+                source_index
+                for token in caption_tokens
+                for source_index in token.get("_source_indices", [])
+                if str(token.get("word", "")).strip()
+            })
+            required_start_time = min(
+                (event["start_time"] for event in events), default=0.0
+            )
+            # The final fully revealed caption remains on screen through the end
+            # of the narration/video. Audit the whole remaining timeline so a late
+            # caption drop cannot hide in a silent tail after the final spoken word.
+            required_end_time = max(
+                scene_cursor,
+                max((float(token.get("end", 0.0)) for token in caption_tokens), default=0.0),
+            )
             return {
                 "events": events,
                 "event_start_times": [event["start_time"] for event in events],
                 "scene_starts": scene_starts,
                 "anchor_width": anchor_width,
                 "sticker_events": sticker_events or [],
+                "covered_source_word_indices": covered_source_word_indices,
+                "required_source_word_indices": required_source_word_indices,
+                "required_start_time": required_start_time,
+                "required_end_time": required_end_time,
+                "source_word_coverage": (
+                    len(set(covered_source_word_indices) & set(required_source_word_indices))
+                    / max(1, len(required_source_word_indices))
+                ),
             }
         def _contains_instructional_reference(dialogue):
             """Detect heading language for diagnostics only; never disable scene motion."""
@@ -3720,7 +4539,19 @@ def process_single_video(
                         pass
         total_duration = sum(item["duration"] for item in prepared)
         if audio_duration and audio_duration > 0 and prepared:
-            # Keep the final image visible through the exact end of the narration.
+            if len(prepared) != len(entries):
+                raise RuntimeError(
+                    f"Strict scene review failed: prepared {len(prepared)} images for "
+                    f"{len(entries)} dialogue-timed scenes."
+                )
+            timing_difference = abs(float(total_duration) - float(audio_duration))
+            if timing_difference > 0.08:
+                raise RuntimeError(
+                    f"Strict scene timing review failed: scene timeline differs from trimmed "
+                    f"audio by {timing_difference:.3f}s."
+                )
+            # Dialogue alignment already sets every boundary; only correct a tiny
+            # floating-point endpoint difference on the last scene.
             # Earlier scenes keep their durations when they fit within the audio.
             previous_duration = sum(float(item["duration"]) for item in prepared[:-1])
             original_last_duration = max(0.1, float(prepared[-1]["duration"]))
@@ -3767,6 +4598,173 @@ def process_single_video(
         audio_clip = None
         output_filename = f"{normalized_project_title}.mp4"
         output_path = os.path.join(edited_folder, output_filename)
+        temporary_output = None
+        completed_segments = []
+        current_temporary_segment = None
+        published_new_output = False
+
+        def _save_incomplete_render(reason):
+            """Preserve every playable render artifact under edited/incomplete."""
+            incomplete_folder = os.path.join(edited_folder, "incomplete")
+            os.makedirs(incomplete_folder, exist_ok=True)
+            stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}_{os.getpid()}"
+            incomplete_video_path = os.path.join(
+                incomplete_folder, f"{normalized_project_title}_incomplete_{stamp}.mp4"
+            )
+            saved_scene_paths = []
+            saved_video_path = None
+            source_video_to_preserve = None
+
+            # A final mux or newly promoted output takes priority. Copy rather than
+            # move, so the source artifact remains available for troubleshooting.
+            if temporary_output and os.path.isfile(temporary_output) and os.path.getsize(temporary_output) > 0:
+                source_video_to_preserve = temporary_output
+            elif published_new_output and os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
+                source_video_to_preserve = output_path
+
+            if source_video_to_preserve:
+                try:
+                    shutil.copy2(source_video_to_preserve, incomplete_video_path)
+                    if os.path.isfile(incomplete_video_path) and os.path.getsize(incomplete_video_path) > 0:
+                        saved_video_path = incomplete_video_path
+                        print(f"💾 [INCOMPLETE] Preserved rendered MP4: {saved_video_path}")
+                except Exception as preserve_exc:
+                    print(f"⚠️ [INCOMPLETE] Could not copy final/partial MP4: {preserve_exc}")
+
+            # If no final MP4 exists, retain all completed scene encodes and try
+            # to compose them into a viewable partial movie with the audio prefix.
+            source_segments = []
+            partial_temporary_segment = None
+            for candidate in list(completed_segments or []):
+                try:
+                    if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+                        source_segments.append(candidate)
+                except OSError:
+                    continue
+            if current_temporary_segment:
+                try:
+                    if (
+                        os.path.isfile(current_temporary_segment)
+                        and os.path.getsize(current_temporary_segment) > 1024
+                        and current_temporary_segment not in source_segments
+                    ):
+                        try:
+                            temporary_is_playable = segment_is_valid(current_temporary_segment)
+                        except Exception:
+                            temporary_is_playable = False
+                        if temporary_is_playable:
+                            source_segments.append(current_temporary_segment)
+                        else:
+                            # Even an unfinalized scene encode is retained for
+                            # recovery; it is not included in the playable concat.
+                            partial_temporary_segment = current_temporary_segment
+                except OSError:
+                    pass
+
+            if source_segments or partial_temporary_segment:
+                scenes_folder = os.path.join(incomplete_folder, "scenes")
+                os.makedirs(scenes_folder, exist_ok=True)
+                for scene_index, source_segment in enumerate(source_segments, start=1):
+                    try:
+                        scene_name = os.path.basename(source_segment)
+                        if ".partial_" in scene_name:
+                            scene_name = f"scene_{scene_index:05d}_partial.mp4"
+                        destination_scene = os.path.join(scenes_folder, scene_name)
+                        if os.path.abspath(source_segment).casefold() != os.path.abspath(destination_scene).casefold():
+                            shutil.copy2(source_segment, destination_scene)
+                        if os.path.isfile(destination_scene) and os.path.getsize(destination_scene) > 0:
+                            saved_scene_paths.append(destination_scene)
+                    except Exception as scene_copy_exc:
+                        print(f"⚠️ [INCOMPLETE] Could not preserve scene segment {source_segment}: {scene_copy_exc}")
+                if partial_temporary_segment:
+                    try:
+                        match = re.search(r"scene_(\d+)", os.path.basename(partial_temporary_segment), re.IGNORECASE)
+                        partial_number = int(match.group(1)) if match else len(saved_scene_paths) + 1
+                        partial_destination = os.path.join(scenes_folder, f"scene_{partial_number:05d}_partial.mp4")
+                        shutil.copy2(partial_temporary_segment, partial_destination)
+                        if os.path.isfile(partial_destination) and os.path.getsize(partial_destination) > 0:
+                            saved_scene_paths.append(partial_destination)
+                    except Exception as partial_copy_exc:
+                        print(f"⚠️ [INCOMPLETE] Could not preserve the active partial scene: {partial_copy_exc}")
+
+            # Try to assemble the saved scenes. If that fails, the individual
+            # scene MP4s are still safely retained in edited/incomplete/scenes.
+            if not saved_video_path and saved_scene_paths:
+                ffmpeg_for_incomplete = None
+                try:
+                    import imageio_ffmpeg
+                    ffmpeg_for_incomplete = imageio_ffmpeg.get_ffmpeg_exe()
+                except Exception:
+                    ffmpeg_for_incomplete = shutil.which("ffmpeg")
+                if ffmpeg_for_incomplete:
+                    concat_list = os.path.join(incomplete_folder, f"scene_concat_{stamp}.txt")
+                    temporary_incomplete = incomplete_video_path + ".partial.mp4"
+                    try:
+                        with open(concat_list, "w", encoding="utf-8", newline="\n") as concat_handle:
+                            for scene_path in saved_scene_paths:
+                                escaped = os.path.abspath(scene_path).replace("\\", "/").replace("'", r"'\''")
+                                concat_handle.write(f"file '{escaped}'\n")
+                        command = [
+                            ffmpeg_for_incomplete, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "concat", "-safe", "0", "-i", concat_list,
+                        ]
+                        has_audio = bool(audio_file_path and os.path.isfile(audio_file_path) and os.path.getsize(audio_file_path) > 0)
+                        if has_audio:
+                            command.extend(["-i", audio_file_path, "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest"])
+                        else:
+                            command.extend(["-map", "0:v:0", "-c:v", "copy"])
+                        command.extend(["-movflags", "+faststart", temporary_incomplete])
+                        assemble_result = subprocess.run(
+                            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, errors="replace", check=False,
+                        )
+                        if (
+                            assemble_result.returncode == 0
+                            and os.path.isfile(temporary_incomplete)
+                            and os.path.getsize(temporary_incomplete) > 1024
+                        ):
+                            _video_producer_replace_with_retry(
+                                temporary_incomplete, incomplete_video_path, timeout_seconds=30.0
+                            )
+                            saved_video_path = incomplete_video_path
+                            print(f"💾 [INCOMPLETE] Composed a partial video from {len(saved_scene_paths)} saved scene(s): {saved_video_path}")
+                        else:
+                            print(
+                                "⚠️ [INCOMPLETE] Scene MP4s were preserved individually; "
+                                "FFmpeg could not compose them into one file: "
+                                + (assemble_result.stderr.strip()[-1500:] or f"exit code {assemble_result.returncode}")
+                            )
+                    except Exception as assemble_exc:
+                        print(f"⚠️ [INCOMPLETE] Could not assemble saved scenes: {assemble_exc}")
+                    finally:
+                        try:
+                            if os.path.isfile(temporary_incomplete):
+                                os.remove(temporary_incomplete)
+                        except OSError:
+                            pass
+
+            manifest = {
+                "project_title": project_title,
+                "status": "incomplete",
+                "reason": str(reason),
+                "video_path": saved_video_path,
+                "saved_scene_segments": saved_scene_paths,
+                "completed_scene_count": len(source_segments),
+                "include_captions": bool(include_captions),
+                "trimmed_audio": audio_file_path,
+                "saved_at": time.time(),
+            }
+            try:
+                _video_producer_write_json_atomic(
+                    os.path.join(incomplete_folder, f"{normalized_project_title}_incomplete_{stamp}.json"),
+                    manifest,
+                )
+            except Exception as manifest_exc:
+                print(f"⚠️ [INCOMPLETE] Could not save the incomplete-render manifest: {manifest_exc}")
+
+            if not saved_video_path and not saved_scene_paths:
+                print(f"⚠️ [INCOMPLETE] No encoded MP4/scene segment was available to save. Folder checked: {incomplete_folder}")
+            return saved_video_path or (incomplete_folder if saved_scene_paths else None)
         try:
             if include_transitions:
                 print(
@@ -3780,6 +4778,7 @@ def process_single_video(
             else:
                 print("⏭️ [CAPTIONS] Caption engine is OFF; stage overlays can still use ASR word timing")
             print("🖥️ [KEEP-AWAKE] Five-second Windows keep-awake heartbeat remains active through rendering")
+            print("🔐 [FILE-ACCESS] Checkpoint/status reads allow Windows delete-sharing; atomic replacements retry transient file locks without truncating destination files")
             # Transition choices and durations are read from each entry's
             # transition_to_next metadata. Supported canonical IDs and descriptive
             # keywords are normalized; no random transition selection occurs.
@@ -3819,7 +4818,7 @@ def process_single_video(
                         resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
                         preview_image.thumbnail((640, 360), resampling)
                         preview_image.save(temporary_preview, format="JPEG", quality=78, optimize=False)
-                        _awake_os.replace(temporary_preview, preview_image_path)
+                        _video_producer_replace_with_retry(temporary_preview, preview_image_path, timeout_seconds=5.0)
                         _preview_publish_state["last_saved"] = now
                         _preview_publish_state["scene_number"] = int(scene_number)
                     except Exception as preview_exc:
@@ -3845,7 +4844,7 @@ def process_single_video(
                 _set_worker_status(
                     "Planning captions and overlays",
                     progress=0,
-                    detail=f"Creating the animated captions and timed headings from {len(audio_words)} recognised narration words.",
+                    detail=f"Creating the animated captions and timed headings from all {len(audio_words)} recognised narration words.",
                 )
                 _start_caption_progress()
                 caption_stream_plan = build_caption_stream_plans(
@@ -3853,8 +4852,29 @@ def process_single_video(
                     video_width,
                     audio_words,
                     subscribe_sticker_events,
-                    suppressed_word_indices=suppressed_heading_word_indices,
+                    # Keep every available narration word in the caption stream.
+                    # Partial ASR coverage is reported below but never blocks rendering.
+                    suppressed_word_indices=set(),
                 )
+                required_caption_words = set(caption_stream_plan.get("required_source_word_indices", []))
+                covered_caption_words = set(caption_stream_plan.get("covered_source_word_indices", []))
+                missing_caption_words = sorted(required_caption_words - covered_caption_words)
+                if (
+                    not caption_stream_plan.get("events")
+                    or missing_caption_words
+                    or caption_stream_plan.get("source_word_coverage", 0.0) < 0.995
+                ):
+                    print(
+                        "⚠️ [CAPTIONS] Caption coverage is partial, but rendering will continue "
+                        "and every available ASR caption event will still be drawn. "
+                        f"Covered {len(covered_caption_words)}/{len(required_caption_words)} "
+                        f"word tokens; missing indices: {missing_caption_words[:30]}"
+                    )
+                else:
+                    print(
+                        f"✅ [CAPTIONS] Caption plan prepared: "
+                        f"{len(covered_caption_words)}/{len(required_caption_words)} word tokens."
+                    )
             else:
                 caption_stream_plan = None
 
@@ -3982,28 +5002,25 @@ def process_single_video(
                                 current.paste(old.crop((0, 0, w - offset, h)), (offset, 0))
                                 current.paste(animated_current.crop((w - offset, 0, w, h)), (0, 0))
 
+                    # Instructional headings are composed as a background/interstitial
+                    # layer so they can never paint over enabled narration captions.
+                    rendered = draw_stage_title_overlay(
+                        current,
+                        absolute_scene_start + t,
+                        title_overlay_events,
+                    )
                     # Exactly one caption-rendering call is allowed per frame. The
                     # ASR stream is the sole spoken-caption source; per-entry dialogue
                     # is not separately painted, preventing appended duplicate lines.
                     if include_captions and stream_plan:
                         rendered = draw_animated_caption(
-                            current, absolute_scene_start + t, clip_duration, stream_plan
+                            rendered, absolute_scene_start + t, clip_duration, stream_plan
                         )
                     elif sticker_plan and sticker_plan.get("sticker_events"):
                         rendered = draw_animated_caption(
-                            current, absolute_scene_start + t, clip_duration, sticker_plan
+                            rendered, absolute_scene_start + t, clip_duration, sticker_plan
                         )
-                    else:
-                        rendered = current
 
-                    # The heading is the top-most visual layer. During its spoken
-                    # interval it fully covers the scene, captions, and stickers;
-                    # immediately afterward the current animated scene is visible.
-                    rendered = draw_stage_title_overlay(
-                        rendered,
-                        absolute_scene_start + t,
-                        title_overlay_events,
-                    )
                     # Capture a sampled, final-composited frame for this video's
                     # dashboard preview. This operation is throttled and cannot
                     # interrupt the actual frame return/encoding path.
@@ -4077,7 +5094,6 @@ def process_single_video(
                 except Exception:
                     return False
 
-            completed_segments = []
             scene_count = max(1, len(clips))
 
             class _SceneSegmentProgressLogger(ProgressBarLogger):
@@ -4134,10 +5150,12 @@ def process_single_video(
                 scene_number = scene_index + 1
                 segment_path = os.path.join(render_segments_dir, f"scene_{scene_number:05d}.mp4")
                 temporary_segment = segment_path + f".partial_{os.getpid()}.mp4"
+                current_temporary_segment = temporary_segment
                 _check_worker_control(
                     stage=f"Checking saved scene {scene_number} of {scene_count}",
                     detail=f"Checking whether scene {scene_number}/{scene_count} has already been rendered and saved.",
                 )
+                expected_scene_duration = float(visual_durations[scene_number - 1])
                 if segment_is_valid(segment_path):
                     completed_segments.append(segment_path)
                     # Also preview cached scenes so a resumed job does not leave
@@ -4204,7 +5222,7 @@ def process_single_video(
                         raise RuntimeError(
                             f"Rendered scene {scene_number} did not produce a valid video segment."
                         )
-                    os.replace(temporary_segment, segment_path)
+                    _video_producer_replace_with_retry(temporary_segment, segment_path, timeout_seconds=30.0)
                     completed_segments.append(segment_path)
                     _video_producer_write_json_atomic(
                         os.path.join(checkpoint_dir, "render_checkpoint.json"),
@@ -4229,11 +5247,14 @@ def process_single_video(
                         detail=f"Scene {scene_number}/{scene_count} is fully encoded and saved. This scene will not need to be rendered again.",
                     )
                 finally:
-                    try:
-                        if os.path.isfile(temporary_segment):
-                            os.remove(temporary_segment)
-                    except OSError:
-                        pass
+                    # Do not delete an interrupted/failed scene encode here.
+                    # The outer failure handler copies it into edited/incomplete
+                    # before a later run is allowed to clean stale temp segments.
+                    if os.path.isfile(temporary_segment):
+                        print(
+                            f"📌 [CHECKPOINT] Leaving partial scene file for recovery: "
+                            f"{temporary_segment}"
+                        )
 
             if len(completed_segments) != scene_count:
                 raise RuntimeError(
@@ -4310,7 +5331,32 @@ def process_single_video(
             )
             if not segment_is_valid(temporary_output):
                 raise RuntimeError("The assembled MP4 failed its final video validation.")
-
+            final_validation_clip = None
+            try:
+                final_validation_clip = VideoFileClip(temporary_output)
+                final_video_duration = float(final_validation_clip.duration or 0.0)
+                final_audio_duration = (
+                    float(final_validation_clip.audio.duration or 0.0)
+                    if final_validation_clip.audio is not None else 0.0
+                )
+                if final_validation_clip.audio is None:
+                    raise RuntimeError("Final MP4 contains no narration audio stream.")
+                if abs(final_video_duration - float(total_duration)) > 0.15:
+                    raise RuntimeError(
+                        f"Final MP4 video duration differs from the scene timeline: "
+                        f"{final_video_duration:.3f}s vs {total_duration:.3f}s."
+                    )
+                if abs(final_audio_duration - float(audio_duration)) > 0.15:
+                    raise RuntimeError(
+                        f"Final MP4 narration duration differs from the trimmed WAV: "
+                        f"{final_audio_duration:.3f}s vs {audio_duration:.3f}s."
+                    )
+            finally:
+                if final_validation_clip is not None:
+                    try:
+                        final_validation_clip.close()
+                    except Exception:
+                        pass
             # Preserve an older final output only after the new MP4 has been
             # completely assembled and validated.
             if os.path.isfile(output_path) and os.path.getsize(output_path) > 0:
@@ -4332,10 +5378,52 @@ def process_single_video(
                     backup_path = os.path.join(
                         edited_folder, f"{normalized_project_title}_old_{next_old_number}.mp4"
                     )
-                os.replace(output_path, backup_path)
+                _video_producer_replace_with_retry(output_path, backup_path, timeout_seconds=30.0)
                 print(f"📦 Preserved previous output as: {backup_path}")
 
-            os.replace(temporary_output, output_path)
+            _video_producer_replace_with_retry(temporary_output, output_path, timeout_seconds=30.0)
+            published_new_output = True
+            final_quality_audit = {
+                "passed": True,
+                "policy_version": 4,
+                "include_captions": bool(include_captions),
+                "include_transitions": bool(include_transitions),
+                "audio_trim_version": audio_trim_version,
+                "silence_filter": silence_filter,
+                "minimum_silence_seconds": silence_min_seconds,
+                "retained_silence_seconds": silence_keep_seconds,
+                "silence_threshold_db": silence_threshold_db,
+                "render_fingerprint": render_fingerprint,
+                "source_audio": original_audio_file_path,
+                "source_audio_signature": original_audio_signature,
+                "source_ready_script_hash": source_ready_script_hash,
+                "source_project_tree_signature": source_project_tree_signature,
+                "source_script_hash": hashlib.sha256(
+                    json.dumps(
+                        selected_script_data, ensure_ascii=False, sort_keys=True, default=str
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "source_script_content_hash": _video_producer_script_payload_content_hash(
+                    selected_script_data
+                ),
+                "image_signature": fingerprint_images,
+                "trimmed_audio": audio_file_path,
+                "trimmed_audio_duration_seconds": float(audio_duration),
+                "video_duration_seconds": float(total_duration),
+                "scene_count": int(scene_count),
+                "recognized_word_count": int(len(audio_words)),
+                "caption_source_coverage": (
+                    float(caption_stream_plan.get("source_word_coverage", 0.0))
+                    if include_captions and caption_stream_plan else None
+                ),
+                "dialogue_match_ratio": float(timing_alignment_report.get("global_dialogue_match_ratio", 0.0)),
+                "updated_at": time.time(),
+            }
+            if not _video_producer_write_json_atomic(
+                os.path.join(edited_folder, "video_quality_audit.json"),
+                final_quality_audit,
+            ):
+                raise RuntimeError("The final video was rendered but its strict quality audit could not be saved.")
             elapsed_minutes = (time.monotonic() - render_started) / 60.0
             print(f"⏱️ Resumable render elapsed time: {elapsed_minutes:.2f} minutes")
             print(f"✅ Video saved: {output_path}")
@@ -4356,15 +5444,27 @@ def process_single_video(
             _set_worker_status(
                 "Finalizing output",
                 progress=99.5,
-                detail="The finished MP4 has been created and validated successfully.",
+                detail="The finished MP4 has been rendered and saved successfully.",
             )
             if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
                 raise RuntimeError("FFmpeg finished without creating a valid output file")
-        except _VideoProducerStopRequested:
+        except _VideoProducerStopRequested as stop_exc:
+            try:
+                preserved_path = _save_incomplete_render(f"Worker stopped: {stop_exc}")
+                if preserved_path:
+                    print(f"💾 [INCOMPLETE] Stopped render preserved at: {preserved_path}")
+            except Exception as preserve_exc:
+                print(f"⚠️ [INCOMPLETE] Could not preserve stopped render: {preserve_exc}")
             raise
         except Exception as exc:
             print(f"❌ Video assembly failed: {exc}")
             traceback.print_exc()
+            try:
+                preserved_path = _save_incomplete_render(f"{type(exc).__name__}: {exc}")
+                if preserved_path:
+                    print(f"💾 [INCOMPLETE] Failed render preserved at: {preserved_path}")
+            except Exception as preserve_exc:
+                print(f"⚠️ [INCOMPLETE] Could not preserve failed render: {preserve_exc}")
             return None
         finally:
             seen = set()
@@ -4414,7 +5514,8 @@ def process_single_video(
         )
         print(f"   Audio: {'✅ Added' if audio_file_path else '❌ None'}")
         if audio_file_path:
-            print(f"   Audio file: {os.path.basename(audio_file_path)}")
+            print(f"   Audio file (trimmed/re-exported): {os.path.basename(audio_file_path)}")
+            print(f"   Original audio source: {os.path.basename(original_audio_file_path)}")
         print(f"   Output: {output_path}")
         print(f"   Thumbnail: {thumbnail_path or '⚠️ Not found'}")
         print("=" * 60)
@@ -4711,87 +5812,158 @@ def _video_producer_detect_gpu():
         "gpu_available": cuda_device_count > 0 or nvenc_available,
     }
 
-def _video_producer_write_worker_status(status_path, payload):
-    """Write one worker snapshot with Windows sharing-violation retries.
 
-    Dashboard readers may briefly have a status file open. The writer therefore
-    uses a unique temporary file, retries os.replace(), and finally falls back to
-    a retrying direct write. A transient GUI/antivirus file handle must not flood
-    the worker log or stop production.
-    """
+
+def _video_producer_emergency_recovery_path(primary_path):
+    """Return a deterministic user-local recovery path on a separate writable root."""
+    import hashlib
+    import os
+    import tempfile
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or tempfile.gettempdir()
+    digest = hashlib.sha256(os.path.abspath(os.fspath(primary_path)).casefold().encode("utf-8")).hexdigest()
+    return os.path.join(base, "SceneIQ", "recovery", "video_producer", digest + ".json")
+
+
+def _video_producer_emergency_temp_recovery_path(primary_path):
+    """Second target inside the emergency tier when LOCALAPPDATA is unavailable."""
+    import hashlib
+    import os
+    import tempfile
+    digest = hashlib.sha256(os.path.abspath(os.fspath(primary_path)).casefold().encode("utf-8")).hexdigest()
+    return os.path.join(tempfile.gettempdir(), "SceneIQ", "recovery", "video_producer", digest + ".json")
+
+
+def _video_producer_status_fallback_paths(status_path, checkpoint_dir=None):
+    """Three tiers: run status file, worker workspace recovery, local emergency recovery."""
+    status_path = os.path.abspath(os.fspath(status_path))
+    if checkpoint_dir:
+        worker_recovery = os.path.join(
+            os.path.abspath(os.fspath(checkpoint_dir)), "recovery", "worker_status.json"
+        )
+    else:
+        # Backward-compatible location when the caller does not know the workspace.
+        worker_recovery = status_path + ".worker_recovery.json"
+    return [
+        status_path,
+        worker_recovery,
+        _video_producer_emergency_recovery_path(status_path),
+        _video_producer_emergency_temp_recovery_path(status_path),
+    ]
+
+
+def _video_producer_progress_fallback_paths(checkpoint_dir):
+    """Three destinations: checkpoint progress, workspace recovery, local recovery."""
+    primary = os.path.join(os.path.abspath(os.fspath(checkpoint_dir)), "progress.json")
+    secondary = os.path.join(os.path.abspath(os.fspath(checkpoint_dir)), "recovery", "progress.json")
+    emergency = _video_producer_emergency_recovery_path(primary)
+    return [primary, secondary, emergency, _video_producer_emergency_temp_recovery_path(primary)]
+
+
+def _video_producer_write_json_to_one_path(path, payload):
+    """Write a JSON snapshot to one path atomically using a unique temporary file."""
     import json
     import os
-    import time
     import uuid
-
-    if not status_path:
-        return
-    directory = os.path.dirname(os.path.abspath(status_path))
+    directory = os.path.dirname(os.path.abspath(path))
     os.makedirs(directory, exist_ok=True)
-    token = f"{os.getpid()}_{uuid.uuid4().hex}"
-    temporary_path = f"{status_path}.tmp_{token}"
-    data = dict(payload or {})
-    data["updated_at"] = time.time()
-    encoded = json.dumps(data, ensure_ascii=False)
-
+    temporary = os.path.join(directory, os.path.basename(path) + f".tmp_{os.getpid()}_{uuid.uuid4().hex}")
     try:
-        with open(temporary_path, "w", encoding="utf-8", newline="") as handle:
-            handle.write(encoded)
+        with open(temporary, "w", encoding="utf-8", newline="") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
             handle.flush()
             try:
                 os.fsync(handle.fileno())
             except OSError:
                 pass
-
-        last_error = None
-        replace_deadline = time.monotonic() + 4.0
-        while time.monotonic() < replace_deadline:
-            try:
-                os.replace(temporary_path, status_path)
-                return
-            except PermissionError as exc:
-                last_error = exc
-                time.sleep(0.12)
-            except OSError as exc:
-                last_error = exc
-                # Only retry Windows sharing/access races. Other failures are
-                # also retried briefly because a transient scanner can interfere.
-                time.sleep(0.12)
-
-        # Fallback: the dashboard already tolerates a short malformed-JSON
-        # interval, and direct truncating writes can succeed when rename is denied.
-        direct_deadline = time.monotonic() + 4.0
-        while time.monotonic() < direct_deadline:
-            try:
-                with open(status_path, "w", encoding="utf-8", newline="") as handle:
-                    handle.write(encoded)
-                    handle.flush()
-                    try:
-                        os.fsync(handle.fileno())
-                    except OSError:
-                        pass
-                return
-            except OSError as exc:
-                last_error = exc
-                time.sleep(0.15)
-
-        raise last_error or OSError("Unable to publish worker status")
+        _video_producer_replace_with_retry(temporary, path, timeout_seconds=5.0)
+        return path
     finally:
         try:
-            if os.path.exists(temporary_path):
-                os.remove(temporary_path)
+            if os.path.exists(temporary):
+                os.remove(temporary)
         except OSError:
             pass
 
-def _video_producer_read_worker_status(status_path):
-    """Read one worker status file; tolerate atomic-replace races and shutdown."""
+
+def _video_producer_write_with_three_level_fallback(primary_path, payload, fallback_paths=None):
+    """Try primary, worker/workspace recovery, then LOCALAPPDATA/TEMP recovery."""
+    candidates = fallback_paths or (
+        [primary_path, primary_path + ".recovery.json", _video_producer_emergency_recovery_path(primary_path)]
+    )
+    errors = []
+    for index, destination in enumerate(candidates):
+        try:
+            _video_producer_write_json_to_one_path(destination, payload)
+            if index:
+                tier = 2 if index == 1 else 3
+                print(
+                    f"⚠️ [RECOVERY] Primary write failed; saved latest state to fallback tier {tier}: {destination}"
+                )
+            return destination
+        except Exception as exc:
+            errors.append(f"{destination}: {exc}")
+    raise OSError("All three SceneIQ recovery destinations failed: " + " | ".join(errors))
+
+
+def _video_producer_read_latest_json_from_paths(paths):
+    """Return the newest readable JSON object across primary and recovery copies."""
     import json
-    try:
-        with open(status_path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError, TypeError):
+    candidates = []
+    for path in paths:
+        try:
+            with _video_producer_open_shared_text(path, encoding="utf-8") as handle:
+                value = json.load(handle)
+            if isinstance(value, dict):
+                try:
+                    updated = float(value.get("updated_at") or 0.0)
+                except (TypeError, ValueError):
+                    updated = 0.0
+                candidates.append((updated, value, path))
+        except (OSError, ValueError, TypeError, NameError):
+            continue
+    if not candidates:
         return {}
+    candidates.sort(key=lambda item: (item[0], item[2] == paths[0]), reverse=True)
+    return candidates[0][1]
+
+
+def _video_producer_write_progress_json(checkpoint_dir, payload):
+    """Write progress with three levels; a locked progress.json no longer loses updates."""
+    import os
+    paths = _video_producer_progress_fallback_paths(checkpoint_dir)
+    data = dict(payload or {})
+    data["updated_at"] = time.time()
+    return _video_producer_write_with_three_level_fallback(paths[0], data, paths)
+
+
+def _video_producer_read_progress_json(checkpoint_dir):
+    """Read whichever valid progress snapshot is newest among the three destinations."""
+    return _video_producer_read_latest_json_from_paths(
+        _video_producer_progress_fallback_paths(checkpoint_dir)
+    )
+
+def _video_producer_write_worker_status(status_path, payload):
+    """Publish worker status using primary, worker-local, then emergency recovery paths."""
+    import os
+    import time
+    if not status_path:
+        return None
+    data = dict(payload or {})
+    data["updated_at"] = time.time()
+    checkpoint_dir = data.get("checkpoint_dir")
+    paths = _video_producer_status_fallback_paths(status_path, checkpoint_dir=checkpoint_dir)
+    data["status_recovery_paths"] = paths
+    written_to = _video_producer_write_with_three_level_fallback(paths[0], data, paths)
+    return written_to
+
+
+def _video_producer_read_worker_status(status_path, checkpoint_dir=None):
+    """Read the newest valid worker snapshot, including workspace/emergency copies."""
+    if not status_path:
+        return {}
+    return _video_producer_read_latest_json_from_paths(
+        _video_producer_status_fallback_paths(status_path, checkpoint_dir=checkpoint_dir)
+    )
 
 
 class _VideoProducerStopRequested(BaseException):
@@ -4803,7 +5975,7 @@ def _video_producer_read_json(path, default=None):
     if not path:
         return {} if default is None else default
     try:
-        with open(path, "r", encoding="utf-8") as handle:
+        with _video_producer_open_shared_text(path, encoding="utf-8") as handle:
             value = json.load(handle)
         return value if isinstance(value, (dict, list)) else ({} if default is None else default)
     except (OSError, ValueError, TypeError):
@@ -4811,15 +5983,19 @@ def _video_producer_read_json(path, default=None):
 
 
 def _video_producer_write_json_atomic(path, payload):
-    """Durably replace one JSON checkpoint/control file."""
+    """Durably replace one JSON checkpoint/control file with Windows lock retries."""
     import json
     import os
     import uuid
     if not path:
         return False
     path = os.path.abspath(os.fspath(path))
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    temp_path = path + f".tmp_{os.getpid()}_{uuid.uuid4().hex}"
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    temp_path = os.path.join(
+        directory,
+        os.path.basename(path) + f".tmp_{os.getpid()}_{uuid.uuid4().hex}",
+    )
     try:
         with open(temp_path, "w", encoding="utf-8", newline="") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -4828,7 +6004,7 @@ def _video_producer_write_json_atomic(path, payload):
                 os.fsync(handle.fileno())
             except OSError:
                 pass
-        os.replace(temp_path, path)
+        _video_producer_replace_with_retry(temp_path, path, timeout_seconds=12.0)
         return True
     finally:
         try:
@@ -4837,17 +6013,33 @@ def _video_producer_write_json_atomic(path, payload):
         except OSError:
             pass
 
-
 def _video_producer_write_control(control_path, command):
-    """Write a control action for one individual project."""
-    return _video_producer_write_json_atomic(
-        control_path,
-        {"command": str(command or "run").strip().casefold(), "updated_at": time.time()},
+    """Write one project's pause/resume/stop command through the recovery tiers."""
+    if not control_path:
+        return False
+    payload = {
+        "command": str(command or "run").strip().casefold(),
+        "updated_at": time.time(),
+    }
+    return _video_producer_write_with_three_level_fallback(
+        control_path, payload, _video_producer_status_fallback_paths(control_path)
+    )
+
+
+def _video_producer_read_control_json(control_path):
+    if not control_path:
+        return {}
+    return _video_producer_read_latest_json_from_paths(
+        _video_producer_status_fallback_paths(control_path)
     )
 
 
 def _video_producer_dashboard_shutdown_requested(shutdown_path):
-    state = _video_producer_read_json(shutdown_path, {})
+    if not shutdown_path:
+        return False
+    state = _video_producer_read_latest_json_from_paths(
+        _video_producer_status_fallback_paths(shutdown_path)
+    )
     return bool(isinstance(state, dict) and state.get("shutdown"))
 
 
@@ -4911,10 +6103,17 @@ def _video_producer_control_checkpoint(
     def dashboard_is_gone():
         if _video_producer_dashboard_shutdown_requested(shutdown_path) or parent_is_gone():
             return True
-        if heartbeat_path and os.path.exists(heartbeat_path):
+        if heartbeat_path:
             try:
-                age = time.time() - os.path.getmtime(heartbeat_path)
-                return age > float(os.environ.get("VIDEO_DASHBOARD_HEARTBEAT_TIMEOUT", "12"))
+                heartbeat_candidates = _video_producer_status_fallback_paths(heartbeat_path)
+                heartbeat_mtimes = [
+                    os.path.getmtime(candidate)
+                    for candidate in heartbeat_candidates
+                    if os.path.isfile(candidate)
+                ]
+                if heartbeat_mtimes:
+                    age = time.time() - max(heartbeat_mtimes)
+                    return age > float(os.environ.get("VIDEO_DASHBOARD_HEARTBEAT_TIMEOUT", "12"))
             except OSError:
                 return False
         return False
@@ -4922,12 +6121,13 @@ def _video_producer_control_checkpoint(
     def set_status(new_status, new_stage=None, new_detail=None):
         if not status_path:
             return
-        previous = _video_producer_read_worker_status(status_path)
+        previous = _video_producer_read_worker_status(status_path, checkpoint_dir=checkpoint_dir)
         previous.update({
             "status": new_status,
             "stage": new_stage or previous.get("stage") or stage or "Video production",
             "detail": new_detail or previous.get("detail") or detail or "",
             "project_title": project_title or previous.get("project_title"),
+            "checkpoint_dir": checkpoint_dir,
             "updated_at": time.time(),
         })
         try:
@@ -4945,15 +6145,12 @@ def _video_producer_control_checkpoint(
                     )
                 }
                 progress_snapshot["updated_at"] = time.time()
-                _video_producer_write_json_atomic(
-                    os.path.join(checkpoint_dir, "progress.json"),
-                    progress_snapshot,
-                )
+                _video_producer_write_progress_json(checkpoint_dir, progress_snapshot)
             except Exception:
                 pass
 
     while True:
-        command_data = _video_producer_read_json(control_path, {}) if control_path else {}
+        command_data = _video_producer_read_control_json(control_path) if control_path else {}
         command = str(command_data.get("command", "run") if isinstance(command_data, dict) else "run").casefold()
 
         if dashboard_is_gone() or command in {"stop", "shutdown", "close", "cancel"}:
@@ -4981,7 +6178,7 @@ def _video_producer_control_checkpoint(
                         "The dashboard was closed. The current video saved its completed work and stopped safely.",
                     )
                     raise _VideoProducerStopRequested("Dashboard closed while video was paused")
-                command_data = _video_producer_read_json(control_path, {}) if control_path else {}
+                command_data = _video_producer_read_control_json(control_path) if control_path else {}
                 command = str(command_data.get("command", "pause") if isinstance(command_data, dict) else "pause").casefold()
                 if command in {"stop", "shutdown", "close", "cancel"}:
                     set_status(
@@ -5019,6 +6216,9 @@ def _video_producer_tree_signature(folder):
             if name.casefold() not in {"edited", "temp_captions", "__pycache__"}
         )
         for filename in sorted(filenames):
+            if filename.casefold() == "thumbnail.png":
+                # Thumbnails are published separately and are not video-render inputs.
+                continue
             path = os.path.join(current_root, filename)
             try:
                 stat = os.stat(path)
@@ -5039,6 +6239,405 @@ def _video_producer_file_signature(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _video_producer_find_project_script_data(node):
+    """Locate the scene-script payload using the same selection rules as the renderer."""
+    import re
+    candidates = []
+
+    def walk(current, path=()):
+        if isinstance(current, dict):
+            for key, value in current.items():
+                yield from walk(value, path + (key,))
+        elif isinstance(current, list):
+            for index, value in enumerate(current):
+                yield from walk(value, path + (index,))
+        yield path, current
+
+    def normalise(key):
+        return re.sub(r"[^a-z0-9]", "", str(key).casefold())
+
+    for path, current in walk(node):
+        if not path or not isinstance(path[-1], str) or normalise(path[-1]) != "script":
+            continue
+        if isinstance(current, list):
+            score = 0
+            for item in current:
+                if isinstance(item, dict):
+                    keys = {normalise(key) for key in item}
+                    if keys.intersection({
+                        "sceneimagegeneration", "sceneimageprompt", "imagegenerationprompt",
+                        "imageprompt", "charactersreference", "characterreference",
+                        "scenepovprompt", "shotnumber", "dialogue", "narration",
+                        "voiceover", "spokentext", "instructionaloverlay", "stageoverlay",
+                        "videoeffects", "captionanimation",
+                    }):
+                        score += 10
+                    if "entries" in keys:
+                        score += 2
+            candidates.append((score, len(current), current))
+        elif isinstance(current, dict):
+            nested = _sceneiq_find_field(current, ("script",))
+            if isinstance(nested, list):
+                candidates.append((1, len(nested), nested))
+            else:
+                candidates.append((0, len(current), current))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return candidates[0][2]
+
+
+def _video_producer_find_project_script_record(data, project_title, project_category=None):
+    """Find one project record and its actual scene payload without borrowing a sibling."""
+    wanted_title = _sceneiq_normalize_key(project_title)
+    wanted_category = _sceneiq_normalize_key(project_category) if project_category else None
+
+    def visit(current):
+        if isinstance(current, dict):
+            title = _sceneiq_direct_project_title(current)
+            script_data = _video_producer_find_project_script_data(current)
+            if title and isinstance(script_data, (dict, list)) and bool(script_data):
+                category = _sceneiq_find_field(
+                    current, ("projectcategory", "project_category", "projectCategory")
+                )
+                if (
+                    _sceneiq_normalize_key(title) == wanted_title
+                    and (wanted_category is None or _sceneiq_normalize_key(category) == wanted_category)
+                ):
+                    return current, script_data
+                return None
+            for child in current.values():
+                if isinstance(child, (dict, list)):
+                    found = visit(child)
+                    if found is not None:
+                        return found
+        elif isinstance(current, list):
+            for child in current:
+                if isinstance(child, (dict, list)):
+                    found = visit(child)
+                    if found is not None:
+                        return found
+        return None
+
+    return visit(data)
+
+
+def _video_producer_script_payload_content_hash(script_data):
+    """Hash a scene script without its mutable dialogue-derived time fields."""
+    import copy
+    import hashlib
+    import json
+
+    payload = copy.deepcopy(script_data)
+    timing_keys = {
+        "start", "starttime", "scenestart", "stop", "end", "stoptime",
+        "sceneend", "duration", "durationseconds", "sceneduration",
+    }
+    for scene in _video_producer_collect_scene_entries(payload):
+        for key in list(scene):
+            if _sceneiq_normalize_key(key) in timing_keys:
+                scene.pop(key, None)
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _video_producer_project_script_content_hash(
+    ready_script_path, project_title, project_category=None
+):
+    """Hash the selected project's authored script while ignoring repaired timings."""
+    import json
+    import os
+    if not ready_script_path or not os.path.isfile(ready_script_path):
+        return ""
+    try:
+        with open(ready_script_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        found = _video_producer_find_project_script_record(
+            data, project_title, project_category
+        )
+        if found is None:
+            return ""
+        return _video_producer_script_payload_content_hash(found[1])
+    except Exception:
+        return ""
+
+
+def _video_producer_project_script_hash(ready_script_path, project_title, project_category=None):
+    """Hash only the selected project's scene script, not unrelated queue projects."""
+    import hashlib
+    import json
+    if not ready_script_path or not os.path.isfile(ready_script_path):
+        return ""
+    try:
+        with open(ready_script_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        found = _video_producer_find_project_script_record(data, project_title, project_category)
+        if found is None:
+            return ""
+        script_data = found[1]
+        encoded = json.dumps(
+            script_data, ensure_ascii=False, sort_keys=True, default=str
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+    except Exception:
+        return ""
+
+
+def _video_producer_collect_scene_entries(script_data):
+    """Collect ordered scene dictionaries from both direct and legacy entries lists."""
+    markers = {
+        "scenepovprompt", "sceneimagegeneration", "sceneimageprompt",
+        "charactersreference", "shotnumber", "dialogue", "narration",
+        "voiceover", "spokentext", "instructionaloverlay", "stageoverlay",
+        "videoeffects", "videoeffect", "captionanimation", "captioneffect",
+    }
+    collected = []
+    seen = set()
+
+    def is_scene(item):
+        return isinstance(item, dict) and bool(
+            markers.intersection(_sceneiq_normalize_key(key) for key in item)
+        )
+
+    def add(item):
+        if isinstance(item, dict) and id(item) not in seen:
+            seen.add(id(item))
+            collected.append(item)
+
+    def walk(node):
+        if isinstance(node, list):
+            for child in node:
+                if is_scene(child):
+                    add(child)
+                elif isinstance(child, (dict, list)):
+                    walk(child)
+            return
+        if not isinstance(node, dict):
+            return
+        entries_list = next(
+            (value for key, value in node.items()
+             if _sceneiq_normalize_key(key) == "entries" and isinstance(value, list)),
+            None,
+        )
+        if isinstance(entries_list, list):
+            for child in entries_list:
+                if isinstance(child, dict):
+                    add(child)
+        if is_scene(node):
+            add(node)
+            return
+        for key, value in node.items():
+            if _sceneiq_normalize_key(key) == "entries":
+                continue
+            if isinstance(value, (dict, list)):
+                walk(value)
+
+    walk(script_data)
+    return collected
+
+
+def _video_producer_merge_project_scene_timings(
+    private_ready_script_path, original_ready_script_path, project_title, project_category=None
+):
+    """Merge only this project's repaired start/stop/duration values into the original queue."""
+    import json
+    import os
+    import time
+
+    if not private_ready_script_path or not os.path.isfile(private_ready_script_path):
+        raise FileNotFoundError("The private READY_SCRIPT with repaired dialogue timings is missing.")
+    if not original_ready_script_path or not os.path.isfile(original_ready_script_path):
+        raise FileNotFoundError("The original READY_SCRIPT cannot be opened for timing publication.")
+
+    lock_path = os.path.abspath(original_ready_script_path) + ".sceniq_timing_publish.lock"
+    lock_handle = None
+    deadline = time.monotonic() + 60.0
+    while lock_handle is None:
+        try:
+            lock_handle = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(lock_handle, f"pid={os.getpid()} time={time.time()}".encode("utf-8"))
+            os.fsync(lock_handle)
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock_path) > 900:
+                    os.remove(lock_path)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting to merge repaired timings into READY_SCRIPT.")
+            time.sleep(0.15)
+
+    try:
+        with open(private_ready_script_path, "r", encoding="utf-8") as handle:
+            private_data = json.load(handle)
+        with open(original_ready_script_path, "r", encoding="utf-8") as handle:
+            original_data = json.load(handle)
+
+        private_match = _video_producer_find_project_script_record(
+            private_data, project_title, project_category
+        )
+        original_match = _video_producer_find_project_script_record(
+            original_data, project_title, project_category
+        )
+        if private_match is None or original_match is None:
+            raise RuntimeError(
+                f"Could not find '{project_title}' in both private and original READY_SCRIPT files."
+            )
+
+        private_content_hash = _video_producer_script_payload_content_hash(private_match[1])
+        original_content_hash = _video_producer_script_payload_content_hash(original_match[1])
+        if not private_content_hash or private_content_hash != original_content_hash:
+            raise RuntimeError(
+                f"The authored script for '{project_title}' changed while the video was rendering. "
+                "The rendered video is stale, so its timings will not overwrite the newer script."
+            )
+
+        source_scenes = _video_producer_collect_scene_entries(private_match[1])
+        destination_scenes = _video_producer_collect_scene_entries(original_match[1])
+        if not source_scenes or len(source_scenes) != len(destination_scenes):
+            raise RuntimeError(
+                f"Scene timing merge mismatch for '{project_title}': "
+                f"private={len(source_scenes)}, original={len(destination_scenes)}."
+            )
+
+        destination_by_id = {}
+        for item in destination_scenes:
+            entry_id = str(item.get("entry_id") or "").strip()
+            if entry_id:
+                destination_by_id[entry_id] = item
+
+        updated = 0
+        for scene_index, source_scene in enumerate(source_scenes):
+            entry_id = str(source_scene.get("entry_id") or "").strip()
+            destination_scene = destination_by_id.get(entry_id) if entry_id else None
+            if destination_scene is None:
+                destination_scene = destination_scenes[scene_index]
+
+            source_start = next((source_scene.get(key) for key in ("start", "start_time", "scene_start") if source_scene.get(key) not in (None, "")), None)
+            source_stop = next((source_scene.get(key) for key in ("stop", "end", "stop_time", "scene_end") if source_scene.get(key) not in (None, "")), None)
+            source_duration = next((source_scene.get(key) for key in ("duration", "duration_seconds", "scene_duration") if source_scene.get(key) not in (None, "")), None)
+            if source_start is None or source_stop is None or source_duration is None:
+                raise RuntimeError(f"Repaired start/stop/duration missing for scene {scene_index + 1}.")
+
+            start_key = next((key for key in ("start", "start_time", "scene_start") if key in destination_scene), "start")
+            stop_key = next((key for key in ("stop", "end", "stop_time", "scene_end") if key in destination_scene), "stop")
+            duration_key = next((key for key in ("duration", "duration_seconds", "scene_duration") if key in destination_scene), "duration")
+            destination_scene[start_key] = source_start
+            destination_scene[stop_key] = source_stop
+            destination_scene[duration_key] = source_duration
+            updated += 1
+
+        if updated != len(source_scenes):
+            raise RuntimeError("Not all scene timings were merged into the original READY_SCRIPT.")
+        if not _video_producer_write_json_atomic(original_ready_script_path, original_data):
+            raise RuntimeError("Could not atomically save repaired scene timings to the original READY_SCRIPT.")
+        return _video_producer_project_script_hash(
+            original_ready_script_path, project_title, project_category
+        )
+    finally:
+        try:
+            os.close(lock_handle)
+        except OSError:
+            pass
+        try:
+            if os.path.isfile(lock_path):
+                os.remove(lock_path)
+        except OSError:
+            pass
+
+
+def _video_producer_setting_enabled(value, default=False):
+    """Parse the yes/true/on variants used by SceneIQ project settings."""
+    if value in (None, ""):
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {
+        "yes", "true", "1", "on", "enabled", "enable"
+    }
+
+
+def _video_producer_completed_output_is_current(
+    output_path, source_ready_script_path, source_project_dir, project_title, project_category=None
+):
+    """Return True only for a final video audited against the current source inputs."""
+    import os
+    import json
+    if not output_path or not os.path.isfile(output_path) or os.path.getsize(output_path) <= 0:
+        return False
+    audit_path = os.path.join(os.path.dirname(os.path.abspath(output_path)), "video_quality_audit.json")
+    audit = _video_producer_read_json(audit_path, {})
+    if not isinstance(audit, dict) or not (
+        audit.get("passed") is True
+        and audit.get("policy_version") == 4
+        and audit.get("audio_trim_version") == "sceneiq_internal_silence_cut_v4"
+        and bool(audit.get("source_script_content_hash"))
+    ):
+        return False
+
+    current_script_hash = _video_producer_project_script_hash(
+        source_ready_script_path, project_title, project_category
+    )
+    if not current_script_hash or audit.get("source_script_hash") != current_script_hash:
+        return False
+    current_content_hash = _video_producer_project_script_content_hash(
+        source_ready_script_path, project_title, project_category
+    )
+    if not current_content_hash or audit.get("source_script_content_hash") != current_content_hash:
+        return False
+
+    try:
+        with _video_producer_open_shared_text(source_ready_script_path, encoding="utf-8") as handle:
+            ready_data = json.load(handle)
+        project_match = _video_producer_find_project_script_record(
+            ready_data, project_title, project_category
+        )
+        if project_match is None:
+            return False
+        project_record = project_match[0]
+        current_caption_setting = _video_producer_setting_enabled(
+            _sceneiq_find_field(project_record, ("include_captions", "includeCaptions")),
+            default=False,
+        )
+        current_transition_setting = _video_producer_setting_enabled(
+            _sceneiq_find_field(project_record, ("include_transitions", "includeTransitions")),
+            default=True,
+        )
+        if bool(audit.get("include_captions", False)) != current_caption_setting:
+            return False
+        if bool(audit.get("include_transitions", True)) != current_transition_setting:
+            return False
+    except Exception:
+        return False
+
+    current_project_signature = _video_producer_tree_signature(source_project_dir)
+    if (
+        not current_project_signature
+        or audit.get("source_project_tree_signature") != current_project_signature
+    ):
+        return False
+
+    current_audio_path = _video_producer_find_audio_source(project_title)
+    if not current_audio_path or not os.path.isfile(current_audio_path):
+        return False
+    try:
+        current_audio_stat = os.stat(current_audio_path)
+    except OSError:
+        return False
+    saved_audio_signature = audit.get("source_audio_signature")
+    if not isinstance(saved_audio_signature, dict):
+        return False
+    current_size = int(current_audio_stat.st_size)
+    current_mtime_ns = int(getattr(
+        current_audio_stat, "st_mtime_ns", int(current_audio_stat.st_mtime * 1e9)
+    ))
+    return bool(
+        saved_audio_signature.get("size") == current_size
+        and saved_audio_signature.get("mtime_ns") == current_mtime_ns
+    )
 
 
 def _video_producer_write_dashboard_error(ready_path, error):
@@ -5077,7 +6676,7 @@ def _video_producer_dashboard_window(manifest_path, ready_path):
         if not path:
             return {} if default is None else default
         try:
-            with open(path, "r", encoding="utf-8") as handle:
+            with _video_producer_open_shared_text(path, encoding="utf-8") as handle:
                 value = json.load(handle)
             return value if isinstance(value, (dict, list)) else ({} if default is None else default)
         except Exception:
@@ -5087,28 +6686,10 @@ def _video_producer_dashboard_window(manifest_path, ready_path):
         if not path:
             return False
         try:
-            _video_producer_write_json_atomic(path, payload)
-            return True
-        except Exception:
-            try:
-                os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-                temporary = path + f".ui_{os.getpid()}.tmp"
-                with open(temporary, "w", encoding="utf-8") as handle:
-                    json.dump(payload, handle, ensure_ascii=False, indent=2)
-                    handle.flush()
-                    try:
-                        os.fsync(handle.fileno())
-                    except OSError:
-                        pass
-                os.replace(temporary, path)
-                return True
-            except Exception:
-                try:
-                    with open(path, "w", encoding="utf-8") as handle:
-                        json.dump(payload, handle, ensure_ascii=False, indent=2)
-                    return True
-                except Exception:
-                    return False
+            return bool(_video_producer_write_json_atomic(path, payload))
+        except Exception as exc:
+            print(f"⚠️ [DASHBOARD-WRITE] Could not safely update '{path}': {exc}")
+            return False
 
     def read_manifest():
         value = read_json(manifest_path, {})
@@ -5739,7 +7320,7 @@ def _video_producer_copy_file_isolated(source_path, destination_path, timeout_se
                 raise OSError("Source changed while it was being copied")
             if os.path.getsize(temporary_path) != after.st_size:
                 raise OSError("Copied file size does not match the source")
-            os.replace(temporary_path, destination_path)
+            _video_producer_replace_with_retry(temporary_path, destination_path)
             return destination_path
         except (OSError, TimeoutError) as exc:
             last_error = exc
@@ -5877,11 +7458,16 @@ def _video_producer_prepare_worker_workspace(job, workspace_path, status_path=No
     import os
     import shutil
 
+    # Workers render from one stable queue snapshot, but completed dialogue
+    # timings must be merged into the actual live READY_SCRIPT source file.
     original_ready_script = job.get("ready_script_path")
+    source_ready_script = job.get("source_ready_script_path") or original_ready_script
     original_images_root = job.get("images_path")
     title = job.get("project_title")
     if not original_ready_script or not os.path.isfile(original_ready_script):
         raise FileNotFoundError(f"READY_SCRIPT snapshot is missing: {original_ready_script}")
+    if not source_ready_script or not os.path.isfile(source_ready_script):
+        raise FileNotFoundError(f"Live source READY_SCRIPT is missing: {source_ready_script}")
     if not original_images_root or not os.path.isdir(original_images_root):
         raise NotADirectoryError(f"IMAGES_PATH is missing: {original_images_root}")
 
@@ -5917,22 +7503,34 @@ def _video_producer_prepare_worker_workspace(job, workspace_path, status_path=No
     for completed_output in dict.fromkeys(completed_output_candidates):
         try:
             if os.path.isfile(completed_output) and os.path.getsize(completed_output) > 0:
-                print(f"✅ [CHECKPOINT] A finished video already exists; skipping production: {completed_output}")
-                return {
-                    "workspace_path": workspace_path,
-                    "already_completed_output": completed_output,
-                    "original_project_dir": original_project_dir,
-                    "ready_script_path": None,
-                    "images_path": None,
-                    "subscribe_stickers_path": None,
-                    "audio_path": None,
-                }
+                if _video_producer_completed_output_is_current(
+                    completed_output, source_ready_script, original_project_dir, title, project_category
+                ):
+                    print(
+                        f"✅ [CHECKPOINT] Existing video passed the current audio/render audit; "
+                        f"skipping production: {completed_output}"
+                    )
+                    return {
+                        "workspace_path": workspace_path,
+                        "already_completed_output": completed_output,
+                        "original_project_dir": original_project_dir,
+                        "source_ready_script_path": source_ready_script,
+                        "ready_script_path": None,
+                        "images_path": None,
+                        "subscribe_stickers_path": None,
+                        "audio_path": None,
+                    }
+                print(
+                    f"♻️ [CHECKPOINT] Existing video is missing current strict QA or its source inputs "
+                    f"changed; regenerating: {completed_output}"
+                )
         except OSError:
             continue
 
     audio_source = _video_producer_find_audio_source(title)
     source_signature = {
-        "queue_sha256": _video_producer_file_signature(original_ready_script),
+        "queue_sha256": _video_producer_file_signature(source_ready_script),
+        "queue_snapshot_sha256": _video_producer_file_signature(original_ready_script),
         "project_tree": _video_producer_tree_signature(original_project_dir),
         "audio": [
             os.path.basename(audio_source),
@@ -5953,6 +7551,7 @@ def _video_producer_prepare_worker_workspace(job, workspace_path, status_path=No
         return {
             "workspace_path": workspace_path,
             "original_project_dir": existing_workspace.get("original_project_dir"),
+            "source_ready_script_path": source_ready_script,
             "private_project_dir": existing_workspace.get("private_project_dir"),
             "ready_script_path": existing_workspace.get("ready_script_path"),
             "images_path": existing_workspace.get("images_path"),
@@ -5993,13 +7592,14 @@ def _video_producer_prepare_worker_workspace(job, workspace_path, status_path=No
             "detail": detail,
             "log_path": job.get("log_path"),
             "status_path": status_path,
+            "checkpoint_dir": job.get("checkpoint_dir"),
         })
-        _video_producer_write_worker_status(status_path, status_payload)
         checkpoint_dir = job.get("checkpoint_dir")
+        _video_producer_write_worker_status(status_path, status_payload)
         if checkpoint_dir:
             try:
-                _video_producer_write_json_atomic(
-                    os.path.join(checkpoint_dir, "progress.json"),
+                _video_producer_write_progress_json(
+                    checkpoint_dir,
                     {
                         "worker_id": job.get("worker_id"),
                         "project_title": title,
@@ -6028,6 +7628,7 @@ def _video_producer_prepare_worker_workspace(job, workspace_path, status_path=No
     if not original_project_dir or not os.path.isdir(original_project_dir):
         return {
             "workspace_path": workspace_path,
+            "source_ready_script_path": source_ready_script,
             "ready_script_path": private_ready_script,
             "images_path": os.path.join(workspace_path, "projects"),
             "subscribe_stickers_path": None,
@@ -6056,15 +7657,23 @@ def _video_producer_prepare_worker_workspace(job, workspace_path, status_path=No
     for existing_output in expected_output_paths:
         try:
             if os.path.isfile(existing_output) and os.path.getsize(existing_output) > 0:
-                return {
-                    "workspace_path": workspace_path,
-                    "already_completed_output": existing_output,
-                    "original_project_dir": original_project_dir,
-                    "ready_script_path": private_ready_script,
-                    "images_path": os.path.join(workspace_path, "projects"),
-                    "subscribe_stickers_path": None,
-                    "audio_path": None,
-                }
+                if _video_producer_completed_output_is_current(
+                    existing_output, source_ready_script, original_project_dir, title, project_category
+                ):
+                    return {
+                        "workspace_path": workspace_path,
+                        "already_completed_output": existing_output,
+                        "original_project_dir": original_project_dir,
+                        "source_ready_script_path": source_ready_script,
+                        "ready_script_path": private_ready_script,
+                        "images_path": os.path.join(workspace_path, "projects"),
+                        "subscribe_stickers_path": None,
+                        "audio_path": None,
+                    }
+                print(
+                    f"♻️ [WORKSPACE] Existing output is not current under strict QA; "
+                    f"continuing with regeneration: {existing_output}"
+                )
         except OSError:
             # If metadata access is temporarily denied, do not assume the output
             # exists; publication will use an explicit lock and retry later.
@@ -6074,6 +7683,7 @@ def _video_producer_prepare_worker_workspace(job, workspace_path, status_path=No
         return {
             "workspace_path": workspace_path,
             "original_project_dir": original_project_dir,
+            "source_ready_script_path": source_ready_script,
             "ready_script_path": private_ready_script,
             "images_path": os.path.join(workspace_path, "projects"),
             "subscribe_stickers_path": None,
@@ -6140,6 +7750,8 @@ def _video_producer_prepare_worker_workspace(job, workspace_path, status_path=No
     workspace_result = {
         "workspace_path": workspace_path,
         "original_project_dir": original_project_dir,
+        "project_title": title,
+        "source_ready_script_path": source_ready_script,
         "private_project_dir": private_project_dir,
         "ready_script_path": private_ready_script,
         "images_path": private_images_root,
@@ -6210,27 +7822,237 @@ def _video_producer_release_project_publish_lock(handle):
         pass
 
 def _video_producer_replace_when_ready(source_path, destination_path, deadline):
-    """Replace a destination only when Windows releases any external file handle."""
-    import os
+    """Replace a destination while respecting the caller's external-lock deadline."""
     import time
-
-    last_error = None
-    while time.monotonic() < deadline:
-        try:
-            os.replace(source_path, destination_path)
-            return
-        except OSError as exc:
-            last_error = exc
-            time.sleep(0.4)
-    raise TimeoutError(
-        f"Destination is still unavailable; could not publish '{destination_path}': {last_error}"
+    remaining = max(0.25, float(deadline) - time.monotonic())
+    return _video_producer_replace_with_retry(
+        source_path, destination_path, timeout_seconds=remaining
     )
 
+def _video_producer_copy_incomplete_outputs(job, workspace_result, render_result=None, reason=""):
+    """Copy partial/private render work into the original project's edited/incomplete folder."""
+    import os
+    import shutil
+    import time
+
+    original_project_dir = (workspace_result or {}).get("original_project_dir")
+    if not original_project_dir or not os.path.isdir(original_project_dir):
+        return []
+    destination_root = os.path.join(original_project_dir, "edited", "incomplete")
+    os.makedirs(destination_root, exist_ok=True)
+    copied_paths = []
+
+    def copy_one(source_path, relative_path=None):
+        if not source_path or not os.path.isfile(source_path) or os.path.getsize(source_path) <= 0:
+            return None
+        relative_path = relative_path or os.path.basename(source_path)
+        destination_path = os.path.join(destination_root, relative_path)
+        os.makedirs(os.path.dirname(destination_path), exist_ok=True)
+        if os.path.abspath(source_path).casefold() == os.path.abspath(destination_path).casefold():
+            return destination_path
+        if os.path.exists(destination_path):
+            stem, extension = os.path.splitext(destination_path)
+            destination_path = f"{stem}_{os.getpid()}_{int(time.time() * 1000)}{extension}"
+        temporary_path = destination_path + f".incoming_{os.getpid()}"
+        try:
+            shutil.copy2(source_path, temporary_path)
+            if not os.path.isfile(temporary_path) or os.path.getsize(temporary_path) <= 0:
+                raise IOError("Copied incomplete artifact is empty")
+            _video_producer_replace_with_retry(temporary_path, destination_path, timeout_seconds=30.0)
+            copied_paths.append(destination_path)
+            return destination_path
+        finally:
+            try:
+                if os.path.exists(temporary_path):
+                    os.remove(temporary_path)
+            except OSError:
+                pass
+
+    private_project_dir = (workspace_result or {}).get("private_project_dir")
+    private_incomplete = (
+        os.path.join(private_project_dir, "edited", "incomplete")
+        if private_project_dir else None
+    )
+    if private_incomplete and os.path.isdir(private_incomplete):
+        for root, _, filenames in os.walk(private_incomplete):
+            for filename in filenames:
+                source_path = os.path.join(root, filename)
+                relative = os.path.relpath(source_path, private_incomplete)
+                try:
+                    copy_one(source_path, relative)
+                except Exception as copy_exc:
+                    print(f"⚠️ [INCOMPLETE-PUBLISH] Could not copy {source_path}: {copy_exc}")
+
+    # A complete private MP4 may still be unpublishable due to a changing source,
+    # missing sidecar, or another final publication check. Save it as incomplete.
+    source_video = (render_result or {}).get("output_path") if isinstance(render_result, dict) else None
+    if source_video and os.path.isfile(source_video):
+        try:
+            title = _video_producer_normalize_title(
+                (workspace_result or {}).get("project_title") or (render_result or {}).get("project_title") or "video"
+            )
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            copy_one(source_video, f"{title}_publish_incomplete_{stamp}_{os.getpid()}.mp4")
+        except Exception as copy_exc:
+            print(f"⚠️ [INCOMPLETE-PUBLISH] Could not preserve private final MP4: {copy_exc}")
+
+    # Preserve resumable scene encodes too, even if the renderer did not manage to
+    # create a single composed MP4 before failing.
+    checkpoint_dir = job.get("checkpoint_dir") if isinstance(job, dict) else None
+    scene_segments_dir = os.path.join(checkpoint_dir, "scene_segments") if checkpoint_dir else None
+    if scene_segments_dir and os.path.isdir(scene_segments_dir):
+        for root, _, filenames in os.walk(scene_segments_dir):
+            for filename in filenames:
+                if not filename.lower().endswith(".mp4"):
+                    continue
+                source_path = os.path.join(root, filename)
+                relative = os.path.join("scene_segments", filename)
+                try:
+                    copy_one(source_path, relative)
+                except Exception as copy_exc:
+                    print(f"⚠️ [INCOMPLETE-PUBLISH] Could not copy saved scene {source_path}: {copy_exc}")
+
+    # If a worker was stopped abruptly before its renderer-level recovery ran,
+    # the durable checkpoint may contain finished scene MP4s but no composed movie.
+    # Build a viewable partial MP4 from those saved scenes so the original project
+    # receives a video file in edited/incomplete, not just loose scene segments.
+    has_top_level_incomplete_movie = any(
+        os.path.dirname(os.path.abspath(path)).casefold() == os.path.abspath(destination_root).casefold()
+        and os.path.splitext(path)[1].casefold() in {".mp4", ".mov", ".mkv", ".avi"}
+        for path in copied_paths
+    )
+    if not has_top_level_incomplete_movie:
+        scene_copy_paths = sorted(
+            path for path in copied_paths
+            if os.path.splitext(path)[1].casefold() == ".mp4"
+            and os.path.basename(os.path.dirname(path)).casefold() == "scene_segments"
+            and re.fullmatch(r"scene_\d+\.mp4", os.path.basename(path), re.IGNORECASE)
+        )
+        if scene_copy_paths:
+            ffmpeg_for_incomplete = None
+            try:
+                import imageio_ffmpeg
+                ffmpeg_for_incomplete = imageio_ffmpeg.get_ffmpeg_exe()
+            except Exception:
+                import shutil as _shutil
+                ffmpeg_for_incomplete = _shutil.which("ffmpeg")
+            if ffmpeg_for_incomplete:
+                stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
+                safe_title = _video_producer_normalize_title(
+                    (workspace_result or {}).get("project_title")
+                    or (job or {}).get("project_title") or "video"
+                )
+                concat_list = os.path.join(destination_root, f"{safe_title}_incomplete_concat_{stamp}.txt")
+                temporary_movie = os.path.join(
+                    destination_root, f".{safe_title}_incomplete_{stamp}.partial.mp4"
+                )
+                incomplete_movie = os.path.join(
+                    destination_root, f"{safe_title}_incomplete_{stamp}.mp4"
+                )
+                try:
+                    with open(concat_list, "w", encoding="utf-8", newline="\n") as concat_handle:
+                        for scene_path in scene_copy_paths:
+                            escaped = os.path.abspath(scene_path).replace("\\", "/").replace("'", r"'\''")
+                            concat_handle.write(f"file '{escaped}'\n")
+
+                    audio_candidates = []
+                    private_project_dir = (workspace_result or {}).get("private_project_dir")
+                    private_edited = os.path.join(private_project_dir, "edited") if private_project_dir else None
+                    render_audio_name = (
+                        os.path.basename(str((render_result or {}).get("audio_file") or ""))
+                        if isinstance(render_result, dict) else ""
+                    )
+                    if private_edited and render_audio_name:
+                        audio_candidates.append(os.path.join(private_edited, render_audio_name))
+                    if private_edited and os.path.isdir(private_edited):
+                        try:
+                            audio_candidates.extend(
+                                os.path.join(private_edited, filename)
+                                for filename in os.listdir(private_edited)
+                                if filename.casefold().endswith("_narration_trimmed.wav")
+                            )
+                        except OSError:
+                            pass
+                    partial_audio = next(
+                        (candidate for candidate in audio_candidates
+                         if os.path.isfile(candidate) and os.path.getsize(candidate) > 0),
+                        None,
+                    )
+                    command = [
+                        ffmpeg_for_incomplete, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                        "-f", "concat", "-safe", "0", "-i", concat_list,
+                    ]
+                    if partial_audio:
+                        command.extend([
+                            "-i", partial_audio,
+                            "-map", "0:v:0", "-map", "1:a:0",
+                            "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest",
+                        ])
+                    else:
+                        command.extend(["-map", "0:v:0", "-c:v", "copy"])
+                    command.extend(["-movflags", "+faststart", temporary_movie])
+                    import subprocess as _subprocess
+                    assemble_result = _subprocess.run(
+                        command, stdout=_subprocess.PIPE, stderr=_subprocess.PIPE,
+                        text=True, errors="replace", check=False,
+                    )
+                    if (
+                        assemble_result.returncode == 0
+                        and os.path.isfile(temporary_movie)
+                        and os.path.getsize(temporary_movie) > 1024
+                    ):
+                        _video_producer_replace_with_retry(
+                            temporary_movie, incomplete_movie, timeout_seconds=30.0
+                        )
+                        copied_paths.append(incomplete_movie)
+                        print(f"💾 [INCOMPLETE-PUBLISH] Composed saved scenes into: {incomplete_movie}")
+                    else:
+                        print(
+                            "⚠️ [INCOMPLETE-PUBLISH] Finished scene files were saved, but a partial MP4 "
+                            "could not be composed: "
+                            + (assemble_result.stderr.strip()[-1500:] or f"exit code {assemble_result.returncode}")
+                        )
+                except Exception as compose_exc:
+                    print(f"⚠️ [INCOMPLETE-PUBLISH] Could not compose checkpoint scenes: {compose_exc}")
+                finally:
+                    for temporary_path in (concat_list, temporary_movie):
+                        try:
+                            if os.path.isfile(temporary_path):
+                                os.remove(temporary_path)
+                        except OSError:
+                            pass
+
+    manifest_path = os.path.join(
+        destination_root,
+        f"incomplete_publish_{os.getpid()}_{int(time.time() * 1000)}.json",
+    )
+    try:
+        _video_producer_write_json_atomic(
+            manifest_path,
+            {
+                "project_title": (job or {}).get("project_title"),
+                "status": "incomplete",
+                "reason": str(reason),
+                "copied_artifacts": copied_paths,
+                "saved_at": time.time(),
+            },
+        )
+    except Exception as manifest_exc:
+        print(f"⚠️ [INCOMPLETE-PUBLISH] Could not save manifest: {manifest_exc}")
+
+    rendered_artifacts = [
+        path for path in copied_paths
+        if os.path.splitext(path)[1].casefold() in {".mp4", ".mov", ".mkv", ".avi", ".wav"}
+    ]
+    if rendered_artifacts:
+        print(f"💾 [INCOMPLETE-PUBLISH] Preserved {len(rendered_artifacts)} artifact(s) under {destination_root}")
+    return rendered_artifacts
+
+
 def _video_producer_publish_worker_outputs(job, workspace_result, render_result):
-    """Publish final MP4/thumbnail to the original project after acquiring its lock."""
+    """Validate source inputs, merge repaired timings, then atomically publish artifacts."""
     import os
     import re
-    import shutil
     import time
     import uuid
 
@@ -6241,6 +8063,15 @@ def _video_producer_publish_worker_outputs(job, workspace_result, render_result)
     source_video = render_result.get("output_path")
     if not source_video or not os.path.isfile(source_video) or os.path.getsize(source_video) <= 0:
         raise RuntimeError(f"Private rendered video is missing or empty: {source_video}")
+
+    project_title = job.get("project_title") or render_result.get("project_title")
+    project_category = job.get("project_category")
+    private_ready_script = workspace_result.get("ready_script_path")
+    original_ready_script = job.get("source_ready_script_path") or job.get("ready_script_path")
+    if not private_ready_script or not os.path.isfile(private_ready_script):
+        raise FileNotFoundError("The private READY_SCRIPT with repaired timings is missing.")
+    if not original_ready_script or not os.path.isfile(original_ready_script):
+        raise FileNotFoundError("The live source READY_SCRIPT is missing.")
 
     publish_timeout = float(os.environ.get("VIDEO_PUBLISH_WAIT_TIMEOUT_SECONDS", "1800"))
     deadline = time.monotonic() + max(10.0, publish_timeout)
@@ -6255,6 +8086,149 @@ def _video_producer_publish_worker_outputs(job, workspace_result, render_result)
     backup_temp_path = None
     backup_final_path = None
     try:
+        private_edited_folder = os.path.dirname(source_video)
+        private_quality_audit = _video_producer_read_json(
+            os.path.join(private_edited_folder, "video_quality_audit.json"), {}
+        )
+        if not isinstance(private_quality_audit, dict) or not (
+            private_quality_audit.get("passed") is True
+            and private_quality_audit.get("policy_version") == 4
+            and private_quality_audit.get("audio_trim_version") == "sceneiq_internal_silence_cut_v4"
+            and bool(private_quality_audit.get("source_script_content_hash"))
+        ):
+            raise RuntimeError("The private render has no passing, current strict quality audit.")
+
+        # Verify that the original authored script, assets, and narration are the
+        # same inputs that were actually rendered. Never re-label a stale render
+        # with the latest source signatures.
+        expected_script_content_hash = str(
+            private_quality_audit.get("source_script_content_hash") or ""
+        )
+        current_script_content_hash = _video_producer_project_script_content_hash(
+            original_ready_script, project_title, project_category
+        )
+        if (
+            not expected_script_content_hash
+            or current_script_content_hash != expected_script_content_hash
+        ):
+            raise RuntimeError(
+                "The original scene dialogue/script changed while this video was rendering. "
+                "The stale MP4 will not replace the existing video."
+            )
+
+        current_project_tree_signature = _video_producer_tree_signature(original_project_dir)
+        rendered_project_tree_signature = private_quality_audit.get("source_project_tree_signature")
+        if (
+            not current_project_tree_signature
+            or not rendered_project_tree_signature
+            or current_project_tree_signature != rendered_project_tree_signature
+        ):
+            raise RuntimeError(
+                "The original project assets changed while this video was rendering. "
+                "The stale MP4 will not be published."
+            )
+
+        original_audio_source = _video_producer_find_audio_source(project_title)
+        if not original_audio_source or not os.path.isfile(original_audio_source):
+            raise RuntimeError("The original narration source disappeared before video publication.")
+        original_audio_source = os.path.abspath(original_audio_source)
+        private_audio_source = str(private_quality_audit.get("source_audio") or "")
+        if not private_audio_source or not os.path.isfile(private_audio_source):
+            raise RuntimeError("The private source narration used by the renderer is missing.")
+        original_audio_hash = _video_producer_file_signature(original_audio_source)
+        private_audio_hash = _video_producer_file_signature(private_audio_source)
+        if not original_audio_hash or original_audio_hash != private_audio_hash:
+            raise RuntimeError(
+                "The original narration audio changed while this video was rendering. "
+                "The stale MP4 will not be published."
+            )
+        original_audio_stat = os.stat(original_audio_source)
+        original_audio_signature = {
+            "path": original_audio_source,
+            "size": int(original_audio_stat.st_size),
+            "mtime_ns": int(getattr(
+                original_audio_stat, "st_mtime_ns", int(original_audio_stat.st_mtime * 1e9)
+            )),
+        }
+
+        # Project-level switches live outside the nested scene list. Verify them
+        # too, so toggling captions while a render is running cannot publish the
+        # wrong version of the video.
+        with open(original_ready_script, "r", encoding="utf-8") as handle:
+            current_ready_data = __import__("json").load(handle)
+        current_project_match = _video_producer_find_project_script_record(
+            current_ready_data, project_title, project_category
+        )
+        if current_project_match is None:
+            raise RuntimeError("The project record disappeared from the live READY_SCRIPT before publication.")
+        current_project_record = current_project_match[0]
+        current_captions_enabled = _video_producer_setting_enabled(
+            _sceneiq_find_field(current_project_record, ("include_captions", "includeCaptions")),
+            default=False,
+        )
+        raw_transition_setting = _sceneiq_find_field(
+            current_project_record, ("include_transitions", "includeTransitions")
+        )
+        current_transitions_enabled = (
+            str(raw_transition_setting).strip().casefold()
+            not in {"no", "false", "0", "off", "disabled"}
+            if raw_transition_setting not in (None, "") else True
+        )
+        if bool(private_quality_audit.get("include_captions", False)) != current_captions_enabled:
+            raise RuntimeError(
+                "The captions setting changed while this video was rendering. "
+                "The stale MP4 will not be published."
+            )
+        if bool(private_quality_audit.get("include_transitions", True)) != current_transitions_enabled:
+            raise RuntimeError(
+                "The transitions setting changed while this video was rendering. "
+                "The stale MP4 will not be published."
+            )
+
+        # The rendered narration must always be the re-exported, silence-trimmed
+        # WAV, and both of its audit sidecars are mandatory.
+        trimmed_audio_name = str(render_result.get("audio_file") or "").strip()
+        if not trimmed_audio_name:
+            trimmed_audio_name = os.path.basename(
+                str(private_quality_audit.get("trimmed_audio") or "")
+            )
+        trimmed_audio_name = os.path.basename(trimmed_audio_name)
+        if not trimmed_audio_name:
+            raise RuntimeError("The renderer did not report its silence-trimmed narration WAV.")
+        destination_trimmed_audio = os.path.join(edited_folder, trimmed_audio_name)
+        sidecar_names = [
+            "scene_timing_repaired.json",
+            "narration_transcript.json",
+            trimmed_audio_name,
+            trimmed_audio_name + ".json",
+        ]
+        for sidecar_name in sidecar_names:
+            source_sidecar = os.path.join(private_edited_folder, sidecar_name)
+            if not os.path.isfile(source_sidecar) or os.path.getsize(source_sidecar) <= 0:
+                raise RuntimeError(f"Required video-production sidecar is missing: {source_sidecar}")
+
+        # Merge timings before replacing an existing MP4. The merge helper itself
+        # rechecks semantic script equality while holding the global READY_SCRIPT lock.
+        merged_script_hash = _video_producer_merge_project_scene_timings(
+            private_ready_script,
+            original_ready_script,
+            project_title,
+            project_category,
+        )
+        if not merged_script_hash:
+            raise RuntimeError("Repaired scene timings were not confirmed in the original READY_SCRIPT.")
+        if _video_producer_project_script_content_hash(
+            original_ready_script, project_title, project_category
+        ) != expected_script_content_hash:
+            raise RuntimeError("The live script changed during timing publication; refusing to publish this MP4.")
+
+        # Recheck mutable source files immediately before publishing the new video.
+        current_project_tree_signature = _video_producer_tree_signature(original_project_dir)
+        if current_project_tree_signature != rendered_project_tree_signature:
+            raise RuntimeError("The original project assets changed during publication; refusing to publish this MP4.")
+        if _video_producer_file_signature(original_audio_source) != original_audio_hash:
+            raise RuntimeError("The original narration changed during publication; refusing to publish this MP4.")
+
         filename = os.path.basename(source_video)
         destination_video = os.path.join(edited_folder, filename)
         token = f"{os.getpid()}_{uuid.uuid4().hex}"
@@ -6271,7 +8245,9 @@ def _video_producer_publish_worker_outputs(job, workspace_result, render_result)
 
         if os.path.isfile(destination_video) and os.path.getsize(destination_video) > 0:
             stem, extension = os.path.splitext(filename)
-            old_pattern = re.compile(rf"^{re.escape(stem)}_old_(\d+){re.escape(extension)}$", re.IGNORECASE)
+            old_pattern = re.compile(
+                rf"^{re.escape(stem)}_old_(\d+){re.escape(extension)}$", re.IGNORECASE
+            )
             old_numbers = []
             for existing_name in os.listdir(edited_folder):
                 match = old_pattern.match(existing_name)
@@ -6296,9 +8272,6 @@ def _video_producer_publish_worker_outputs(job, workspace_result, render_result)
                 _video_producer_replace_when_ready(backup_temp_path, backup_final_path, deadline)
                 backup_temp_path = None
             except Exception as backup_exc:
-                # The new video is already published and the old file is safely
-                # preserved in this pending backup. Do not report the whole job
-                # as failed merely because its preferred backup name is busy.
                 print(
                     f"⚠️ [PUBLISH] New video is saved, but the preserved old video "
                     f"could not be renamed to its numbered backup path: {backup_exc}"
@@ -6307,6 +8280,51 @@ def _video_producer_publish_worker_outputs(job, workspace_result, render_result)
                 if backup_temp_path in stage_paths:
                     stage_paths.remove(backup_temp_path)
                 backup_temp_path = None
+
+        for sidecar_name in sidecar_names:
+            source_sidecar = os.path.join(private_edited_folder, sidecar_name)
+            destination_sidecar = os.path.join(edited_folder, sidecar_name)
+            stage_sidecar = os.path.join(edited_folder, f".{sidecar_name}.incoming_{token}")
+            stage_paths.append(stage_sidecar)
+            _video_producer_copy_file_isolated(
+                source_sidecar,
+                stage_sidecar,
+                timeout_seconds=max(1.0, deadline - time.monotonic()),
+            )
+            _video_producer_replace_when_ready(stage_sidecar, destination_sidecar, deadline)
+
+        # Rewrite sidecar path references to their stable published locations.
+        published_transcript_path = os.path.join(edited_folder, "narration_transcript.json")
+        transcript_payload = _video_producer_read_json(published_transcript_path, {})
+        if isinstance(transcript_payload, dict):
+            transcript_payload["source_audio"] = original_audio_source
+            transcript_payload["trimmed_audio"] = destination_trimmed_audio
+            if not _video_producer_write_json_atomic(published_transcript_path, transcript_payload):
+                raise RuntimeError("Could not update the published narration transcript paths.")
+
+        trim_metadata_path = destination_trimmed_audio + ".json"
+        trim_metadata = _video_producer_read_json(trim_metadata_path, {})
+        if isinstance(trim_metadata, dict):
+            trim_metadata["trimmed_audio"] = destination_trimmed_audio
+            source_signature = trim_metadata.get("source_signature")
+            if isinstance(source_signature, dict):
+                trim_metadata["source_signature"] = dict(source_signature)
+                trim_metadata["source_signature"].update(original_audio_signature)
+            if not _video_producer_write_json_atomic(trim_metadata_path, trim_metadata):
+                raise RuntimeError("Could not update the published audio-trim metadata paths.")
+
+        private_quality_audit["source_script_hash"] = merged_script_hash
+        private_quality_audit["source_script_content_hash"] = expected_script_content_hash
+        private_quality_audit["source_ready_script_hash"] = _video_producer_file_signature(original_ready_script)
+        private_quality_audit["source_project_tree_signature"] = current_project_tree_signature
+        private_quality_audit["source_audio"] = original_audio_source
+        private_quality_audit["source_audio_signature"] = original_audio_signature
+        private_quality_audit["source_audio_sha256"] = original_audio_hash
+        private_quality_audit["trimmed_audio"] = destination_trimmed_audio
+        if not _video_producer_write_json_atomic(
+            os.path.join(edited_folder, "video_quality_audit.json"), private_quality_audit
+        ):
+            raise RuntimeError("Could not publish the strict video quality audit.")
 
         # Publish the thumbnail too, but it is ancillary: a thumbnail lock must
         # not invalidate a correctly rendered and safely published MP4.
@@ -6333,7 +8351,9 @@ def _video_producer_publish_worker_outputs(job, workspace_result, render_result)
         final_result["thumbnail_path"] = thumbnail_published or (
             destination_thumbnail if os.path.isfile(destination_thumbnail) else None
         )
-        final_result["backup_path"] = backup_final_path if backup_final_path and os.path.isfile(backup_final_path) else None
+        final_result["backup_path"] = (
+            backup_final_path if backup_final_path and os.path.isfile(backup_final_path) else None
+        )
         final_result["private_output_path"] = source_video
         return final_result
     finally:
@@ -6369,9 +8389,7 @@ def _video_producer_process_worker(job):
     workspace_path = os.path.join(checkpoint_dir, "workspace")
     started_at = time.time()
 
-    saved_progress = _video_producer_read_json(
-        os.path.join(checkpoint_dir, "progress.json"), {}
-    )
+    saved_progress = _video_producer_read_progress_json(checkpoint_dir)
     saved_stage = (
         str(saved_progress.get("stage"))
         if isinstance(saved_progress, dict) and saved_progress.get("stage")
@@ -6403,6 +8421,7 @@ def _video_producer_process_worker(job):
         "log_path": log_path,
         "status_path": status_path,
         "issue_path": issue_path,
+        "checkpoint_dir": checkpoint_dir,
     }
     if issue_path:
         try:
@@ -6423,6 +8442,7 @@ def _video_producer_process_worker(job):
     result = None
     cleanup_workspace = False
     workspace_deleted = False
+    workspace = None
     try:
         with open(log_path, "a", encoding="utf-8", buffering=1) as worker_log:
             with contextlib.redirect_stdout(worker_log), contextlib.redirect_stderr(worker_log):
@@ -6511,16 +8531,31 @@ def _video_producer_process_worker(job):
                         "edited",
                         normalized_output_name,
                     )
+                    recovered_quality = _video_producer_read_json(
+                        os.path.join(os.path.dirname(recovered_private_output), "video_quality_audit.json"), {}
+                    ) if recovered_private_output else {}
+                    recovered_quality_is_current = bool(
+                        isinstance(recovered_quality, dict)
+                        and recovered_quality.get("passed") is True
+                        and recovered_quality.get("policy_version") == 4
+                        and recovered_quality.get("audio_trim_version") == "sceneiq_internal_silence_cut_v4"
+                        and bool(recovered_quality.get("source_script_content_hash"))
+                    )
                     if (
                         recovered_private_output
                         and os.path.isfile(recovered_private_output)
                         and os.path.getsize(recovered_private_output) > 0
+                        and recovered_quality_is_current
                     ):
-                        print(f"♻️ [CHECKPOINT] Reusing the already completed private MP4: {recovered_private_output}")
+                        print(f"♻️ [CHECKPOINT] Reusing the already completed private MP4 with a current strict QA audit: {recovered_private_output}")
                         result = {
                             "project_title": title,
                             "output_path": recovered_private_output,
                             "output_file": normalized_output_name,
+                            "audio_file": (
+                                os.path.basename(str(recovered_quality.get("trimmed_audio") or ""))
+                                if recovered_quality.get("trimmed_audio") else None
+                            ),
                             "thumbnail_path": os.path.join(workspace.get("private_project_dir", ""), "edited", "Thumbnail.png"),
                         }
                     else:
@@ -6567,25 +8602,69 @@ def _video_producer_process_worker(job):
                             "detail": "The finished MP4 is ready. Saving it and its thumbnail into the original project edited folder.",
                         })
                         print("[PUBLISH] Waiting for exclusive access to the original project's edited folder...")
-                        published_result = _video_producer_publish_worker_outputs(job, workspace, result)
-                        result = published_result
-                        final_status = "completed"
-                        cleanup_workspace = True
-                        print(f"✅ [PUBLISH] Final video safely saved to: {result['output_path']}")
-                        # A verified/published MP4 no longer needs its scene segments
-                        # or ASR cache; interrupted and stopped jobs retain them.
                         try:
-                            shutil.rmtree(os.path.join(checkpoint_dir, "scene_segments"), ignore_errors=True)
-                            for cache_name in ("narration_word_timestamps.json", "scene_concat_list.txt"):
-                                cache_path = os.path.join(checkpoint_dir, cache_name)
-                                if os.path.isfile(cache_path):
-                                    os.remove(cache_path)
-                        except OSError:
-                            pass
-                        if result.get("backup_path"):
-                            print(f"📦 [PUBLISH] Previous output preserved as: {result['backup_path']}")
-                        if result.get("thumbnail_path"):
-                            print(f"🖼️ [PUBLISH] Thumbnail saved to: {result['thumbnail_path']}")
+                            published_result = _video_producer_publish_worker_outputs(job, workspace, result)
+                        except Exception as publish_exc:
+                            print(f"❌ [PUBLISH] Final publication failed: {publish_exc}")
+                            incomplete_paths = _video_producer_copy_incomplete_outputs(
+                                job, workspace, render_result=result,
+                                reason=f"Final publication failed: {type(publish_exc).__name__}: {publish_exc}",
+                            )
+                            final_status = "failed"
+                            cleanup_workspace = bool(incomplete_paths)
+                            issue_summary = (
+                                f"The video rendered but could not pass final publication: {publish_exc}. "
+                                + (
+                                    f"Rendered output/work was preserved under {os.path.join(workspace.get('original_project_dir', ''), 'edited', 'incomplete')}."
+                                    if incomplete_paths else
+                                    f"Private render workspace retained at {workspace_path}."
+                                )
+                            )
+                            issue_payload = {
+                                "project_title": title,
+                                "worker_id": job.get("worker_id"),
+                                "status": "failed",
+                                "error_type": "PublishValidationFailed",
+                                "error": issue_summary,
+                                "issue_summary": issue_summary,
+                                "stage": "Final video publication",
+                                "traceback": traceback.format_exc(),
+                                "log_path": log_path,
+                                "workspace_path": workspace_path,
+                                "incomplete_paths": incomplete_paths,
+                                "updated_at": time.time(),
+                            }
+                            if issue_path:
+                                try:
+                                    _video_producer_write_json_atomic(issue_path, issue_payload)
+                                except Exception as issue_write_exc:
+                                    print(f"[ISSUE REPORT WARNING] Could not write issue report: {issue_write_exc}")
+                            result = {
+                                "project_title": title,
+                                "status": "incomplete",
+                                "error": issue_summary,
+                                "incomplete_paths": incomplete_paths,
+                                "issue": issue_payload,
+                            }
+                        else:
+                            result = published_result
+                            final_status = "completed"
+                            cleanup_workspace = True
+                            print(f"✅ [PUBLISH] Final video safely saved to: {result['output_path']}")
+                            # A verified/published MP4 no longer needs its scene segments
+                            # or ASR cache; interrupted and stopped jobs retain them.
+                            try:
+                                shutil.rmtree(os.path.join(checkpoint_dir, "scene_segments"), ignore_errors=True)
+                                for cache_name in ("narration_word_timestamps.json", "scene_concat_list.txt"):
+                                    cache_path = os.path.join(checkpoint_dir, cache_name)
+                                    if os.path.isfile(cache_path):
+                                        os.remove(cache_path)
+                            except OSError:
+                                pass
+                            if result.get("backup_path"):
+                                print(f"📦 [PUBLISH] Previous output preserved as: {result['backup_path']}")
+                            if result.get("thumbnail_path"):
+                                print(f"🖼️ [PUBLISH] Thumbnail saved to: {result['thumbnail_path']}")
                     else:
                         final_status = "failed"
                         # process_single_video intentionally returns None for several
@@ -6627,7 +8706,31 @@ def _video_producer_process_worker(job):
                                 _video_producer_write_json_atomic(issue_path, issue_payload)
                             except Exception as issue_write_exc:
                                 print(f"[ISSUE REPORT WARNING] Could not write issue report: {issue_write_exc}")
-                        result = {"project_title": title, "status": "failed", "error": issue_summary, "issue": issue_payload}
+                        incomplete_paths = _video_producer_copy_incomplete_outputs(
+                            job, workspace, render_result=None,
+                            reason=f"Renderer did not complete: {issue_summary}",
+                        )
+                        if incomplete_paths:
+                            incomplete_destination = os.path.join(
+                                workspace.get("original_project_dir", ""), "edited", "incomplete"
+                            )
+                            issue_summary += f" Rendered work was preserved under: {incomplete_destination}"
+                            issue_payload["error"] = issue_summary
+                            issue_payload["issue_summary"] = issue_summary
+                            issue_payload["incomplete_paths"] = incomplete_paths
+                            cleanup_workspace = True
+                            if issue_path:
+                                try:
+                                    _video_producer_write_json_atomic(issue_path, issue_payload)
+                                except Exception as issue_write_exc:
+                                    print(f"[ISSUE REPORT WARNING] Could not update issue report: {issue_write_exc}")
+                        result = {
+                            "project_title": title,
+                            "status": "incomplete" if incomplete_paths else "failed",
+                            "error": issue_summary,
+                            "incomplete_paths": incomplete_paths,
+                            "issue": issue_payload,
+                        }
                         print(f"❌ [VIDEO-ISSUE] {title}: {issue_summary}")
 
                 issue_from_result = result.get("issue") if isinstance(result, dict) else None
@@ -6635,7 +8738,11 @@ def _video_producer_process_worker(job):
                     result.get("output_path") if isinstance(result, dict) and result.get("output_path")
                     else result.get("error") if isinstance(result, dict) and result.get("error")
                     else result.get("skip_reason") if isinstance(result, dict) and result.get("skip_reason")
-                    else f"No output returned. Workspace retained at: {workspace_path}"
+                    else (
+                        "; ".join(result.get("incomplete_paths", []))
+                        if isinstance(result, dict) and result.get("incomplete_paths")
+                        else f"No output returned. Workspace retained at: {workspace_path}"
+                    )
                 )
                 status_payload = {
                     **base_status,
@@ -6675,7 +8782,7 @@ def _video_producer_process_worker(job):
                 except OSError:
                     pass
                 try:
-                    current_state = _video_producer_read_worker_status(status_path)
+                    current_state = _video_producer_read_worker_status(status_path, checkpoint_dir=checkpoint_dir)
                     _video_producer_write_worker_status(status_path, {
                         **current_state,
                         "workspace_path": workspace_path,
@@ -6695,20 +8802,40 @@ def _video_producer_process_worker(job):
             "workspace_path": None if workspace_deleted else workspace_path,
         }
     except _VideoProducerStopRequested as stop_exc:
+        incomplete_paths = []
+        if isinstance(workspace, dict):
+            try:
+                incomplete_paths = _video_producer_copy_incomplete_outputs(
+                    job, workspace, render_result=result,
+                    reason=f"Worker stopped: {stop_exc}",
+                )
+            except Exception as preserve_exc:
+                print(f"⚠️ [INCOMPLETE-PUBLISH] Could not copy stopped render artifacts: {preserve_exc}")
         try:
-            current_state = _video_producer_read_worker_status(status_path)
+            current_state = _video_producer_read_worker_status(status_path, checkpoint_dir=checkpoint_dir)
+            stop_detail = (
+                "The worker stopped at a safe checkpoint. Completed scene MP4 segments and "
+                "the prepared workspace are retained for the next Start/relaunch."
+            )
+            if incomplete_paths:
+                stop_detail += (
+                    " Rendered video/scene work was also saved under "
+                    + os.path.join(workspace.get("original_project_dir", ""), "edited", "incomplete")
+                    + "."
+                )
             current_state = {
                 **base_status,
                 **current_state,
                 "status": "stopped",
                 "stage": "Stopped safely — progress saved",
-                "detail": "The worker stopped at a safe checkpoint. Completed scene MP4 segments, narration word timings and the prepared project workspace are retained for the next Start/relaunch.",
+                "detail": stop_detail,
+                "incomplete_paths": incomplete_paths,
                 "finished_at": time.time(),
                 "workspace_path": workspace_path,
             }
             _video_producer_write_worker_status(status_path, current_state)
-            _video_producer_write_json_atomic(
-                os.path.join(checkpoint_dir, "progress.json"),
+            _video_producer_write_progress_json(
+                checkpoint_dir,
                 {
                     "worker_id": job.get("worker_id"),
                     "project_title": title,
@@ -6741,7 +8868,7 @@ def _video_producer_process_worker(job):
     except Exception as exc:
         error_traceback = traceback.format_exc()
         preserved_workspace = workspace_path if workspace_path and os.path.isdir(workspace_path) else None
-        previous_status = _video_producer_read_worker_status(status_path)
+        previous_status = _video_producer_read_worker_status(status_path, checkpoint_dir=checkpoint_dir)
         failed_stage = str(previous_status.get("stage") or "Video production")
         issue_payload = {
             "project_title": title,
@@ -6756,6 +8883,21 @@ def _video_producer_process_worker(job):
             "workspace_path": preserved_workspace,
             "updated_at": time.time(),
         }
+        incomplete_paths = []
+        if isinstance(workspace, dict):
+            try:
+                incomplete_paths = _video_producer_copy_incomplete_outputs(
+                    job, workspace, render_result=result,
+                    reason=f"Worker failed: {type(exc).__name__}: {exc}",
+                )
+            except Exception as preserve_exc:
+                print(f"⚠️ [INCOMPLETE-PUBLISH] Could not copy failed render artifacts: {preserve_exc}")
+        if incomplete_paths:
+            issue_payload["incomplete_paths"] = incomplete_paths
+            issue_payload["issue_summary"] = (
+                f"{exc}. Rendered work was preserved under "
+                + os.path.join(workspace.get("original_project_dir", ""), "edited", "incomplete")
+            )
         try:
             with open(log_path, "a", encoding="utf-8", buffering=1) as worker_log:
                 worker_log.write("\n[WORKER FAILED]\n")
@@ -6836,7 +8978,7 @@ def _video_producer_write_parent_worker_error(job, stage, error_text):
     except OSError:
         pass
     try:
-        previous = _video_producer_read_worker_status(job.get("status_path"))
+        previous = _video_producer_read_worker_status(job.get("status_path"), checkpoint_dir=job.get("checkpoint_dir"))
         _video_producer_write_worker_status(job["status_path"], {
             **previous,
             "worker_id": job.get("worker_id"),
@@ -6848,6 +8990,7 @@ def _video_producer_write_parent_worker_error(job, stage, error_text):
             "detail": str(error_text),
             "log_path": job.get("log_path"),
             "status_path": job.get("status_path"),
+            "checkpoint_dir": job.get("checkpoint_dir"),
             "updated_at": time.time(),
         })
     except Exception:
@@ -6903,7 +9046,7 @@ def _video_producer_execute_jobs_resilient(jobs, worker_count, run_dir):
                 try:
                     if job.get("issue_path"):
                         _video_producer_write_json_atomic(job["issue_path"], issue)
-                    previous = _video_producer_read_worker_status(job.get("status_path"))
+                    previous = _video_producer_read_worker_status(job.get("status_path"), checkpoint_dir=job.get("checkpoint_dir"))
                     _video_producer_write_worker_status(job["status_path"], {
                         **previous, **issue,
                         "detail": str(exc),
@@ -7487,6 +9630,7 @@ def video_producer_main(cpu_workers=None, gpu_workers=None, max_projects=None):
             "project_title": title,
             "project_category": category_value,
             "ready_script_path": ready_script_snapshot_path,
+            "source_ready_script_path": ready_script_path,
             "images_path": images_path,
             "subscribe_stickers_path": subscribe_stickers_path,
             "workspace_root": os.path.join(project_checkpoint_dir, "worker_workspaces"),
@@ -7515,9 +9659,7 @@ def video_producer_main(cpu_workers=None, gpu_workers=None, max_projects=None):
             _video_producer_write_control(job["control_path"], "run")
         except Exception as control_exc:
             print(f"⚠️ [CONTROL] Could not initialize {job.get('worker_id')}: {control_exc}")
-        saved_progress = _video_producer_read_json(
-            os.path.join(job["checkpoint_dir"], "progress.json"), {}
-        )
+        saved_progress = _video_producer_read_progress_json(job["checkpoint_dir"])
         saved_stage = saved_progress.get("stage") if isinstance(saved_progress, dict) else None
         saved_detail = saved_progress.get("detail") if isinstance(saved_progress, dict) else None
         safe_title = _video_producer_normalize_title(job["project_title"])
@@ -7545,6 +9687,7 @@ def video_producer_main(cpu_workers=None, gpu_workers=None, max_projects=None):
                 "queued_at": job["queued_at"],
                 "log_path": job["log_path"],
                 "status_path": job["status_path"],
+                "checkpoint_dir": job.get("checkpoint_dir"),
                 "preview_path": job["preview_path"],
                 "control_path": job["control_path"],
                 "issue_path": job.get("issue_path"),
@@ -7644,10 +9787,10 @@ def video_producer_main(cpu_workers=None, gpu_workers=None, max_projects=None):
             key = str(job.get("worker_id"))
             if key not in restartable_by_id:
                 continue
-            control_data = _video_producer_read_json(job["control_path"], {})
+            control_data = _video_producer_read_control_json(job["control_path"])
             if isinstance(control_data, dict) and str(control_data.get("command", "")).casefold() in {"start", "resume"}:
                 _video_producer_write_control(job["control_path"], "run")
-                previous_state = _video_producer_read_worker_status(job["status_path"])
+                previous_state = _video_producer_read_worker_status(job["status_path"], checkpoint_dir=job.get("checkpoint_dir"))
                 _video_producer_write_worker_status(job["status_path"], {
                     **previous_state,
                     "status": "queued",
@@ -10502,7 +12645,7 @@ class SceneIQApp:
             font=("Segoe UI", 9), padx=10, pady=9, bd=0, highlightthickness=0,
             state="disabled",
         )
-        scroll = ttk.Scrollbar(
+        scroll = self.ttk.Scrollbar(
             body, orient="vertical", command=self.issue_text.yview,
             style="SceneIQ.Vertical.TScrollbar",
         )
@@ -10588,17 +12731,16 @@ class SceneIQApp:
     def _write_heartbeat(self):
         import os
         import time
+        payload = {"pid": os.getpid(), "heartbeat_at": time.time(), "updated_at": time.time()}
         try:
-            _video_producer_write_json_atomic(self.heartbeat_path, {
-                "pid": os.getpid(), "heartbeat_at": time.time(),
-            })
-        except Exception:
-            try:
-                import json
-                with open(self.heartbeat_path, "w", encoding="utf-8") as handle:
-                    json.dump({"pid": os.getpid(), "heartbeat_at": time.time()}, handle)
-            except Exception:
-                pass
+            _video_producer_write_with_three_level_fallback(
+                self.heartbeat_path,
+                payload,
+                _video_producer_status_fallback_paths(self.heartbeat_path),
+            )
+        except Exception as exc:
+            # Heartbeat failure is visible in the console; never truncate a locked file.
+            self.log(f"Dashboard heartbeat could not be saved to any recovery location: {exc}", "WARNING")
 
     def _refresh_dashboard(self):
         import time
@@ -10624,7 +12766,7 @@ class SceneIQApp:
             for index, job in enumerate(jobs):
                 worker_id = str(job.get("worker_id") or f"WORKER-{index + 1:03d}")
                 active_ids.add(worker_id)
-                status = self._read_dashboard_json(job.get("status_path"), {})
+                status = _video_producer_read_worker_status(job.get("status_path"), checkpoint_dir=job.get("checkpoint_dir"))
                 if not isinstance(status, dict):
                     status = {}
                 status_state = str(status.get("status") or "queued").casefold()
@@ -10709,9 +12851,17 @@ class SceneIQApp:
     def _write_shutdown_request(self):
         import time
         try:
-            _video_producer_write_json_atomic(self.shutdown_path, {
-                "shutdown": True, "requested_at": time.time(), "requested_by": "SceneIQ desktop window",
-            })
+            payload = {
+                "shutdown": True,
+                "requested_at": time.time(),
+                "requested_by": "SceneIQ desktop window",
+                "updated_at": time.time(),
+            }
+            _video_producer_write_with_three_level_fallback(
+                self.shutdown_path,
+                payload,
+                _video_producer_status_fallback_paths(self.shutdown_path),
+            )
         except Exception as exc:
             self.log(f"Could not write graceful shutdown request: {exc}", "WARNING")
 
