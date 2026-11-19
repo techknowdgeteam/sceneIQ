@@ -3,6 +3,29 @@ sceneiqvideoproduction.py
 This single file contains both the video renderer and its isolated dashboard mode.
 Google Flow image generation lives in
 sceniqimageproduction.py and is not imported or started here.
+
+MANDATORY PRODUCTION BEHAVIOUR — PRESERVE THESE RULES IN FUTURE CHANGES:
+1. CAPTIONS: Use the authored scene dialogue/narration for the exact displayed
+   wording and spelling. Align each authored word to the corresponding spoken
+   word recognized in the audio. Speech recognition supplies the pronunciation
+   timing, not the replacement spelling. Reveal/type each word only during its
+   spoken interval, and finish revealing that word by its recognized spoken end;
+   never pre-type the next word or let typing drift away from pronunciation.
+2. LIKE/SUBSCRIBE STICKERS: Treat animated GIF/WebP/APNG stickers as independent
+   visual overlays, not as captions. Start a sticker at the spoken CTA trigger,
+   then let its selected animation play for one complete cycle across scene
+   boundaries. Do not remove it when the word, caption, caption line, or scene
+   ends. It may disappear only after its complete GIF animation cycle finishes.
+3. Keep the caption timeline and sticker lifetime independent. A caption setting,
+   caption event ending, or scene boundary must never shorten a sticker's full
+   animation. Preserve all other existing producer behaviour unless explicitly
+   requested to change it.
+4. FRAME-ACCURATE CAPTION CLOCK: At 24 fps, every independently encoded scene
+   segment must contain an integer number of frames. Allocate the narration's
+   total frame count across the scene segments, and calculate every scene start
+   from cumulative frame counts. Never calculate caption offsets by repeatedly
+   adding unrounded decimal scene durations; that causes progressive caption
+   drift after many separately encoded scene segments.
 """
 
 import os
@@ -730,7 +753,7 @@ def process_single_video(
         - instructional_overlay / legacy stage-step-level-example fields control
           a full-screen background, timed heading entrance, optional emphasis/hold,
           and optional exit animation. The project overlay palette is locked globally.
-        - Captions use strict ASR word timing: no next word is pretyped before its own spoken start.
+        - Captions use strict ASR word timing: each word finishes at its spoken end; no next word is pretyped.
         - Short internal near-flat gaps are cut before ASR; retained speech samples are never time-stretched.
         - Enabled captions are rendered from ASR timing on every applicable frame.
           Caption appearance is not used as a final render-failure gate.
@@ -740,7 +763,7 @@ def process_single_video(
         - Instructional-heading words are omitted from ordinary captions while the
           heading is displayed. Overlay ASR works even when ordinary captions are off.
         - AI-provided identifiers and descriptive keywords are normalized safely.
-        - Like/subscribe stickers retain the existing 50% display scale.
+        - Like/subscribe stickers retain the existing 50% display scale, start at the spoken CTA onset, and play one full GIF cycle across scene boundaries.
         Captions, overlays, and effects are rendered frame-by-frame; source images remain unchanged.
         Keeps the existing queue, project lookup, script timing, audio matching,
         image normalization, output backup, and sequential clip assembly.
@@ -758,6 +781,7 @@ def process_single_video(
         import traceback
         import time
         import random
+        import gc
         import math
         from functools import lru_cache
         from PIL import Image, ImageDraw, ImageFont, ImageColor, ImageOps, ImageEnhance, ImageFilter, ImageChops
@@ -1208,8 +1232,9 @@ def process_single_video(
                  characters_reference and scene_Image_generation.
               2. Older nested batches containing an "entries" list and
                  scene_pov_prompt.
-            Caption text is taken from a narration/dialogue field if one exists.
-            No separate JSON file is required.
+            Scene extraction preserves authored dialogue as the canonical written
+            wording for captions. Speech recognition supplies the timing for each
+            corresponding spoken word; it does not replace the authored spelling.
             """
             # Use the same structure-independent script discovery as the Google
             # Flow generator; do not assume project_name/script_json wrapper keys.
@@ -1226,6 +1251,8 @@ def process_single_video(
             seen_ids = set()
             # These fields identify a scene object without requiring the legacy
             # scene_pov_prompt field to exist.
+            # These names identify a scene-shaped dictionary only; speech-text
+            # values are deliberately never harvested from it for captions/timing.
             scene_markers = {
                 "scene_pov_prompt",
                 "scene_Image_generation",
@@ -1282,25 +1309,6 @@ def process_single_video(
                     if isinstance(value, (dict, list)):
                         walk(value)
             walk(script_data)
-            def first_text(entry, keys):
-                for key in keys:
-                    value = entry.get(key)
-                    if isinstance(value, str) and value.strip():
-                        return value.strip()
-                    if isinstance(value, (int, float)) and not isinstance(value, bool):
-                        return str(value)
-                return ""
-            caption_keys = (
-                "dialogue",
-                "narration",
-                "voiceover",
-                "voice_over",
-                "voice_over_script",
-                "spoken_text",
-                "caption",
-                "subtitle",
-                "text",
-            )
             result = []
             running_cursor = 0.0
             for index, entry in enumerate(collected):
@@ -1330,33 +1338,64 @@ def process_single_video(
                     duration = 5.0
                     stop = start + duration
                 item = dict(entry)
+                # Keep one isolated authored speech string for caption spelling.
+                # It is never used for timing: only ASR word timestamps determine
+                # when the corresponding written words appear.
+                caption_source_aliases = (
+                    "dialogue", "narration", "voiceover", "voice_over",
+                    "voice_over_script", "spoken_text", "caption", "subtitle", "text",
+                )
+                caption_source_text = ""
+                for source_alias in caption_source_aliases:
+                    wanted_source_key = _normalise_key(source_alias)
+                    for source_key, source_value in entry.items():
+                        if _normalise_key(source_key) != wanted_source_key:
+                            continue
+                        if isinstance(source_value, str) and source_value.strip():
+                            caption_source_text = source_value.strip()
+                        elif isinstance(source_value, (int, float)) and not isinstance(source_value, bool):
+                            caption_source_text = str(source_value)
+                        elif isinstance(source_value, list):
+                            caption_source_text = " ".join(
+                                str(part).strip() for part in source_value
+                                if isinstance(part, (str, int, float)) and str(part).strip()
+                            )
+                        if caption_source_text:
+                            break
+                    if caption_source_text:
+                        break
+                item["_sceneiq_caption_source_text"] = caption_source_text
+
+                # Keep raw scene speech fields out of the renderer's visual item.
+                # The isolated text above is used only by the word-to-ASR aligner.
+                speech_text_field_names = {
+                    "dialogue", "narration", "voiceover", "voiceoverscript",
+                    "spoken_text", "caption", "subtitle", "text",
+                }
+                for field_name in list(item):
+                    if _normalise_key(field_name) in speech_text_field_names:
+                        item.pop(field_name, None)
                 item["start_seconds"] = start
                 item["stop_seconds"] = stop
                 item["duration_seconds"] = duration
-                # Keep source dialogue even when caption rendering is disabled.
-                # Stage/step/level detection and subscribe-sticker matching must not
-                # depend on the caption toggle.
-                source_dialogue = first_text(entry, caption_keys)
-                item["source_dialogue"] = source_dialogue
-                item["dialogue"] = source_dialogue if include_captions else ""
                 result.append(item)
                 running_cursor = max(running_cursor, stop)
             # Preserve the order in which scene records appear in the script.
             # Original start/stop values may be wrong; sorting by them here could
-            # reorder the storyboard before the dialogue-based timing repair runs.
+            # reorder the storyboard before audio-duration timing allocation runs.
             if include_captions:
-                print(f"📚 [CAPTIONS] Read {len(result)} scene entries from panel.json")
-                if result:
-                    caption_count = sum(bool(item.get("dialogue")) for item in result)
-                    print(f"📝 [CAPTIONS] {caption_count}/{len(result)} scenes contain caption/narration text")
-                    if caption_count == 0:
-                        print(
-                            "⚠️ [CAPTIONS] Scene entries were found, but none contains dialogue/narration "
-                            "text. Animated captions need a text field such as dialogue, narration, "
-                            "voiceover, spoken_text, caption, or subtitle."
-                        )
+                print(f"📚 [CAPTIONS] Read {len(result)} visual scene entries from panel.json")
+                authored_dialogue_count = sum(
+                    bool(str(item.get("_sceneiq_caption_source_text", "")).strip())
+                    for item in result
+                )
+                print(
+                    "📝 [CAPTIONS] Authored scene dialogue supplies the displayed wording; "
+                    "ASR supplies the actual word start/end times. "
+                    f"Dialogue text found in {authored_dialogue_count}/{len(result)} scene(s)."
+                )
             else:
-                print(f"📚 [VIDEO] Read {len(result)} scene entries; caption extraction is disabled")
+                print(f"📚 [VIDEO] Read {len(result)} visual scene entries; ordinary captions are disabled")
             return result
         _set_worker_status(
             "Reading the story and its scene instructions",
@@ -2074,13 +2113,289 @@ def process_single_video(
             return cleaned
 
         audio_words = _deduplicate_overlapping_asr_words(audio_words)
-        if not audio_words:
-            raise RuntimeError("ASR produced no word-level timestamps from the silence-trimmed narration.")
-        print(f"🧹 [ASR] Caption timeline contains {len(audio_words)} unique, timestamped word event(s)")
 
-        def _sceneiq_alignment_tokens(value):
+        def _sceneiq_sanitize_asr_word_timestamps(words, audio_duration):
+            """Keep only valid recognized words whose timestamps fall inside the actual narration."""
+            import math
+
+            try:
+                duration_limit = float(audio_duration)
+            except (TypeError, ValueError):
+                duration_limit = 0.0
+            if not math.isfinite(duration_limit) or duration_limit <= 0:
+                raise RuntimeError("The trimmed narration duration is invalid for ASR caption timing.")
+
+            cleaned = []
+            rejected = 0
+            for item in words or []:
+                if not isinstance(item, dict):
+                    rejected += 1
+                    continue
+                word = str(item.get("word", "") or "").strip()
+                try:
+                    start = float(item.get("start"))
+                    end = float(item.get("end"))
+                except (TypeError, ValueError):
+                    rejected += 1
+                    continue
+                if not word or not math.isfinite(start) or not math.isfinite(end):
+                    rejected += 1
+                    continue
+                start = max(0.0, start)
+                if start >= duration_limit:
+                    rejected += 1
+                    continue
+                end = min(duration_limit, max(start, end))
+                if end - start < 0.015:
+                    # Keep the recognized word at its actual end-of-file position
+                    # while guaranteeing the renderer has a minimally visible interval.
+                    start = max(0.0, min(start, duration_limit - 0.015))
+                    end = min(duration_limit, max(end, start + 0.015))
+                if end <= start:
+                    rejected += 1
+                    continue
+                cleaned.append({"word": word, "start": start, "end": end})
+
+            cleaned.sort(key=lambda item: (item["start"], item["end"]))
+            if rejected:
+                print(
+                    f"⚠️ [ASR] Discarded {rejected} invalid/out-of-range word timestamp(s); "
+                    "remaining recognized words stay on the narration timeline."
+                )
+            return cleaned
+
+        audio_words = _sceneiq_sanitize_asr_word_timestamps(
+            audio_words, float(trimmed_audio_duration)
+        )
+        if not audio_words:
+            raise RuntimeError("ASR produced no valid word-level timestamps inside the silence-trimmed narration.")
+        print(
+            f"🧹 [ASR] Prepared {len(audio_words)} unique, valid, timestamped spoken-word event(s); "
+            "these ASR start/end times will control caption pronunciation timing."
+        )
+
+        def _sceneiq_transcript_tokens(value):
+            """Normalize a recognized ASR token for spoken-phrase matching only."""
             value = str(value or "").casefold().replace("’", "'")
             return re.findall(r"[a-z0-9]+(?:'[a-z0-9]+)?", value)
+
+        def build_dialogue_pronunciation_timed_words(scene_entries, recognized_words):
+            """Use authored scene words, timed by the matching spoken ASR words.
+
+            This is a monotonic text-to-audio alignment, not a caption clock based
+            on scene durations. Exact and phonetic matches inherit the recognized
+            word's real start/end. This lets a correctly authored word such as
+            "ladder" display at the timestamp where Whisper recognized "latter".
+            Unmatched ASR events are retained as a safe fallback; authored words
+            with no corresponding recognized speech event are not invented.
+            """
+            from difflib import SequenceMatcher
+            import math
+
+            dialogue_tokens = []
+            for scene_index, scene_entry in enumerate(scene_entries or []):
+                if not isinstance(scene_entry, dict):
+                    continue
+                source_text = str(scene_entry.get("_sceneiq_caption_source_text", "") or "").strip()
+                if not source_text:
+                    continue
+                matches = list(re.finditer(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)*", source_text))
+                for match_index, match in enumerate(matches):
+                    previous_end = matches[match_index - 1].end() if match_index else 0
+                    next_start = matches[match_index + 1].start() if match_index + 1 < len(matches) else len(source_text)
+                    between_before = source_text[previous_end:match.start()]
+                    between_after = source_text[match.end():next_start]
+                    leading_match = re.search(r"([$£€¥₹“\"'‘([{]+)\s*$", between_before)
+                    trailing_match = re.match(r"\s*([,.;:!?…—–-]+)", between_after)
+                    leading = leading_match.group(1) if leading_match else ""
+                    trailing = trailing_match.group(1) if trailing_match else ""
+                    surface = f"{leading}{match.group(0)}{trailing}"
+                    dialogue_tokens.append({
+                        "word": surface,
+                        "normalized": re.sub(r"[^a-z0-9']+", "", match.group(0).casefold().replace("’", "'")),
+                        "scene_index": scene_index,
+                    })
+
+            asr_tokens = []
+            for item in recognized_words or []:
+                if not isinstance(item, dict):
+                    continue
+                raw_word = str(item.get("word", "") or "").strip()
+                normalized_parts = _sceneiq_transcript_tokens(raw_word)
+                normalized = "".join(normalized_parts)
+                if not raw_word or not normalized:
+                    continue
+                try:
+                    start = float(item.get("start"))
+                    end = float(item.get("end"))
+                except (TypeError, ValueError):
+                    continue
+                if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+                    continue
+                asr_tokens.append({
+                    "word": raw_word,
+                    "normalized": normalized,
+                    "start": start,
+                    "end": end,
+                })
+
+            if not asr_tokens:
+                return []
+            if not dialogue_tokens:
+                print(
+                    "⚠️ [CAPTIONS] No authored scene dialogue was found; "
+                    "using recognized ASR words and their timestamps as fallback."
+                )
+                return [dict(item) for item in asr_tokens]
+
+            def phonetic_key(value):
+                value = re.sub(r"[^a-z]", "", str(value or "").casefold())
+                if not value:
+                    return ""
+                value = value.replace("ph", "f").replace("ck", "k").replace("qu", "kw")
+                value = re.sub(r"(.)\1+", r"\1", value)
+                chars = list(value)
+                for index in range(1, len(chars) - 1):
+                    if chars[index] in {"d", "t"} and chars[index - 1] in "aeiou" and chars[index + 1] in "aeiou":
+                        # In many English accents these are realized with the same
+                        # intervocalic flap (e.g. ladder/latter). The surrounding
+                        # words and sequence order remain part of the alignment.
+                        chars[index] = "t"
+                return "".join(chars)
+
+            dialogue_norms = [item["normalized"] for item in dialogue_tokens]
+            asr_norms = [item["normalized"] for item in asr_tokens]
+            dialogue_phonetics = [phonetic_key(value) for value in dialogue_norms]
+            asr_phonetics = [phonetic_key(value) for value in asr_norms]
+
+            def substitution_score(dialogue_index, asr_index):
+                left = dialogue_norms[dialogue_index]
+                right = asr_norms[asr_index]
+                if left and left == right:
+                    return 6.0
+                left_phonetic = dialogue_phonetics[dialogue_index]
+                right_phonetic = asr_phonetics[asr_index]
+                if left_phonetic and left_phonetic == right_phonetic and min(len(left_phonetic), len(right_phonetic)) >= 3:
+                    return 5.0
+                if not left or not right:
+                    return -3.0
+                ratio = SequenceMatcher(None, left, right, autojunk=False).ratio()
+                shortest = min(len(left), len(right))
+                if ratio >= 0.76 and shortest >= 4:
+                    return 2.8 + ratio
+                if ratio >= 0.62 and shortest >= 5:
+                    return 1.6 + ratio
+                return -2.6
+
+            dialogue_to_asr = {}
+
+            def align_unanchored_gap(dialogue_start, dialogue_stop, asr_start, asr_stop):
+                dialogue_count = dialogue_stop - dialogue_start
+                asr_count = asr_stop - asr_start
+                if dialogue_count <= 0 or asr_count <= 0:
+                    return
+                # Exact matching blocks normally keep these gaps small. Avoid a
+                # pathological quadratic allocation if an entire script is unrelated.
+                if dialogue_count * asr_count > 350_000:
+                    return
+                gap_penalty = 1.35
+                scores = [[0.0] * (asr_count + 1) for _ in range(dialogue_count + 1)]
+                trace = [bytearray(asr_count + 1) for _ in range(dialogue_count + 1)]
+                for i in range(1, dialogue_count + 1):
+                    scores[i][0] = scores[i - 1][0] - gap_penalty
+                    trace[i][0] = 1  # authored dialogue word had no ASR match
+                for j in range(1, asr_count + 1):
+                    scores[0][j] = scores[0][j - 1] - gap_penalty
+                    trace[0][j] = 2  # recognized ASR word has no dialogue match
+                for i in range(1, dialogue_count + 1):
+                    absolute_dialogue_index = dialogue_start + i - 1
+                    for j in range(1, asr_count + 1):
+                        absolute_asr_index = asr_start + j - 1
+                        match_value = substitution_score(absolute_dialogue_index, absolute_asr_index)
+                        diagonal = scores[i - 1][j - 1] + match_value
+                        skip_dialogue = scores[i - 1][j] - gap_penalty
+                        skip_asr = scores[i][j - 1] - gap_penalty
+                        if diagonal >= skip_dialogue and diagonal >= skip_asr:
+                            scores[i][j] = diagonal
+                            trace[i][j] = 0
+                        elif skip_dialogue >= skip_asr:
+                            scores[i][j] = skip_dialogue
+                            trace[i][j] = 1
+                        else:
+                            scores[i][j] = skip_asr
+                            trace[i][j] = 2
+                i, j = dialogue_count, asr_count
+                recovered = []
+                while i > 0 or j > 0:
+                    direction = trace[i][j]
+                    if i > 0 and j > 0 and direction == 0:
+                        absolute_dialogue_index = dialogue_start + i - 1
+                        absolute_asr_index = asr_start + j - 1
+                        if substitution_score(absolute_dialogue_index, absolute_asr_index) >= 2.0:
+                            recovered.append((absolute_dialogue_index, absolute_asr_index))
+                        i -= 1
+                        j -= 1
+                    elif i > 0 and (j == 0 or direction == 1):
+                        i -= 1
+                    elif j > 0:
+                        j -= 1
+                    else:
+                        break
+                for dialogue_index, asr_index in reversed(recovered):
+                    dialogue_to_asr[dialogue_index] = asr_index
+
+            # Exact sequence matches are stable anchors. Only gaps between these
+            # anchors need fuzzy/phonetic comparison, which reduces false matches
+            # among repeated short words and keeps the whole alignment in order.
+            matcher = SequenceMatcher(None, dialogue_norms, asr_norms, autojunk=False)
+            matching_blocks = matcher.get_matching_blocks()
+            previous_dialogue = 0
+            previous_asr = 0
+            for block in matching_blocks:
+                align_unanchored_gap(
+                    previous_dialogue,
+                    block.a,
+                    previous_asr,
+                    block.b,
+                )
+                for offset in range(block.size):
+                    dialogue_to_asr[block.a + offset] = block.b + offset
+                previous_dialogue = block.a + block.size
+                previous_asr = block.b + block.size
+
+            asr_to_dialogue = {asr_index: dialogue_index for dialogue_index, asr_index in dialogue_to_asr.items()}
+            matched_asr_indices = set(asr_to_dialogue)
+            output_words = []
+            for asr_index, asr_item in enumerate(asr_tokens):
+                dialogue_index = asr_to_dialogue.get(asr_index)
+                display_word = (
+                    dialogue_tokens[dialogue_index]["word"]
+                    if dialogue_index is not None
+                    else asr_item["word"]
+                )
+                output_words.append({
+                    "word": display_word,
+                    "start": asr_item["start"],
+                    "end": asr_item["end"],
+                    "_asr_word_index": asr_index,
+                    "_dialogue_word_index": dialogue_index,
+                })
+
+            matched_dialogue_count = len(dialogue_to_asr)
+            dialogue_match_ratio = matched_dialogue_count / max(1, len(dialogue_tokens))
+            asr_fallback_count = len(asr_tokens) - len(matched_asr_indices)
+            print(
+                f"✅ [CAPTIONS] Aligned {matched_dialogue_count}/{len(dialogue_tokens)} authored "
+                f"dialogue word(s) to ASR pronunciation timestamps ({dialogue_match_ratio:.1%}); "
+                f"{asr_fallback_count} unmatched ASR word(s) retained at their recognized timings."
+            )
+            if dialogue_match_ratio < 0.70:
+                print(
+                    "⚠️ [CAPTIONS] Dialogue-to-ASR match rate is below 70%. "
+                    "Matched words keep authored spelling; unmatched speech stays on its ASR wording "
+                    "rather than being assigned invented timestamps."
+                )
+            return output_words
 
         def _sceneiq_format_script_time(seconds):
             seconds = max(0.0, float(seconds))
@@ -2092,182 +2407,88 @@ def process_single_video(
                 return f"{hours}:{minutes:02d}:{remainder:05.2f}"
             return f"{whole_minutes}:{remainder:05.2f}"
 
-        def _sceneiq_align_scene_times_to_dialogue(scene_entries, recognized_words, narration_duration):
-            """Align ordered scene dialogue to ASR words from the trimmed narration."""
-            import difflib
-            if not scene_entries or not recognized_words or narration_duration <= 0:
-                raise RuntimeError("Scene dialogue alignment needs scene entries, ASR words, and a valid audio duration.")
+        def _sceneiq_allocate_scene_times_from_audio(scene_entries, narration_duration):
+            """Allocate visual scene durations without reading or matching scene dialogue.
 
-            expected_tokens = []
-            token_scene_owners = []
-            per_scene_tokens = []
-            for scene_index, scene_entry in enumerate(scene_entries):
-                scene_tokens = _sceneiq_alignment_tokens(scene_entry.get("source_dialogue") or "")
-                per_scene_tokens.append(scene_tokens)
-                expected_tokens.extend(scene_tokens)
-                token_scene_owners.extend([scene_index] * len(scene_tokens))
-            if not expected_tokens:
+            Existing scene durations are used only as visual weights. They are scaled
+            proportionally to the exact trimmed-audio duration. Caption wording and
+            every caption word's start/end remain sourced directly from ASR timestamps.
+            """
+            import math
+
+            if not isinstance(scene_entries, list) or not scene_entries:
+                raise RuntimeError("No visual scene entries are available for audio-duration allocation.")
+            try:
+                total_duration = float(narration_duration)
+            except (TypeError, ValueError):
+                total_duration = 0.0
+            if not math.isfinite(total_duration) or total_duration <= 0:
+                raise RuntimeError("The trimmed narration duration is invalid for scene timing.")
+
+            minimum_scene_duration = 1.0 / 24.0
+            required_minimum = minimum_scene_duration * len(scene_entries)
+            if total_duration + 1e-9 < required_minimum:
                 raise RuntimeError(
-                    "No scene dialogue/narration text was found, so the trimmed audio cannot be aligned to scene entries."
+                    f"Narration is too short ({total_duration:.3f}s) to reserve one 24-fps frame "
+                    f"for each of the {len(scene_entries)} visual scenes ({required_minimum:.3f}s required)."
                 )
 
-            transcript_tokens = []
-            transcript_word_indices = []
-            for word_index, word_item in enumerate(recognized_words):
-                parts = _sceneiq_alignment_tokens(word_item.get("word", ""))
-                for part in parts:
-                    transcript_tokens.append(part)
-                    transcript_word_indices.append(word_index)
-            if not transcript_tokens:
-                raise RuntimeError("The ASR transcript contains no usable text tokens for scene alignment.")
-
-            matcher = difflib.SequenceMatcher(
-                None, expected_tokens, transcript_tokens, autojunk=False
-            )
-            matched_by_scene = {i: [] for i in range(len(scene_entries))}
-            matched_expected_by_scene = {i: 0 for i in range(len(scene_entries))}
-            for block in matcher.get_matching_blocks():
-                for offset in range(block.size):
-                    expected_index = block.a + offset
-                    transcript_index = block.b + offset
-                    scene_index = token_scene_owners[expected_index]
-                    matched_by_scene[scene_index].append(transcript_word_indices[transcript_index])
-                    matched_expected_by_scene[scene_index] += 1
-
-            total_matched = sum(matched_expected_by_scene.values())
-            global_coverage = total_matched / max(1, len(expected_tokens))
-            if global_coverage < 0.60:
-                raise RuntimeError(
-                    f"Scene dialogue does not sufficiently match the trimmed narration "
-                    f"({global_coverage:.0%} token coverage; minimum 60%). "
-                    "The project was stopped to avoid incorrect scene/caption timing."
-                )
-
-            scene_anchors = {}
-            alignment_details = []
+            duration_weights = []
             for scene_index, scene_entry in enumerate(scene_entries):
-                expected_count = len(per_scene_tokens[scene_index])
-                matched_indices = sorted(set(matched_by_scene[scene_index]))
-                matched_count = matched_expected_by_scene[scene_index]
-                coverage = matched_count / max(1, expected_count)
-                if expected_count:
-                    minimum_matches = max(1, int(math.ceil(expected_count * 0.50)))
-                    if matched_count < minimum_matches or not matched_indices:
-                        entry_name = str(scene_entry.get("entry_id") or f"scene {scene_index + 1}")
-                        raise RuntimeError(
-                            f"Dialogue alignment failed for {entry_name}: "
-                            f"matched {matched_count}/{expected_count} words ({coverage:.0%}). "
-                            "The video was stopped instead of guessing this scene's timing."
-                        )
-                    first_word_index = matched_indices[0]
-                    last_word_index = matched_indices[-1]
-                    word_start = float(recognized_words[first_word_index]["start"])
-                    word_end = float(recognized_words[last_word_index]["end"])
-                    if word_end <= word_start:
-                        raise RuntimeError(f"Invalid ASR timing range for scene {scene_index + 1}.")
-                    scene_anchors[scene_index] = (word_start, word_end)
-                else:
-                    first_word_index = None
-                    last_word_index = None
-                alignment_details.append({
-                    "scene_index": scene_index,
-                    "entry_id": scene_entry.get("entry_id"),
-                    "expected_dialogue_words": expected_count,
-                    "matched_dialogue_words": matched_count,
-                    "dialogue_match_ratio": round(coverage, 4),
-                    "first_asr_word_index": first_word_index,
-                    "last_asr_word_index": last_word_index,
-                })
+                raw_weight = scene_entry.get("duration_seconds")
+                if raw_weight is None:
+                    raw_weight = scene_entry.get("duration", scene_entry.get("scene_duration"))
+                try:
+                    weight = float(raw_weight)
+                except (TypeError, ValueError):
+                    weight = 5.0
+                if not math.isfinite(weight) or weight <= 0:
+                    weight = 5.0
+                duration_weights.append(max(minimum_scene_duration, weight))
 
-            # Determine a speech-centre for every scene. Entries with dialogue use
-            # real ASR timestamps; silent/no-dialogue entries are interpolated
-            # between their nearest spoken scenes, weighted by dialogue length.
-            known_indices = sorted(scene_anchors)
-            if not known_indices:
-                raise RuntimeError("No scene could be anchored to the recognized narration.")
-            centres = {}
-            for scene_index, (start_value, end_value) in scene_anchors.items():
-                centres[scene_index] = (start_value + end_value) / 2.0
-
-            first_known = known_indices[0]
-            if first_known > 0:
-                total_weight = sum(max(1, len(per_scene_tokens[i])) for i in range(first_known + 1))
-                first_centre = centres[first_known]
-                for i in range(first_known):
-                    cumulative = sum(max(1, len(per_scene_tokens[j])) for j in range(i + 1))
-                    centres[i] = max(0.0, first_centre * cumulative / max(1, total_weight))
-
-            for left_index, right_index in zip(known_indices, known_indices[1:]):
-                if right_index - left_index <= 1:
-                    continue
-                left_centre = centres[left_index]
-                right_centre = centres[right_index]
-                weights = [max(1, len(per_scene_tokens[i])) for i in range(left_index + 1, right_index)]
-                total_weight = sum(weights) + 1
-                cumulative = 0
-                for offset, scene_index in enumerate(range(left_index + 1, right_index)):
-                    cumulative += weights[offset]
-                    centres[scene_index] = left_centre + (right_centre - left_centre) * cumulative / total_weight
-
-            last_known = known_indices[-1]
-            if last_known < len(scene_entries) - 1:
-                remaining_indices = list(range(last_known + 1, len(scene_entries)))
-                weights = [max(1, len(per_scene_tokens[i])) for i in remaining_indices]
-                total_weight = sum(weights) + 1
-                cumulative = 0
-                for offset, scene_index in enumerate(remaining_indices):
-                    cumulative += weights[offset]
-                    centres[scene_index] = centres[last_known] + (
-                        narration_duration - centres[last_known]
-                    ) * cumulative / total_weight
-
-            centre_values = [float(centres[i]) for i in range(len(scene_entries))]
-            if len(centre_values) > 1:
-                minimum_gap = 0.025
-                if narration_duration < minimum_gap * len(centre_values):
-                    raise RuntimeError("Narration is too short to assign a distinct timeline to every scene.")
-                # Keep interpolated and aligned centres strictly chronological.
-                for i in range(1, len(centre_values)):
-                    centre_values[i] = max(centre_values[i], centre_values[i - 1] + minimum_gap)
-                # If clamping exceeded the endpoint, compress the centre range evenly.
-                if centre_values[-1] > narration_duration:
-                    start_centre = max(0.0, centre_values[0])
-                    available = max(0.01, narration_duration - start_centre)
-                    span = max(0.001, centre_values[-1] - start_centre)
-                    centre_values = [
-                        start_centre + (value - start_centre) * available / span
-                        for value in centre_values
-                    ]
+            remaining_duration = max(0.0, total_duration - required_minimum)
+            weight_total = sum(duration_weights)
+            allocated_durations = [
+                minimum_scene_duration + remaining_duration * (weight / weight_total)
+                for weight in duration_weights
+            ]
+            # Make the final boundary exactly equal to the narration duration;
+            # this prevents cumulative floating-point drift from shifting captions.
+            if allocated_durations:
+                allocated_durations[-1] = total_duration - sum(allocated_durations[:-1])
+            if any(
+                not math.isfinite(value) or value + 1e-9 < minimum_scene_duration
+                for value in allocated_durations
+            ):
+                raise RuntimeError("Audio-only scene duration allocation produced an invalid scene interval.")
 
             boundaries = [0.0]
-            for i in range(len(centre_values) - 1):
-                # When adjacent scenes both have speech anchors, place their cut
-                # halfway through the actual pause between the previous dialogue's
-                # last word and the next dialogue's first word. For unspoken scenes,
-                # retain centre-based interpolation between the nearest anchors.
-                previous_anchor = scene_anchors.get(i)
-                next_anchor = scene_anchors.get(i + 1)
-                if previous_anchor and next_anchor and next_anchor[0] >= previous_anchor[1]:
-                    boundary = (float(previous_anchor[1]) + float(next_anchor[0])) / 2.0
-                else:
-                    boundary = (centre_values[i] + centre_values[i + 1]) / 2.0
-                lower_bound = boundaries[-1] + 0.01
-                upper_bound = narration_duration - (len(centre_values) - i - 1) * 0.01
-                boundary = min(upper_bound, max(lower_bound, boundary))
-                boundaries.append(boundary)
-            boundaries.append(float(narration_duration))
+            for duration_value in allocated_durations:
+                boundaries.append(boundaries[-1] + duration_value)
+            boundaries[-1] = total_duration
 
-            repaired = []
+            scene_reports = []
             for scene_index, scene_entry in enumerate(scene_entries):
-                start_value = max(0.0, boundaries[scene_index])
-                stop_value = max(start_value + 0.01, boundaries[scene_index + 1])
-                stop_value = min(float(narration_duration), stop_value)
+                start_value = float(boundaries[scene_index])
+                stop_value = float(boundaries[scene_index + 1])
                 duration_value = stop_value - start_value
-                if duration_value <= 0:
-                    raise RuntimeError(f"The repaired duration for scene {scene_index + 1} is invalid.")
+                if duration_value + 1e-9 < minimum_scene_duration:
+                    raise RuntimeError(
+                        f"Audio-only allocation gave scene {scene_index + 1} an invalid "
+                        f"duration ({duration_value:.6f}s)."
+                    )
 
-                original_start = scene_entry.get("start") or scene_entry.get("start_time") or scene_entry.get("scene_start")
-                original_stop = scene_entry.get("stop") or scene_entry.get("end") or scene_entry.get("stop_time") or scene_entry.get("scene_end")
+                original_start = (
+                    scene_entry.get("start")
+                    or scene_entry.get("start_time")
+                    or scene_entry.get("scene_start")
+                )
+                original_stop = (
+                    scene_entry.get("stop")
+                    or scene_entry.get("end")
+                    or scene_entry.get("stop_time")
+                    or scene_entry.get("scene_end")
+                )
                 formatted_start = _sceneiq_format_script_time(start_value)
                 formatted_stop = _sceneiq_format_script_time(stop_value)
                 scene_entry["start_seconds"] = start_value
@@ -2279,46 +2500,69 @@ def process_single_video(
 
                 source_entry = scene_entry.get("_sceneiq_source_entry")
                 if isinstance(source_entry, dict):
-                    start_key = next((k for k in ("start", "start_time", "scene_start") if k in source_entry), "start")
-                    stop_key = next((k for k in ("stop", "end", "stop_time", "scene_end") if k in source_entry), "stop")
-                    duration_key = next((k for k in ("duration", "duration_seconds", "scene_duration") if k in source_entry), "duration")
+                    start_key = next(
+                        (key for key in ("start", "start_time", "scene_start") if key in source_entry),
+                        "start",
+                    )
+                    stop_key = next(
+                        (key for key in ("stop", "end", "stop_time", "scene_end") if key in source_entry),
+                        "stop",
+                    )
+                    duration_key = next(
+                        (key for key in ("duration", "duration_seconds", "scene_duration") if key in source_entry),
+                        "duration",
+                    )
                     source_entry[start_key] = formatted_start
                     source_entry[stop_key] = formatted_stop
                     source_entry[duration_key] = round(duration_value, 4)
 
-                repaired.append({
-                    **alignment_details[scene_index],
+                scene_reports.append({
                     "scene_index": scene_index + 1,
                     "entry_id": scene_entry.get("entry_id"),
                     "original_start": original_start,
                     "original_stop": original_stop,
+                    "original_duration_weight_seconds": round(duration_weights[scene_index], 6),
                     "start": formatted_start,
                     "stop": formatted_stop,
-                    "duration_seconds": round(duration_value, 4),
-                    "dialogue": scene_entry.get("source_dialogue", ""),
+                    "duration_seconds": round(duration_value, 6),
                 })
+
             return {
-                "global_dialogue_match_ratio": round(global_coverage, 4),
-                "expected_dialogue_token_count": len(expected_tokens),
-                "matched_dialogue_token_count": total_matched,
-                "audio_word_count": len(recognized_words),
-                "audio_duration_seconds": float(narration_duration),
-                "scenes": repaired,
+                "method": "asr_only_audio_duration_with_original_visual_duration_weights",
+                "caption_text_source": "scene_dialogue_words_aligned_to_asr_word_timestamps",
+                "scene_count": len(scene_entries),
+                "audio_duration_seconds": total_duration,
+                "minimum_scene_duration_seconds": minimum_scene_duration,
+                "scenes": scene_reports,
             }
 
         try:
-            timing_alignment_report = _sceneiq_align_scene_times_to_dialogue(
-                entries, audio_words, float(trimmed_audio_duration)
+            # Capture the authored source fingerprint before changing only visual
+            # scene timing fields. Caption spelling is read separately from dialogue;
+            # caption timing continues to come exclusively from recognized audio words.
+            import hashlib as _sceneiq_hashlib
+            import copy as _sceneiq_copy
+            _authored_script_snapshot = _sceneiq_copy.deepcopy(selected_script_data)
+            _source_script_content_hash_before_audio_repair = (
+                _video_producer_script_payload_content_hash(_authored_script_snapshot)
+            )
+            _source_script_hash_before_audio_repair = _sceneiq_hashlib.sha256(
+                json.dumps(
+                    _authored_script_snapshot, ensure_ascii=False, sort_keys=True, default=str
+                ).encode("utf-8")
+            ).hexdigest()
+
+            timing_alignment_report = _sceneiq_allocate_scene_times_from_audio(
+                entries, float(trimmed_audio_duration)
             )
             print(
-                f"🧭 [SCENE-TIMING] Rebuilt {len(entries)} scene start/stop values from "
-                f"trimmed-audio dialogue alignment. Matched "
-                f"{timing_alignment_report['matched_dialogue_token_count']}/"
-                f"{timing_alignment_report['expected_dialogue_token_count']} script words "
-                f"({timing_alignment_report['global_dialogue_match_ratio']:.0%})."
+                f"🧭 [SCENE-TIMING] Allocated {len(entries)} visual scene intervals across "
+                f"the exact {float(trimmed_audio_duration):.3f}s trimmed narration using "
+                "original scene-duration weights only. Dialogue is reserved for caption spelling; "
+                "ASR word timestamps alone determine caption timing."
             )
-            # Persist the repaired source scene records to the selected READY_SCRIPT
-            # so future resumes use the same dialogue-derived timeline.
+            # Persist the audio-duration scene intervals to READY_SCRIPT so future
+            # resumes use the same visual timeline; the dialogue text remains untouched.
             if _ready_script_path and os.path.isfile(_ready_script_path):
                 if not _video_producer_write_json_atomic(_ready_script_path, ready_data):
                     raise RuntimeError("Could not persist repaired scene times to READY_SCRIPT.")
@@ -2326,7 +2570,7 @@ def process_single_video(
             timing_report_path = os.path.join(edited_folder, "scene_timing_repaired.json")
             transcript_report_path = os.path.join(edited_folder, "narration_transcript.json")
             if not _video_producer_write_json_atomic(timing_report_path, timing_alignment_report):
-                raise RuntimeError("Could not save the scene timing alignment audit.")
+                raise RuntimeError("Could not save the ASR-only scene timing audit.")
             if not _video_producer_write_json_atomic(
                 transcript_report_path,
                 {
@@ -2339,9 +2583,8 @@ def process_single_video(
                 },
             ):
                 raise RuntimeError("Could not save the narration transcript audit.")
-            # Fingerprint only the final, dialogue-aligned timings. This lets a
-            # completed scene checkpoint be reused on the next run, while any
-            # changed audio, image, dialogue, timing or caption policy invalidates it.
+            # Fingerprint the final audio-duration scene timeline and the new
+            # dialogue-spelling/ASR-pronunciation caption alignment policy.
             if not checkpoint_dir:
                 checkpoint_dir = os.path.join(project_folder, ".video_producer_checkpoint")
             os.makedirs(checkpoint_dir, exist_ok=True)
@@ -2375,8 +2618,13 @@ def process_single_video(
                 "original_audio": original_audio_file_path,
                 "audio_trim_version": audio_trim_version,
                 "silence_filter": silence_filter,
-                "caption_render_policy_version": 5,
-                "scene_dialogue_alignment_version": 2,
+                "caption_render_policy_version": 10,
+                "scene_timing_allocation_version": 2,
+                "scene_frame_timing_version": 1,
+                "scene_frame_rate": 24,
+                "scene_timeline_policy": "integer_frame_counts_and_cumulative_frame_offsets",
+                "caption_text_source": "scene_dialogue_words_aligned_to_asr_word_timestamps",
+                "subscribe_sticker_lifetime_policy": "play_one_complete_animation_cycle_after_spoken_trigger_across_scene_boundaries",
                 "include_captions": include_captions,
                 "include_transitions": include_transitions,
                 "encoder": video_encoder,
@@ -2396,7 +2644,7 @@ def process_single_video(
                 or previous_fingerprint.get("fingerprint") != render_fingerprint
             ):
                 if os.path.isdir(render_segments_dir):
-                    # The old scene MP4s contain the earlier audio/caption timing,
+                    # The old scene MP4s contain the previous caption/timing policy,
                     # so they must NOT be reused as current scenes. However, never
                     # silently destroy already-rendered effort when a new trim or
                     # caption policy changes the fingerprint: archive the old set.
@@ -2449,12 +2697,12 @@ def process_single_video(
                     fingerprint_path,
                     {"fingerprint": render_fingerprint, "updated_at": time.time()},
                 ):
-                    raise RuntimeError("Could not save the aligned render fingerprint.")
+                    raise RuntimeError("Could not save the ASR-timed render fingerprint.")
                 print("🧹 [CHECKPOINT] Aligned project inputs changed; stale scene segments were invalidated.")
             else:
                 os.makedirs(render_segments_dir, exist_ok=True)
         except Exception as alignment_exc:
-            print(f"❌ [SCENE-TIMING] Strict dialogue alignment failed: {alignment_exc}")
+            print(f"❌ [SCENE-TIMING] ASR-only audio-duration scene allocation failed: {alignment_exc}")
             traceback.print_exc()
             return None
 
@@ -2533,36 +2781,101 @@ def process_single_video(
                 f"({rejected_count} rejected); display scale is 50% of the previous size"
             )
             return valid_stickers
-        def build_subscribe_sticker_events(scene_items):
-            """
-            Place one subscribe sticker in the centre of each scene whose source
-            dialogue contains LIKE AND SUBSCRIBE or SUBSCRIBE. The sticker is fixed
-            in screen position (never keyframed) and disappears 0.2s before the
-            scene ends. This works with captions ON or OFF.
-            """
-            selected_events = []
-            pool_index = 0
-            previous_path = None
-            scene_cursor = 0.0
-            trigger_pattern = re.compile(r"\b(?:like\s+(?:and|&)\s+subscribe|subscribe)\b", re.IGNORECASE)
-            triggered_scenes = []
+        def build_subscribe_sticker_events(scene_items, recognized_words, scene_start_offsets):
+            """Find spoken subscribe calls directly in ASR and place stickers at the spoken onset."""
+            if not recognized_words:
+                print("⚠️ [SUBSCRIBE-STICKERS] No ASR word timestamps are available; skipping stickers.")
+                return []
+            if not isinstance(scene_start_offsets, (list, tuple)) or len(scene_start_offsets) != len(scene_items):
+                print("⚠️ [SUBSCRIBE-STICKERS] Scene offsets are unavailable; skipping stickers.")
+                return []
 
+            scene_ranges = []
             for scene_index, scene_item in enumerate(scene_items):
-                scene_duration = max(0.0, float(scene_item.get("duration", 0.0)))
-                scene_start = scene_cursor
-                scene_end = scene_start + scene_duration
-                scene_cursor = scene_end
+                scene_start = max(0.0, float(scene_start_offsets[scene_index]))
+                scene_end = scene_start + max(0.0, float(scene_item.get("duration", 0.0)))
+                scene_ranges.append((scene_start, scene_end))
 
-                source_text = str(
-                    scene_item.get("source_dialogue")
-                    or scene_item.get("dialogue")
-                    or ""
+            transcript_tokens = []
+            for word_index, word_item in enumerate(recognized_words):
+                for spoken_token in _sceneiq_transcript_tokens(word_item.get("word", "")):
+                    transcript_tokens.append({
+                        "token": spoken_token,
+                        "word_index": word_index,
+                        "word": word_item,
+                    })
+
+            if not transcript_tokens:
+                return []
+
+            candidates = []
+            subscribe_words_used_by_like_phrase = set()
+            for token_index, token_item in enumerate(transcript_tokens):
+                if token_item["token"] != "like":
+                    continue
+                search_end = min(len(transcript_tokens), token_index + 5)
+                subscribe_position = next(
+                    (
+                        candidate_index
+                        for candidate_index in range(token_index + 1, search_end)
+                        if transcript_tokens[candidate_index]["token"] == "subscribe"
+                    ),
+                    None,
                 )
-                if trigger_pattern.search(source_text):
-                    triggered_scenes.append((scene_index, scene_start, scene_end, scene_item))
+                if subscribe_position is None:
+                    continue
+                candidates.append({
+                    "word": token_item["word"],
+                    "trigger_word": "like",
+                })
+                subscribe_words_used_by_like_phrase.add(
+                    transcript_tokens[subscribe_position]["word_index"]
+                )
 
+            for token_item in transcript_tokens:
+                if token_item["token"] != "subscribe":
+                    continue
+                if token_item["word_index"] in subscribe_words_used_by_like_phrase:
+                    continue
+                candidates.append({
+                    "word": token_item["word"],
+                    "trigger_word": "subscribe",
+                })
+
+            candidates.sort(
+                key=lambda item: float(item["word"].get("start", 0.0))
+            )
+            triggered_by_scene = {}
+            for candidate in candidates:
+                try:
+                    spoken_start = max(0.0, float(candidate["word"].get("start", 0.0)))
+                except (TypeError, ValueError):
+                    continue
+                scene_index = next(
+                    (
+                        index for index, (scene_start, scene_end) in enumerate(scene_ranges)
+                        if scene_start <= spoken_start < scene_end
+                    ),
+                    None,
+                )
+                if scene_index is None and scene_ranges:
+                    last_index = len(scene_ranges) - 1
+                    if abs(spoken_start - scene_ranges[last_index][1]) <= 0.01:
+                        scene_index = last_index
+                if scene_index is None or scene_index in triggered_by_scene:
+                    continue
+                scene_start, scene_end = scene_ranges[scene_index]
+                triggered_by_scene[scene_index] = {
+                    "scene_index": scene_index,
+                    "scene_start": scene_start,
+                    "scene_end": scene_end,
+                    "spoken_start": spoken_start,
+                    "trigger_word": candidate["trigger_word"],
+                }
+
+            triggered_scenes = [triggered_by_scene[index] for index in sorted(triggered_by_scene)]
             if not triggered_scenes:
-                print("ℹ️ [SUBSCRIBE-STICKERS] No LIKE AND SUBSCRIBE / SUBSCRIBE scene found")
+                print("ℹ️ [SUBSCRIBE-STICKERS] No spoken LIKE + SUBSCRIBE / SUBSCRIBE phrase was found in ASR.")
                 return []
 
             sticker_pool = discover_transparent_subscribe_stickers()
@@ -2570,17 +2883,15 @@ def process_single_video(
                 print("⚠️ [SUBSCRIBE-STICKERS] No verified transparent stickers available; continuing without overlays")
                 return []
 
-            for scene_index, scene_start, scene_end, scene_item in triggered_scenes:
-                # Keep the overlay on this scene only. It starts with the scene and
-                # ends 0.2 seconds before the next scene can appear.
-                sticker_start = scene_start
-                sticker_end = scene_end - 0.2
-                if sticker_end <= sticker_start + 0.05:
-                    print(
-                        f"⏭️ [SUBSCRIBE-STICKERS] Scene {scene_index + 1} is too short "
-                        "to display a sticker safely before its final 0.2s."
-                    )
-                    continue
+            selected_events = []
+            pool_index = 0
+            previous_path = None
+            for trigger in triggered_scenes:
+                scene_index = trigger["scene_index"]
+                scene_start = trigger["scene_start"]
+                sticker_start = trigger["spoken_start"]
+                if sticker_start < scene_start:
+                    sticker_start = scene_start
 
                 if pool_index >= len(sticker_pool):
                     random.shuffle(sticker_pool)
@@ -2591,112 +2902,28 @@ def process_single_video(
                 selected_sticker = sticker_pool[pool_index]
                 pool_index += 1
                 previous_path = selected_sticker["path"]
+                # The sticker lifetime is the complete animation cycle, not the
+                # remaining duration of the scene or the spoken CTA word.
+                sticker_cycle_duration = max(
+                    0.02, float(selected_sticker.get("cycle_duration", 0.02))
+                )
+                sticker_end = sticker_start + sticker_cycle_duration
                 selected_events.append({
                     "path": selected_sticker["path"],
                     "filename": selected_sticker["filename"],
                     "start_time": sticker_start,
                     "end_time": sticker_end,
-                    "display_duration": sticker_end - sticker_start,
                     "scene_index": scene_index,
-                    "trigger_word": "subscribe",
+                    "trigger_word": trigger["trigger_word"],
+                    "cycle_duration": sticker_cycle_duration,
                 })
                 print(
-                    f"🎯 [SUBSCRIBE-STICKERS] Scene {scene_index + 1}: "
-                    f"'{selected_sticker['filename']}' centred for "
-                    f"{sticker_end - sticker_start:.2f}s "
-                    "(fixed position; removed 0.20s before scene end)"
+                    f"✅ [SUBSCRIBE-STICKERS] Scene {scene_index + 1}: '{trigger['trigger_word']}' "
+                    f"spoken at {sticker_start:.3f}s; full GIF animation plays until "
+                    f"{sticker_end:.3f}s ({sticker_cycle_duration:.3f}s), independent of scene/caption end"
                 )
-
-            print(f"✅ [SUBSCRIBE-STICKERS] Scheduled {len(selected_events)} fixed-centre sticker overlay(s)")
             return selected_events
-        # Force the finished video and every scene image to the solo producer's
-        # fixed 16:9 frame. The dimensions were initialized at function entry so
-        # the earlier render-fingerprint logic can safely use them.
-        print(f"📐 Output size (forced 16:9): {video_width}x{video_height}")
-        def fit_image(image, width, height):
-            # Fill the 16:9 frame by center-cropping excess edges, then resize.
-            # This prevents letterboxing and ensures every normalized image is 16:9.
-            image = image.convert("RGB")
-            source_width, source_height = image.size
-            target_ratio = width / height
-            source_ratio = source_width / source_height
-            if source_ratio > target_ratio:
-                crop_width = int(source_height * target_ratio)
-                left = max(0, (source_width - crop_width) // 2)
-                image = image.crop((left, 0, left + crop_width, source_height))
-            elif source_ratio < target_ratio:
-                crop_height = int(source_width / target_ratio)
-                top = max(0, (source_height - crop_height) // 2)
-                image = image.crop((0, top, source_width, top + crop_height))
-            return image.resize((width, height), Image.Resampling.LANCZOS)
-        def load_font(size):
-            candidates = [
-                r"C:\Windows\Fonts\arialbd.ttf",
-                r"C:\Windows\Fonts\arial.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            ]
-            for font_path in candidates:
-                try:
-                    return ImageFont.truetype(font_path, size)
-                except Exception:
-                    continue
-            return ImageFont.load_default()
-        def wrap_words(draw, text, font, max_width):
-            words = text.split()
-            lines, current = [], ""
-            for word in words:
-                candidate = f"{current} {word}".strip()
-                if draw.textbbox((0, 0), candidate, font=font, stroke_width=2)[2] <= max_width:
-                    current = candidate
-                else:
-                    if current:
-                        lines.append(current)
-                    # Keep exceptionally long words from running off-screen.
-                    chunk = ""
-                    for char in word:
-                        test = chunk + char
-                        if draw.textbbox((0, 0), test, font=font, stroke_width=2)[2] <= max_width:
-                            chunk = test
-                        else:
-                            if chunk:
-                                lines.append(chunk)
-                            chunk = char
-                    current = chunk
-            if current:
-                lines.append(current)
-            return lines
-        # Cache caption text measurements. Font and output dimensions stay unchanged.
-        caption_text_width_cache = {}
-        def _clean_caption_text(value):
-            """Normalize whitespace without separating currency or number punctuation."""
-            value = re.sub(r"\s+", " ", str(value or "").strip())
-            value = re.sub(r"([$£€¥₹])\s+(?=\d)", r"\1", value)
-            value = re.sub(r"(?<=\d)\s*,\s*(?=\d)", ",", value)
-            value = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", value)
-            return re.sub(r",\s*$", "", value).rstrip()
-        def _caption_text_width(draw, text, font):
-            text = str(text or " ")
-            cached = caption_text_width_cache.get(text)
-            if cached is None:
-                cached = draw.textbbox((0, 0), text, font=font, stroke_width=2)[2]
-                if len(caption_text_width_cache) >= 50000:
-                    caption_text_width_cache.clear()
-                caption_text_width_cache[text] = cached
-            return cached
-        def _fit_word_suffix(draw, text, font, max_width):
-            """Keep an exceptionally long word within the single visible row."""
-            text = str(text or "")
-            if not text:
-                return ""
-            if _caption_text_width(draw, text, font) <= max_width:
-                return text
-            for start_index in range(len(text)):
-                suffix = text[start_index:]
-                if _caption_text_width(draw, suffix, font) <= max_width:
-                    return suffix
-            return text[-1:]
-        @lru_cache(maxsize=1)
+
         def _load_subscribe_sticker_animation(sticker_path, frame_width, frame_height):
             """Load and resize a transparent sticker animation only when it is needed."""
             # Keep the same sizing calculation as the prior producer version,
@@ -2784,6 +3011,93 @@ def process_single_video(
                     f"{sticker_load_exc}"
                 )
                 return (), 0.0
+        # Force the finished video and every scene image to the solo producer's
+        # fixed 16:9 frame. The dimensions were initialized at function entry so
+        # the earlier render-fingerprint logic can safely use them.
+        print(f"📐 Output size (forced 16:9): {video_width}x{video_height}")
+        def fit_image(image, width, height):
+            # Fill the 16:9 frame by center-cropping excess edges, then resize.
+            # This prevents letterboxing and ensures every normalized image is 16:9.
+            image = image.convert("RGB")
+            source_width, source_height = image.size
+            target_ratio = width / height
+            source_ratio = source_width / source_height
+            if source_ratio > target_ratio:
+                crop_width = int(source_height * target_ratio)
+                left = max(0, (source_width - crop_width) // 2)
+                image = image.crop((left, 0, left + crop_width, source_height))
+            elif source_ratio < target_ratio:
+                crop_height = int(source_width / target_ratio)
+                top = max(0, (source_height - crop_height) // 2)
+                image = image.crop((0, top, source_width, top + crop_height))
+            return image.resize((width, height), Image.Resampling.LANCZOS)
+        def load_font(size):
+            candidates = [
+                r"C:\Windows\Fonts\arialbd.ttf",
+                r"C:\Windows\Fonts\arial.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ]
+            for font_path in candidates:
+                try:
+                    return ImageFont.truetype(font_path, size)
+                except Exception:
+                    continue
+            return ImageFont.load_default()
+        def wrap_words(draw, text, font, max_width):
+            words = text.split()
+            lines, current = [], ""
+            for word in words:
+                candidate = f"{current} {word}".strip()
+                if draw.textbbox((0, 0), candidate, font=font, stroke_width=2)[2] <= max_width:
+                    current = candidate
+                else:
+                    if current:
+                        lines.append(current)
+                    # Keep exceptionally long words from running off-screen.
+                    chunk = ""
+                    for char in word:
+                        test = chunk + char
+                        if draw.textbbox((0, 0), test, font=font, stroke_width=2)[2] <= max_width:
+                            chunk = test
+                        else:
+                            if chunk:
+                                lines.append(chunk)
+                            chunk = char
+                    current = chunk
+            if current:
+                lines.append(current)
+            return lines
+        # Cache caption text measurements. Font and output dimensions stay unchanged.
+        caption_text_width_cache = {}
+        def _clean_caption_text(value):
+            """Normalize whitespace without separating currency or number punctuation."""
+            value = re.sub(r"\s+", " ", str(value or "").strip())
+            value = re.sub(r"([$£€¥₹])\s+(?=\d)", r"\1", value)
+            value = re.sub(r"(?<=\d)\s*,\s*(?=\d)", ",", value)
+            value = re.sub(r"(?<=\d)\s*\.\s*(?=\d)", ".", value)
+            return re.sub(r",\s*$", "", value).rstrip()
+        def _caption_text_width(draw, text, font):
+            text = str(text or " ")
+            cached = caption_text_width_cache.get(text)
+            if cached is None:
+                cached = draw.textbbox((0, 0), text, font=font, stroke_width=2)[2]
+                if len(caption_text_width_cache) >= 50000:
+                    caption_text_width_cache.clear()
+                caption_text_width_cache[text] = cached
+            return cached
+        def _fit_word_suffix(draw, text, font, max_width):
+            """Keep an exceptionally long word within the single visible row."""
+            text = str(text or "")
+            if not text:
+                return ""
+            if _caption_text_width(draw, text, font) <= max_width:
+                return text
+            for start_index in range(len(text)):
+                suffix = text[start_index:]
+                if _caption_text_width(draw, suffix, font) <= max_width:
+                    return suffix
+            return text[-1:]
         def draw_animated_caption(frame_image, global_time, duration, caption_plan):
             """
             Preserve the existing single-row typewriter appearance, but reveal each
@@ -2805,7 +3119,12 @@ def process_single_video(
                 )
                 if not animation_frames or animation_cycle <= 0:
                     continue
-                animation_time = (now - sticker_start) % animation_cycle
+                # Play one complete animation cycle from its real spoken trigger.
+                # Do not loop a short GIF fragment to fill a scene, and do not
+                # terminate it at the CTA word/caption/scene boundary.
+                animation_time = max(0.0, now - sticker_start)
+                if animation_time >= animation_cycle:
+                    continue
                 elapsed_frame_time = 0.0
                 sticker_frame = animation_frames[-1][0]
                 for candidate_frame, candidate_duration in animation_frames:
@@ -3024,11 +3343,20 @@ def process_single_video(
             so the same heading is not duplicated in the bottom captions.
             """
             suppressed_word_indices = set(suppressed_word_indices or ())
+            caption_fps = 24
             scene_starts_for_caption = []
-            scene_cursor_for_caption = 0.0
+            scene_cursor_for_caption_frames = 0
             for item in prepared_items:
-                scene_starts_for_caption.append(scene_cursor_for_caption)
-                scene_cursor_for_caption += max(0.001, float(item.get("duration", 0.1)))
+                scene_starts_for_caption.append(scene_cursor_for_caption_frames / caption_fps)
+                frame_value = item.get("_sceneiq_duration_frames")
+                try:
+                    scene_frames = int(frame_value) if frame_value is not None else int(
+                        round(max(1.0 / caption_fps, float(item.get("duration", 0.1))) * caption_fps)
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    scene_frames = 1
+                scene_cursor_for_caption_frames += max(1, scene_frames)
+            scene_timeline_duration = scene_cursor_for_caption_frames / caption_fps
 
             def _normalize_caption_numeric_spacing(value):
                 """Keep currency symbols, thousands separators and decimals contiguous."""
@@ -3176,7 +3504,7 @@ def process_single_video(
                     float(rows[row_id + 1]["start_time"])
                     if has_following_row
                     else max(
-                        sum(float(item["duration"]) for item in prepared_items),
+                        scene_timeline_duration,
                         max(
                             (token["end"] for token in row_info["tokens"]),
                             default=row_start
@@ -3188,37 +3516,47 @@ def process_single_video(
                 char_times = []
                 for token_index, token in enumerate(tokens):
                     word = token["word"]
-                    word_start = token["start"]
-                    word_end = max(word_start + 0.015, token["end"])
-                    word_duration = word_end - word_start
+                    word_start = max(0.0, float(token["start"]))
+                    word_end = max(word_start + 0.015, float(token["end"]))
 
-                    # STRICT SPOKEN-WORD GATE:
-                    # No character of a word may appear before that word's own
-                    # ASR start time. Type the current word across its spoken
-                    # interval, slightly faster than the voice, and finish it
-                    # shortly BEFORE the word's ASR end. Never pretype any part
-                    # of the following word to prepare for a row handoff.
-                    finish_early = min(0.045, max(0.010, word_duration * 0.10))
-                    typing_end = max(
-                        word_start + min(0.005, word_duration * 0.05),
-                        word_end - finish_early,
-                    )
+                    # STRICT WORD-BY-WORD AUDIO LOCK:
+                    # - No character appears before this word's own ASR start.
+                    # - Characters are revealed across the word's full spoken interval.
+                    # - The final character is revealed AT the ASR word end, not early.
+                    # - The next word is not allowed to start typing before its own
+                    #   ASR start, even when adjacent Whisper timestamps overlap.
+                    # If Whisper reports a small overlap, finish this word no later
+                    # than the next word's start so the visible text never runs ahead.
+                    if token_index < len(tokens) - 1:
+                        next_word_start = max(
+                            0.0, float(tokens[token_index + 1]["start"])
+                        )
+                        typing_end = min(word_end, max(word_start, next_word_start))
+                    else:
+                        typing_end = word_end
+
                     typing_span = max(0.0, typing_end - word_start)
                     for char_index in range(len(word)):
+                        # The first character appears after speech for this word
+                        # begins; the final character lands exactly at typing_end.
                         reveal_time = word_start + (
                             (char_index + 1) / max(1, len(word))
                         ) * typing_span
-                        # Preserve chronological prefix order when ASR timestamps
-                        # overlap, but never move a character earlier than its
-                        # own word's start time.
                         reveal_time = max(word_start, reveal_time)
                         if char_times:
+                            # The prefix must remain chronological. Since the
+                            # preceding word is capped at this word's start, this
+                            # does not pull the current word into an earlier time.
                             reveal_time = max(reveal_time, char_times[-1])
                         char_times.append(reveal_time)
 
                     if token_index < len(tokens) - 1:
-                        # The space appears as the next word begins.
-                        space_time = tokens[token_index + 1]["start"]
+                        # A separating space may appear at the next word's onset;
+                        # rstrip() prevents a visible trailing space before its
+                        # first spoken character appears.
+                        space_time = max(
+                            0.0, float(tokens[token_index + 1]["start"])
+                        )
                         if char_times:
                             space_time = max(space_time, char_times[-1])
                         char_times.append(space_time)
@@ -3260,14 +3598,14 @@ def process_single_video(
             caption_plan_summary = (
                 f"📝 [CAPTIONS] Planned {len(events)} single-row caption segments "
                 f"from {sum(len(row['tokens']) for row in rows)} recognized words. "
-                "Strict word gate enabled: each word begins at its own spoken start, "
-                "finishes slightly before its spoken end, and following words are never pretyped."
+                "Restored the supplied word-by-word audio lock: each word's final "
+                "character lands at its ASR end time (or the next word's onset when "
+                "Whisper reports overlap), and no next word is pretyped."
             )
-            scene_starts = []
-            scene_cursor = 0.0
-            for item in prepared_items:
-                scene_starts.append(scene_cursor)
-                scene_cursor += max(0.001, float(item.get("duration", 0.1)))
+            # Reuse the same integer-frame boundaries used by the independently
+            # encoded MP4 scene segments. This avoids a second floating-point clock.
+            scene_starts = list(scene_starts_for_caption)
+            scene_cursor = scene_timeline_duration
             _update_caption_progress(100, finish=True)
             print(caption_plan_summary)
             covered_source_word_indices = sorted({
@@ -3306,13 +3644,6 @@ def process_single_video(
                     / max(1, len(required_source_word_indices))
                 ),
             }
-        def _contains_instructional_reference(dialogue):
-            """Detect heading language for diagnostics only; never disable scene motion."""
-            return bool(re.search(
-                r"\b(?:stage|step|level|example|chapter)\s*(?:(?:no\.?|number)\s*)?#?\s*(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\b",
-                str(dialogue or ""), re.IGNORECASE,
-            ))
-
         # These are the keyframe variations the AI storyboard may explicitly select.
         # The producer no longer picks from random/duration-based pools: it reads
         # each entry's keyframes object and executes that exact plan.
@@ -3849,7 +4180,7 @@ def process_single_video(
                 "reason": str(raw.get("reason") or "").strip(),
             }
 
-        def build_scene_motion_plan(scene_entry, dialogue, scene_index):
+        def build_scene_motion_plan(scene_entry, scene_index):
             """
             Translate an entry's explicit keyframes object into the renderer's
             motion_plan. Missing/disabled metadata means static; never randomize.
@@ -4424,17 +4755,23 @@ def process_single_video(
         for index in range(count):
             entry = entries[index]
             image_info = image_files[index]
-            duration = max(0.1, float(entry.get("duration_seconds", 5.0)))
+            duration = float(entry.get("duration_seconds", 5.0))
+            minimum_scene_frame = 1.0 / 24.0
+            if not math.isfinite(duration) or duration + 1e-9 < minimum_scene_frame:
+                raise RuntimeError(
+                    f"Scene {index + 1} has an invalid allocated duration ({duration!r}s). "
+                    f"The audio-duration allocator must reserve at least one 24-fps frame "
+                    f"({minimum_scene_frame:.6f}s) without extending the audio timeline."
+                )
             try:
+                # Validate the image without keeping a decoded 1920x1080 bitmap
+                # in memory. Full decoding happens only when this scene is encoded.
                 with Image.open(image_info["path"]) as source:
-                    base_image = fit_image(source, video_width, video_height)
-                source_dialogue = entry.get("source_dialogue") or entry.get("dialogue", "")
+                    source.verify()
                 prepared.append({
                     "number": image_info["number"],
-                    "image": base_image,
+                    "image_path": image_info["path"],
                     "duration": duration,
-                    "caption": entry.get("dialogue", ""),
-                    "source_dialogue": source_dialogue,
                     "stage_overlay_specs": overlay_specs_by_entry[index] if index < len(overlay_specs_by_entry) else [],
                     "caption_animation": extract_caption_animation(entry, project_caption_defaults),
                     "video_effect_plan": extract_video_effect_plan(entry),
@@ -4443,7 +4780,7 @@ def process_single_video(
                     "filename": image_info["filename"],
                     # The storyboard's per-entry editing metadata is authoritative.
                     "transition_plan": build_transition_plan(entry),
-                    "motion_plan": build_scene_motion_plan(entry, source_dialogue, index),
+                    "motion_plan": build_scene_motion_plan(entry, index),
                 })
                 print(f"🎬 [{index + 1}/{count}] {image_info['filename']} — {duration:.1f}s")
             except Exception as exc:
@@ -4458,6 +4795,59 @@ def process_single_video(
         if not prepared:
             print("❌ No images could be processed")
             return None
+
+        # Keep at most the current and previous source image decoded at once.
+        # A 1920x1080 RGB image is about 6.2 MB; retaining all 256 images at
+        # once can consume more than 1.5 GB before x264 starts encoding.
+        _prepared_scene_image_cache = {}
+
+        def _get_prepared_scene_image(scene_index):
+            scene_index = int(scene_index)
+            cached_image = _prepared_scene_image_cache.pop(scene_index, None)
+            if cached_image is not None:
+                _prepared_scene_image_cache[scene_index] = cached_image
+                return cached_image
+
+            image_path = prepared[scene_index].get("image_path")
+            if not image_path or not os.path.isfile(image_path):
+                raise RuntimeError(
+                    f"Scene {scene_index + 1} source image is unavailable: {image_path}"
+                )
+            with Image.open(image_path) as source:
+                loaded_image = fit_image(source, video_width, video_height)
+            _prepared_scene_image_cache[scene_index] = loaded_image
+
+            while len(_prepared_scene_image_cache) > 2:
+                evicted_index = next(iter(_prepared_scene_image_cache))
+                evicted_image = _prepared_scene_image_cache.pop(evicted_index)
+                try:
+                    evicted_image.close()
+                except Exception:
+                    pass
+            return loaded_image
+
+        def _log_render_memory(stage, scene_number=None):
+            try:
+                import psutil as _sceneiq_psutil
+                process_memory = _sceneiq_psutil.Process(os.getpid()).memory_info().rss / (1024 ** 3)
+                available_memory = _sceneiq_psutil.virtual_memory().available / (1024 ** 3)
+                label = f" scene={scene_number}" if scene_number is not None else ""
+                print(
+                    f"🧠 [MEMORY] {stage}{label} | worker RSS={process_memory:.2f} GB | "
+                    f"system available={available_memory:.2f} GB",
+                    flush=True,
+                )
+            except Exception as memory_exc:
+                # Memory reporting is diagnostic only and never blocks rendering.
+                if not _log_render_memory.__dict__.get("warned", False):
+                    _log_render_memory.__dict__["warned"] = True
+                    print(
+                        f"⚠️ [MEMORY] RAM telemetry unavailable ({memory_exc}); "
+                        "bounded image loading and per-scene cleanup remain active.",
+                        flush=True,
+                    )
+
+        _log_render_memory("After lightweight scene preparation")
         audio_duration = None
         audio_probe = None
         if audio_file_path:
@@ -4478,7 +4868,7 @@ def process_single_video(
             if len(prepared) != len(entries):
                 raise RuntimeError(
                     f"Strict scene review failed: prepared {len(prepared)} images for "
-                    f"{len(entries)} dialogue-timed scenes."
+                    f"{len(entries)} visual scenes."
                 )
             timing_difference = abs(float(total_duration) - float(audio_duration))
             if timing_difference > 0.08:
@@ -4486,11 +4876,11 @@ def process_single_video(
                     f"Strict scene timing review failed: scene timeline differs from trimmed "
                     f"audio by {timing_difference:.3f}s."
                 )
-            # Dialogue alignment already sets every boundary; only correct a tiny
-            # floating-point endpoint difference on the last scene.
+            # Audio-duration allocation already sets every boundary; only correct
+            # a tiny floating-point endpoint difference on the last scene.
             # Earlier scenes keep their durations when they fit within the audio.
             previous_duration = sum(float(item["duration"]) for item in prepared[:-1])
-            original_last_duration = max(0.1, float(prepared[-1]["duration"]))
+            original_last_duration = float(prepared[-1]["duration"])
             last_available = float(audio_duration) - previous_duration
             if last_available > 0:
                 # Extend OR shorten only the final image so the video ends with audio.
@@ -4507,12 +4897,12 @@ def process_single_video(
                 # If all preceding scenes alone exceed the audio, preserve the final
                 # image and proportionally fit the preceding scenes into the remaining
                 # time rather than cutting off the final image entirely.
-                last_duration = min(original_last_duration, max(0.1, float(audio_duration) * 0.15))
+                last_duration = min(original_last_duration, max(1.0 / 24.0, float(audio_duration) * 0.15))
                 available_for_previous = max(0.0, float(audio_duration) - last_duration)
                 if previous_duration > 0 and available_for_previous > 0:
                     scale = available_for_previous / previous_duration
                     for item in prepared[:-1]:
-                        item["duration"] = max(0.01, float(item["duration"]) * scale)
+                        item["duration"] = max(1.0 / 24.0, float(item["duration"]) * scale)
                 elif available_for_previous <= 0:
                     prepared = prepared[-1:]
                     last_duration = float(audio_duration)
@@ -4521,11 +4911,172 @@ def process_single_video(
                 # Remove tiny floating-point discrepancies so the last frame lands
                 # on the audio endpoint.
                 if prepared:
-                    prepared[-1]["duration"] = max(
-                        0.01, float(audio_duration) - sum(float(item["duration"]) for item in prepared[:-1])
+                    reconciled_last_duration = float(audio_duration) - sum(
+                        float(item["duration"]) for item in prepared[:-1]
                     )
+                    if reconciled_last_duration + 1e-9 < (1.0 / 24.0):
+                        raise RuntimeError(
+                            "The earlier scene durations leave less than one frame for the final scene; "
+                            "refusing to stretch the visual timeline or silently drop a scene."
+                        )
+                    prepared[-1]["duration"] = reconciled_last_duration
                     total_duration = float(audio_duration)
                 print("⚠️ Scene timings exceeded the audio; fitted earlier scenes so the final image remains until audio ends")
+
+        def _sceneiq_allocate_integer_scene_frames(prepared_items, scene_entries, narration_duration, fps=24):
+            """Allocate one exact, cumulative 24-fps frame clock to every scene.
+
+            Each scene is encoded into its own MP4 and later joined by FFmpeg's
+            concat demuxer. Decimal scene durations that are not whole frame counts
+            are rounded independently by the encoder, so summing those decimal
+            durations for caption offsets causes progressive drift. This allocator
+            preserves the current relative scene-duration weights while distributing
+            the exact total narration frame count using the largest-remainder method.
+            """
+            import math as _frame_math
+
+            if not isinstance(prepared_items, list) or not prepared_items:
+                raise RuntimeError("Cannot create a frame-accurate timeline without prepared scenes.")
+            try:
+                fps_value = int(fps)
+                narration_seconds = float(narration_duration)
+            except (TypeError, ValueError, OverflowError):
+                raise RuntimeError("The narration duration or video frame rate is invalid.")
+            if fps_value <= 0 or not _frame_math.isfinite(narration_seconds) or narration_seconds <= 0:
+                raise RuntimeError("The narration duration or video frame rate is invalid.")
+
+            total_frames = int(round(narration_seconds * fps_value))
+            scene_count = len(prepared_items)
+            if total_frames < scene_count:
+                raise RuntimeError(
+                    f"The narration provides {total_frames} video frames for {scene_count} scenes; "
+                    "each scene needs at least one frame."
+                )
+
+            weights = []
+            for scene_index, scene_item in enumerate(prepared_items):
+                try:
+                    weight = float(scene_item.get("duration", 1.0 / fps_value))
+                except (TypeError, ValueError, OverflowError):
+                    weight = 1.0 / fps_value
+                if not _frame_math.isfinite(weight) or weight <= 0:
+                    weight = 1.0 / fps_value
+                weights.append(max(1.0 / fps_value, weight))
+
+            # Reserve one frame per scene, then distribute all remaining frames
+            # proportionally. The integer allocations sum to total_frames exactly.
+            extra_frames = total_frames - scene_count
+            total_weight = sum(weights)
+            exact_extras = [extra_frames * weight / total_weight for weight in weights]
+            whole_extras = [_frame_math.floor(value) for value in exact_extras]
+            frames_left = extra_frames - sum(whole_extras)
+            remainder_order = sorted(
+                range(scene_count),
+                key=lambda index: (-(exact_extras[index] - whole_extras[index]), index),
+            )
+            for index in remainder_order[:frames_left]:
+                whole_extras[index] += 1
+            frame_counts = [1 + int(value) for value in whole_extras]
+            if sum(frame_counts) != total_frames or any(value < 1 for value in frame_counts):
+                raise RuntimeError("Integer-frame scene allocation failed its total-frame invariant.")
+
+            def _format_frame_clock_time(seconds):
+                seconds = max(0.0, float(seconds))
+                whole_minutes = int(seconds // 60)
+                remainder = seconds - whole_minutes * 60
+                if whole_minutes >= 60:
+                    hours = whole_minutes // 60
+                    minutes = whole_minutes % 60
+                    return f"{hours}:{minutes:02d}:{remainder:09.6f}"
+                return f"{whole_minutes}:{remainder:09.6f}"
+
+            frame_cursor = 0
+            report_scenes = []
+            for index, (prepared_item, frame_count) in enumerate(zip(prepared_items, frame_counts)):
+                start_frame = frame_cursor
+                stop_frame = start_frame + frame_count
+                start_seconds = start_frame / fps_value
+                stop_seconds = stop_frame / fps_value
+                duration_seconds = frame_count / fps_value
+                prepared_item["_sceneiq_duration_frames"] = int(frame_count)
+                prepared_item["duration"] = duration_seconds
+
+                if index < len(scene_entries):
+                    scene_entry = scene_entries[index]
+                    scene_entry["start_seconds"] = start_seconds
+                    scene_entry["stop_seconds"] = stop_seconds
+                    scene_entry["duration_seconds"] = duration_seconds
+                    scene_entry["start"] = _format_frame_clock_time(start_seconds)
+                    scene_entry["stop"] = _format_frame_clock_time(stop_seconds)
+                    scene_entry["duration"] = round(duration_seconds, 8)
+
+                    source_entry = scene_entry.get("_sceneiq_source_entry")
+                    if isinstance(source_entry, dict):
+                        start_key = next(
+                            (key for key in ("start", "start_time", "scene_start") if key in source_entry),
+                            "start",
+                        )
+                        stop_key = next(
+                            (key for key in ("stop", "end", "stop_time", "scene_end") if key in source_entry),
+                            "stop",
+                        )
+                        duration_key = next(
+                            (key for key in ("duration", "duration_seconds", "scene_duration") if key in source_entry),
+                            "duration",
+                        )
+                        source_entry[start_key] = _format_frame_clock_time(start_seconds)
+                        source_entry[stop_key] = _format_frame_clock_time(stop_seconds)
+                        source_entry[duration_key] = round(duration_seconds, 8)
+
+                report_scenes.append({
+                    "scene_index": index + 1,
+                    "start_frame": start_frame,
+                    "stop_frame_exclusive": stop_frame,
+                    "frame_count": int(frame_count),
+                    "start": _format_frame_clock_time(start_seconds),
+                    "stop": _format_frame_clock_time(stop_seconds),
+                    "duration_seconds": round(duration_seconds, 8),
+                })
+                frame_cursor = stop_frame
+
+            video_duration = total_frames / fps_value
+            if frame_cursor != total_frames:
+                raise RuntimeError("Frame cursor does not end on the allocated narration frame count.")
+
+            # Persist the frame-aligned times so the project timeline and future
+            # renders agree with the exact times used by the encoded scene segments.
+            if _ready_script_path and os.path.isfile(_ready_script_path):
+                if not _video_producer_write_json_atomic(_ready_script_path, ready_data):
+                    raise RuntimeError("Could not persist the frame-aligned scene timeline to READY_SCRIPT.")
+            if isinstance(timing_alignment_report, dict):
+                timing_alignment_report["method"] = "integer_frame_scene_timeline_largest_remainder"
+                timing_alignment_report["video_fps"] = fps_value
+                timing_alignment_report["total_video_frames"] = total_frames
+                timing_alignment_report["video_duration_seconds"] = video_duration
+                timing_alignment_report["audio_duration_seconds"] = narration_seconds
+                timing_alignment_report["audio_video_endpoint_difference_seconds"] = round(
+                    video_duration - narration_seconds, 8
+                )
+                timing_alignment_report["scenes"] = report_scenes
+                if timing_report_path:
+                    if not _video_producer_write_json_atomic(timing_report_path, timing_alignment_report):
+                        raise RuntimeError("Could not persist the frame-aligned scene timing audit.")
+
+            print(
+                f"🎞️ [FRAME-CLOCK] Allocated exactly {total_frames:,} frames at {fps_value} fps "
+                f"across {scene_count} scenes ({video_duration:.6f}s). "
+                "Every scene boundary is frame-aligned; cumulative caption drift from "
+                "fractional per-scene durations is eliminated."
+            )
+            return frame_counts, video_duration
+
+        _sceneiq_scene_frame_counts, total_duration = _sceneiq_allocate_integer_scene_frames(
+            prepared,
+            entries,
+            float(audio_duration if audio_duration and audio_duration > 0 else trimmed_audio_duration),
+            fps=24,
+        )
+
         # Existing outputs are preserved. If the target project filename already
         # exists, it will be renamed to \\\\\\\\\\\\\\\<project>_old_N.mp4 before the new render
         # is written, where N is one greater than the highest existing old number.
@@ -4541,6 +5092,7 @@ def process_single_video(
 
         def _save_incomplete_render(reason):
             """Preserve every playable render artifact under edited/incomplete."""
+            print(f"🧯 [INCOMPLETE] Recovery invoked: {reason}", flush=True)
             incomplete_folder = os.path.join(edited_folder, "incomplete")
             os.makedirs(incomplete_folder, exist_ok=True)
             stamp = time.strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}_{os.getpid()}"
@@ -4721,15 +5273,26 @@ def process_single_video(
             clips = []
             # Each scene uses its full assigned duration. The next scene begins
             # exactly when the current scene's duration ends; no early time shift.
-            visual_durations = [float(item["duration"]) for item in prepared]
+            visual_durations = [int(frame_count) / 24.0 for frame_count in _sceneiq_scene_frame_counts]
             scene_start_offsets = []
-            scene_cursor = 0.0
-            for scene_duration in visual_durations:
-                scene_start_offsets.append(scene_cursor)
-                scene_cursor += max(0.001, float(scene_duration))
-            # Subscribe stickers are driven by the scene's source dialogue, not by
-            # ASR, so they remain available whether captions are ON or OFF.
-            subscribe_sticker_events = build_subscribe_sticker_events(prepared)
+            scene_cursor_frames = 0
+            for frame_count in _sceneiq_scene_frame_counts:
+                scene_start_offsets.append(scene_cursor_frames / 24.0)
+                scene_cursor_frames += int(frame_count)
+            scene_cursor = scene_cursor_frames / 24.0
+            if scene_cursor_frames != sum(_sceneiq_scene_frame_counts):
+                raise RuntimeError("Caption scene offsets failed their cumulative frame-clock check.")
+            if abs(scene_cursor - float(total_duration)) > 1e-9:
+                raise RuntimeError(
+                    f"Caption scene clock ({scene_cursor:.6f}s) does not match encoded scene duration "
+                    f"({float(total_duration):.6f}s)."
+                )
+            # Call-to-action stickers are detected from recognized ASR words only;
+            # no per-scene dialogue field is consulted. This remains active whether
+            # ordinary captions are ON or OFF.
+            subscribe_sticker_events = build_subscribe_sticker_events(
+                prepared, audio_words, scene_start_offsets
+            )
             sticker_only_plan = {"events": [], "sticker_events": subscribe_sticker_events}
 
             # Publish occasional final-composited frames into a small preview JPG.
@@ -4780,16 +5343,19 @@ def process_single_video(
                 _set_worker_status(
                     "Planning captions and overlays",
                     progress=0,
-                    detail=f"Creating the animated captions and timed headings from all {len(audio_words)} recognised narration words.",
+                    detail=f"Aligning authored scene wording to the {len(audio_words)} recognized narration word timestamps.",
                 )
                 _start_caption_progress()
+                caption_word_events = build_dialogue_pronunciation_timed_words(
+                    entries, audio_words
+                )
                 caption_stream_plan = build_caption_stream_plans(
                     prepared,
                     video_width,
-                    audio_words,
+                    caption_word_events,
                     subscribe_sticker_events,
-                    # Keep every available narration word in the caption stream.
-                    # Partial ASR coverage is reported below but never blocks rendering.
+                    # Keep every recognized spoken event. Matched events display
+                    # authored dialogue spelling; every event keeps its ASR timing.
                     suppressed_word_indices=set(),
                 )
                 required_caption_words = set(caption_stream_plan.get("required_source_word_indices", []))
@@ -4825,8 +5391,13 @@ def process_single_video(
                 detail=f"Building {len(prepared)} scene clip(s)",
             )
             for scene_index, item in enumerate(prepared):
-                base_image = item["image"]
                 duration = float(visual_durations[scene_index])
+                expected_scene_frames = int(_sceneiq_scene_frame_counts[scene_index])
+                if int(round(duration * 24.0)) != expected_scene_frames:
+                    raise RuntimeError(
+                        f"Scene {scene_index + 1} duration is not aligned to its allocated "
+                        f"24-fps frame count ({expected_scene_frames})."
+                    )
                 caption_plan = caption_stream_plan if include_captions else None
                 global_scene_start = (
                     caption_stream_plan["scene_starts"][scene_index]
@@ -4834,7 +5405,8 @@ def process_single_video(
                     else scene_start_offsets[scene_index]
                 )
                 motion_plan = item.get("motion_plan") or {"static": True}
-                previous_image = prepared[scene_index - 1]["image"] if scene_index > 0 else None
+                previous_image_index = scene_index - 1
+                has_previous_image = scene_index > 0
                 previous_motion_plan = (
                     prepared[scene_index - 1].get("motion_plan") if scene_index > 0 else None
                 )
@@ -4865,7 +5437,7 @@ def process_single_video(
                         duration * 0.28,
                         previous_duration * 0.28,
                     )
-                    if transition_type != "none" and previous_image is not None
+                    if transition_type != "none" and has_previous_image
                     else 0.0
                 )
                 if transition_type != "none" and active_transition <= 0:
@@ -4874,9 +5446,9 @@ def process_single_video(
                 current_scene_number = scene_index + 1
                 def make_frame(
                     t,
-                    base=base_image,
+                    scene_image_index=scene_index,
+                    previous_image_index=previous_image_index,
                     clip_duration=duration,
-                    previous=previous_image,
                     previous_plan=previous_motion_plan,
                     previous_clip_duration=previous_duration,
                     previous_video_effect_plan=(
@@ -4886,23 +5458,39 @@ def process_single_video(
                     effect=transition_type,
                     trans_duration=active_transition,
                     scene_motion_plan=motion_plan,
+                    current_video_effect_plan=item.get("video_effect_plan"),
+                    current_effect_scene_index=scene_index,
                     stream_plan=caption_plan,
                     sticker_plan=sticker_only_plan,
                     absolute_scene_start=global_scene_start,
                     title_overlay_events=item.get("stage_overlay_events", []),
+                    current_scene_number=scene_index + 1,
+                    frame_check_state=_last_frame_control_check,
                 ):
                     t = max(0.0, float(t))
-                    if _worker_time.monotonic() - _last_frame_control_check["at"] >= 0.75:
+                    # Load previous first, then current, so the two-entry cache
+                    # retains exactly the images needed for an outgoing transition.
+                    previous = (
+                        _get_prepared_scene_image(previous_image_index)
+                        if (
+                            previous_image_index >= 0
+                            and effect != "none"
+                            and trans_duration > 0
+                            and t < trans_duration
+                        ) else None
+                    )
+                    base = _get_prepared_scene_image(scene_image_index)
+                    if _worker_time.monotonic() - frame_check_state["at"] >= 0.75:
                         _check_worker_control(
                             stage=f"Rendering scene {current_scene_number} of {len(prepared)}",
                             detail=f"Rendering camera movement, transition, captions and overlays for scene {current_scene_number}/{len(prepared)}.",
                         )
-                        _last_frame_control_check["at"] = _worker_time.monotonic()
+                        frame_check_state["at"] = _worker_time.monotonic()
                     animated_current = apply_image_motion(
                         base, t, clip_duration, scene_motion_plan
                     )
                     animated_current = apply_video_effects(
-                        animated_current, t, clip_duration, item.get("video_effect_plan"), scene_index
+                        animated_current, t, clip_duration, current_video_effect_plan, current_effect_scene_index
                     )
                     current = animated_current.copy()
                     # Start the transition from the previous scene's actual final
@@ -4945,9 +5533,9 @@ def process_single_video(
                         absolute_scene_start + t,
                         title_overlay_events,
                     )
-                    # Exactly one caption-rendering call is allowed per frame. The
-                    # ASR stream is the sole spoken-caption source; per-entry dialogue
-                    # is not separately painted, preventing appended duplicate lines.
+                    # Exactly one caption-rendering call is allowed per frame.
+                    # Authored scene wording is aligned to ASR pronunciation timings;
+                    # the separate sticker event timeline remains independent.
                     if include_captions and stream_plan:
                         rendered = draw_animated_caption(
                             rendered, absolute_scene_start + t, clip_duration, stream_plan
@@ -5013,6 +5601,7 @@ def process_single_video(
                 f"🎛️ [ENCODER] {video_encoder} | preset={active_encoder_preset} | "
                 f"threads={active_encoder_threads}"
             )
+            _log_render_memory("Immediately before scene encoding")
 
             from proglog import ProgressBarLogger
 
@@ -5271,6 +5860,17 @@ def process_single_video(
                         total=scene_count,
                         detail=f"Scene {scene_number}/{scene_count} was already rendered successfully; no need to render it again.",
                     )
+                    try:
+                        scene_clip.close()
+                    except Exception:
+                        pass
+                    clips[scene_index] = None
+                    # Each scene is encoded independently. Force collection after
+                    # releasing its MoviePy clip so long projects do not accumulate
+                    # frame closures or short-lived image/NumPy objects over 256 scenes.
+                    gc.collect()
+                    _log_render_memory("After scene release and garbage collection", scene_number)
+                    _log_render_memory("Reused cached scene", scene_number)
                     continue
 
                 for stale_path in (segment_path, temporary_segment):
@@ -5293,6 +5893,11 @@ def process_single_video(
                 segment_logger = _SceneSegmentProgressLogger(
                     scene_number, len(completed_segments), scene_count
                 )
+                # Capture memory immediately before the next scene starts. If the
+                # OS terminates the worker under memory pressure, the last flushed
+                # snapshot identifies the scene and available RAM beforehand.
+                gc.collect()
+                _log_render_memory("Before scene encode", scene_number)
                 try:
                     scene_clip.write_videofile(
                         temporary_segment,
@@ -5332,6 +5937,16 @@ def process_single_video(
                         total=scene_count,
                         detail=f"Scene {scene_number}/{scene_count} is fully encoded and saved. This scene will not need to be rendered again.",
                     )
+                    _log_render_memory("Scene checkpoint saved", scene_number)
+                except Exception as scene_encode_exc:
+                    _log_render_memory("Scene encode exception", scene_number)
+                    print(
+                        f"❌ [SCENE-ENCODE] Scene {scene_number}/{scene_count} failed: "
+                        f"{type(scene_encode_exc).__name__}: {scene_encode_exc}",
+                        flush=True,
+                    )
+                    traceback.print_exc()
+                    raise
                 finally:
                     # Do not delete an interrupted/failed scene encode here.
                     # The outer failure handler copies it into edited/incomplete
@@ -5341,6 +5956,11 @@ def process_single_video(
                             f"📌 [CHECKPOINT] Leaving partial scene file for recovery: "
                             f"{temporary_segment}"
                         )
+                    try:
+                        scene_clip.close()
+                    except Exception:
+                        pass
+                    clips[scene_index] = None
 
             if len(completed_segments) != scene_count:
                 raise RuntimeError(
@@ -5471,7 +6091,7 @@ def process_single_video(
             published_new_output = True
             final_quality_audit = {
                 "passed": True,
-                "policy_version": 5,
+                "policy_version": 8,
                 "include_captions": bool(include_captions),
                 "include_transitions": bool(include_transitions),
                 "audio_trim_version": audio_trim_version,
@@ -5484,14 +6104,8 @@ def process_single_video(
                 "source_audio_signature": original_audio_signature,
                 "source_ready_script_hash": source_ready_script_hash,
                 "source_project_tree_signature": source_project_tree_signature,
-                "source_script_hash": hashlib.sha256(
-                    json.dumps(
-                        selected_script_data, ensure_ascii=False, sort_keys=True, default=str
-                    ).encode("utf-8")
-                ).hexdigest(),
-                "source_script_content_hash": _video_producer_script_payload_content_hash(
-                    selected_script_data
-                ),
+                "source_script_hash": _source_script_hash_before_audio_repair,
+                "source_script_content_hash": _source_script_content_hash_before_audio_repair,
                 "image_signature": fingerprint_images,
                 "trimmed_audio": audio_file_path,
                 "trimmed_audio_duration_seconds": float(audio_duration),
@@ -5502,7 +6116,8 @@ def process_single_video(
                     float(caption_stream_plan.get("source_word_coverage", 0.0))
                     if include_captions and caption_stream_plan else None
                 ),
-                "dialogue_match_ratio": float(timing_alignment_report.get("global_dialogue_match_ratio", 0.0)),
+                "scene_timing_method": str(timing_alignment_report.get("method", "asr_only_audio_duration_allocation")),
+                "caption_text_source": "scene_dialogue_words_aligned_to_asr_word_timestamps",
                 "updated_at": time.time(),
             }
             if not _video_producer_write_json_atomic(
@@ -5562,6 +6177,13 @@ def process_single_video(
                     resource.close()
                 except Exception:
                     pass
+            for cached_image in list(_prepared_scene_image_cache.values()):
+                try:
+                    cached_image.close()
+                except Exception:
+                    pass
+            _prepared_scene_image_cache.clear()
+            clips.clear()
         # Clean temporary folder left by older versions, if present.
         try:
             if os.path.isdir(temp_folder):
@@ -6496,7 +7118,7 @@ def _video_producer_find_project_script_record(data, project_title, project_cate
 
 
 def _video_producer_script_payload_content_hash(script_data):
-    """Hash a scene script without its mutable dialogue-derived time fields."""
+    """Hash a scene script without its mutable audio-allocated timing fields."""
     import copy
     import hashlib
     import json
@@ -6612,13 +7234,13 @@ def _video_producer_collect_scene_entries(script_data):
 def _video_producer_merge_project_scene_timings(
     private_ready_script_path, original_ready_script_path, project_title, project_category=None
 ):
-    """Merge only this project's repaired start/stop/duration values into the original queue."""
+    """Merge this project's ASR-duration visual scene timings into the original queue."""
     import json
     import os
     import time
 
     if not private_ready_script_path or not os.path.isfile(private_ready_script_path):
-        raise FileNotFoundError("The private READY_SCRIPT with repaired dialogue timings is missing.")
+        raise FileNotFoundError("The private READY_SCRIPT with allocated scene timings is missing.")
     if not original_ready_script_path or not os.path.isfile(original_ready_script_path):
         raise FileNotFoundError("The original READY_SCRIPT cannot be opened for timing publication.")
 
@@ -6638,7 +7260,7 @@ def _video_producer_merge_project_scene_timings(
             except OSError:
                 pass
             if time.monotonic() >= deadline:
-                raise TimeoutError("Timed out waiting to merge repaired timings into READY_SCRIPT.")
+                raise TimeoutError("Timed out waiting to merge allocated timings into READY_SCRIPT.")
             time.sleep(0.15)
 
     try:
@@ -6658,6 +7280,8 @@ def _video_producer_merge_project_scene_timings(
                 f"Could not find '{project_title}' in both private and original READY_SCRIPT files."
             )
 
+        # Compare the original authored scene payload while ignoring only the
+        # mutable timing fields. No speech text field is read, rewritten, or merged.
         private_content_hash = _video_producer_script_payload_content_hash(private_match[1])
         original_content_hash = _video_producer_script_payload_content_hash(original_match[1])
         if not private_content_hash or private_content_hash != original_content_hash:
@@ -6699,12 +7323,13 @@ def _video_producer_merge_project_scene_timings(
             destination_scene[start_key] = source_start
             destination_scene[stop_key] = source_stop
             destination_scene[duration_key] = source_duration
+
             updated += 1
 
         if updated != len(source_scenes):
             raise RuntimeError("Not all scene timings were merged into the original READY_SCRIPT.")
         if not _video_producer_write_json_atomic(original_ready_script_path, original_data):
-            raise RuntimeError("Could not atomically save repaired scene timings to the original READY_SCRIPT.")
+            raise RuntimeError("Could not atomically save allocated scene timings to the original READY_SCRIPT.")
         return _video_producer_project_script_hash(
             original_ready_script_path, project_title, project_category
         )
@@ -6743,7 +7368,7 @@ def _video_producer_completed_output_is_current(
     audit = _video_producer_read_json(audit_path, {})
     if not isinstance(audit, dict) or not (
         audit.get("passed") is True
-        and audit.get("policy_version") == 5
+        and audit.get("policy_version") == 8
         and audit.get("audio_trim_version") == "sceneiq_internal_silence_cut_v5"
         and bool(audit.get("source_script_content_hash"))
     ):
@@ -7629,8 +8254,8 @@ def _video_producer_prepare_worker_workspace(job, workspace_path, status_path=No
     import os
     import shutil
 
-    # Workers render from one stable queue snapshot, but completed dialogue
-    # timings must be merged into the actual live READY_SCRIPT source file.
+    # Workers render from one stable queue snapshot, but completed audio-duration
+    # scene timings must be merged into the actual live READY_SCRIPT source file.
     original_ready_script = job.get("ready_script_path")
     source_ready_script = job.get("source_ready_script_path") or original_ready_script
     original_images_root = job.get("images_path")
@@ -8221,7 +8846,7 @@ def _video_producer_publish_worker_outputs(job, workspace_result, render_result)
         )
         if not isinstance(private_quality_audit, dict) or not (
             private_quality_audit.get("passed") is True
-            and private_quality_audit.get("policy_version") == 5
+            and private_quality_audit.get("policy_version") == 8
             and private_quality_audit.get("audio_trim_version") == "sceneiq_internal_silence_cut_v5"
             and bool(private_quality_audit.get("source_script_content_hash"))
         ):
@@ -8241,7 +8866,7 @@ def _video_producer_publish_worker_outputs(job, workspace_result, render_result)
             or current_script_content_hash != expected_script_content_hash
         ):
             raise RuntimeError(
-                "The original scene dialogue/script changed while this video was rendering. "
+                "The original scene script changed while this video was rendering. "
                 "The stale MP4 will not replace the existing video."
             )
 
@@ -8364,11 +8989,16 @@ def _video_producer_publish_worker_outputs(job, workspace_result, render_result)
             project_category,
         )
         if not merged_script_hash:
-            raise RuntimeError("Repaired scene timings were not confirmed in the original READY_SCRIPT.")
+            raise RuntimeError("Allocated scene timings were not confirmed in the original READY_SCRIPT.")
+        merged_script_content_hash = _video_producer_project_script_content_hash(
+            original_ready_script, project_title, project_category
+        )
+        if not merged_script_content_hash:
+            raise RuntimeError("Could not verify the allocated scene timings in the original READY_SCRIPT.")
         if _video_producer_project_script_content_hash(
             original_ready_script, project_title, project_category
-        ) != expected_script_content_hash:
-            raise RuntimeError("The live script changed during timing publication; refusing to publish this MP4.")
+        ) != merged_script_content_hash:
+            raise RuntimeError("The live script changed during scene-timing publication; refusing to publish this MP4.")
 
         # Recheck mutable source files immediately before publishing the new video.
         current_project_tree_signature = _video_producer_tree_signature(original_project_dir)
@@ -8465,7 +9095,7 @@ def _video_producer_publish_worker_outputs(job, workspace_result, render_result)
                 raise RuntimeError("Could not update the published audio-trim metadata paths.")
 
         private_quality_audit["source_script_hash"] = merged_script_hash
-        private_quality_audit["source_script_content_hash"] = expected_script_content_hash
+        private_quality_audit["source_script_content_hash"] = merged_script_content_hash
         private_quality_audit["source_ready_script_hash"] = _video_producer_file_signature(original_ready_script)
         private_quality_audit["source_project_tree_signature"] = current_project_tree_signature
         private_quality_audit["source_audio"] = original_audio_source
@@ -8688,7 +9318,7 @@ def _video_producer_process_worker(job):
                     recovered_quality_is_current = bool(
                         isinstance(recovered_quality, dict)
                         and recovered_quality.get("passed") is True
-                        and recovered_quality.get("policy_version") == 5
+                        and recovered_quality.get("policy_version") == 8
                         and recovered_quality.get("audio_trim_version") == "sceneiq_internal_silence_cut_v5"
                         and bool(recovered_quality.get("source_script_content_hash"))
                     )
@@ -9105,282 +9735,170 @@ def _video_producer_process_worker(job):
             "workspace_path": preserved_workspace,
         }
 
-def _video_producer_is_resource_failure(result):
-    """Identify failures that are worth retrying with one rendering process."""
-    if not isinstance(result, dict) or str(result.get("status", "")).casefold() != "failed":
-        return False
-    detail = " ".join((
-        str(result.get("error") or ""),
-        str(result.get("traceback") or ""),
-        str(result.get("detail") or ""),
-    )).casefold()
-    indicators = (
-        "memoryerror", "out of memory", "not enough memory", "cannot allocate memory",
-        "failed to allocate", "cuda error: out of memory", "cudnn_status_alloc_failed",
-        "winerror 8", "winerror 1450", "winerror 1455",
-        "resource temporarily unavailable", "brokenprocesspool",
-    )
-    return any(token in detail for token in indicators)
-
-
-def _video_producer_write_parent_worker_error(job, stage, error_text):
-    """Record a retry state without allowing dashboard/logging errors to stop production."""
-    import os
-    import time
-    try:
-        with open(job.get("log_path", os.devnull), "a", encoding="utf-8", buffering=1) as handle:
-            handle.write(f"\n[PARENT] {stage}: {error_text}\n")
-    except OSError:
-        pass
-    try:
-        previous = _video_producer_read_worker_status(job.get("status_path"), checkpoint_dir=job.get("checkpoint_dir"))
-        _video_producer_write_worker_status(job["status_path"], {
-            **previous,
-            "worker_id": job.get("worker_id"),
-            "lane": str(job.get("lane") or "cpu").upper(),
-            "project_title": job.get("project_title"),
-            "status": "queued",
-            "stage": stage,
-            "progress": 0,
-            "detail": str(error_text),
-            "log_path": job.get("log_path"),
-            "status_path": job.get("status_path"),
-            "checkpoint_dir": job.get("checkpoint_dir"),
-            "updated_at": time.time(),
-        })
-    except Exception:
-        pass
-
-
 def _video_producer_execute_jobs_resilient(jobs, worker_count, run_dir):
-    """Run with the requested process count, retry with one process, then last-resort inline.
+    """Execute each queued project exactly once; never automatically rerun it.
 
-    This is still multiprocessing by default, including a one-worker ProcessPool.
-    If Windows cannot create a child process at all, a final inline attempt is made
-    so a single video can still render rather than abandoning the whole batch.
+    Parallel jobs may run concurrently, but a failed submission, worker crash,
+    resource error, or broken process pool is recorded as a terminal failure.
+    No failed or unreturned job is relaunched in another process or inline.
     """
     import multiprocessing
     import traceback
+    import time
     from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 
     if not jobs:
         return []
 
-    # SceneIQ already isolates the renderer from the GUI with the dedicated
-    # --sceneiq-worker service process. When the RAM planner selects one render
-    # process (the normal case on low-memory machines), run each project inside
-    # that service process instead of spawning a second Python interpreter via a
-    # one-worker ProcessPoolExecutor. This restores the working solo producer's
-    # memory profile while keeping the desktop responsive and each project fully
-    # isolated by its own workspace, status file, log, checkpoint and exception
-    # boundary. A project's failure is recorded and the next project still runs.
-    if max(1, int(worker_count or 1)) <= 1 or len(jobs) == 1:
-        print(
-            f"🎞️ [WORKER-ISOLATION] Running {len(jobs)} project(s) sequentially inside "
-            "the isolated video-service process. No nested ProcessPool child will be spawned."
-        )
-        inline_results = []
-        for job in jobs:
-            try:
-                item_result = _video_producer_process_worker(job)
-            except Exception as exc:
-                import traceback as _inline_traceback
-                error_traceback = _inline_traceback.format_exc()
-                issue = {
-                    "project_title": job.get("project_title"),
-                    "worker_id": job.get("worker_id"),
-                    "status": "failed",
-                    "error_type": type(exc).__name__,
-                    "error": str(exc),
-                    "stage": "Video worker startup",
-                    "traceback": error_traceback,
-                    "log_path": job.get("log_path"),
-                    "workspace_path": job.get("workspace_path"),
-                    "updated_at": time.time(),
-                }
-                try:
-                    if job.get("issue_path"):
-                        _video_producer_write_json_atomic(job["issue_path"], issue)
-                    previous = _video_producer_read_worker_status(job.get("status_path"), checkpoint_dir=job.get("checkpoint_dir"))
-                    _video_producer_write_worker_status(job["status_path"], {
-                        **previous, **issue,
-                        "detail": str(exc),
-                        "issue_path": job.get("issue_path"),
-                        "finished_at": time.time(),
-                    })
-                except Exception:
-                    pass
-                item_result = {
-                    "project_title": job.get("project_title"),
-                    "status": "failed",
-                    "error": str(exc),
-                    "traceback": error_traceback,
-                    "worker_id": job.get("worker_id"),
-                    "log_path": job.get("log_path"),
-                    "issue_path": job.get("issue_path"),
-                }
-            inline_results.append(item_result)
-        return inline_results
-
-    context = multiprocessing.get_context("spawn")
     results_by_id = {}
-    retry_jobs = []
-    accounted = set()
-    future_to_job = {}
-    executor = None
 
     def key_for(job):
         return str(job.get("worker_id") or job.get("project_title") or id(job))
 
-    def keep_retry(job, stage, error_text):
-        job_key = key_for(job)
-        if job_key in accounted or any(key_for(existing) == job_key for existing in retry_jobs):
-            return
-        retry_jobs.append(job)
-        _video_producer_write_parent_worker_error(job, stage, error_text)
+    def record_failure(job, stage, exc, error_traceback=None):
+        message = str(exc)
+        error_traceback = error_traceback or "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)
+        )
+        issue = {
+            "project_title": job.get("project_title"),
+            "worker_id": job.get("worker_id"),
+            "status": "failed",
+            "error_type": type(exc).__name__,
+            "error": message,
+            "stage": stage,
+            "traceback": error_traceback,
+            "log_path": job.get("log_path"),
+            "workspace_path": job.get("workspace_path"),
+            "updated_at": time.time(),
+        }
+        try:
+            log_path = job.get("log_path")
+            if log_path:
+                with open(log_path, "a", encoding="utf-8", buffering=1) as handle:
+                    handle.write("\n[WORKER FAILED — NOT RETRIED]\n")
+                    handle.write(f"Stage: {stage}\n")
+                    handle.write(error_traceback or message)
+                    if not error_traceback.endswith("\n"):
+                        handle.write("\n")
+        except Exception:
+            pass
+        try:
+            issue_path = job.get("issue_path")
+            if issue_path:
+                _video_producer_write_json_atomic(issue_path, issue)
+        except Exception:
+            pass
+        try:
+            status_path = job.get("status_path")
+            previous = _video_producer_read_worker_status(
+                status_path, checkpoint_dir=job.get("checkpoint_dir")
+            ) if status_path else {}
+            if status_path:
+                _video_producer_write_worker_status(status_path, {
+                    **(previous if isinstance(previous, dict) else {}),
+                    **issue,
+                    "detail": message,
+                    "issue_path": job.get("issue_path"),
+                    "finished_at": time.time(),
+                })
+        except Exception:
+            pass
+        return {
+            "project_title": job.get("project_title"),
+            "status": "failed",
+            "error": message,
+            "error_type": type(exc).__name__,
+            "traceback": error_traceback,
+            "worker_id": job.get("worker_id"),
+            "lane": job.get("lane"),
+            "log_path": job.get("log_path"),
+            "issue_path": job.get("issue_path"),
+        }
 
-    def save_result(job, item_result, allow_resource_retry):
-        job_key = key_for(job)
-        if allow_resource_retry and _video_producer_is_resource_failure(item_result):
-            keep_retry(
-                job,
-                "Retrying with one rendering process",
-                "The concurrent worker reported a memory/resource failure; this project will be retried alone.",
-            )
-            return
-        results_by_id[job_key] = item_result
-        accounted.add(job_key)
+    # The normal single-project / single-worker route remains in-process, but
+    # the project is entered only once. No retry/fallback follows an exception.
+    if max(1, int(worker_count or 1)) <= 1 or len(jobs) == 1:
+        print(
+            f"🎞️ [WORKER-ISOLATION] Executing {len(jobs)} project(s) once inside "
+            "the isolated video-service process. Automatic worker retries are disabled."
+        )
+        for job in jobs:
+            try:
+                item_result = _video_producer_process_worker(job)
+            except Exception as exc:
+                item_result = record_failure(
+                    job, "Video worker startup/execution", exc, traceback.format_exc()
+                )
+            results_by_id[key_for(job)] = item_result
+        return [results_by_id[key_for(job)] for job in jobs]
 
-    # First attempt: use the resource-aware worker count. Pool creation, submit,
-    # worker crashes, and BrokenProcessPool are all recoverable here.
+    # Multi-project runs retain their parallel execution, but every submitted
+    # project is still executed at most once. A broken pool is reported, not
+    # reconstructed and not followed by serial/inline reruns.
+    future_to_job = {}
+    executor = None
     try:
+        context = multiprocessing.get_context("spawn")
         executor = ProcessPoolExecutor(
             max_workers=max(1, int(worker_count or 1)),
             mp_context=context,
         )
-        for index, job in enumerate(jobs):
+        for job in jobs:
             try:
                 future = executor.submit(_video_producer_process_worker, job)
                 future_to_job[future] = job
             except Exception as exc:
-                keep_retry(
-                    job,
-                    "Retrying after process startup failure",
-                    f"Could not submit worker process: {exc}",
+                results_by_id[key_for(job)] = record_failure(
+                    job, "Worker process submission", exc, traceback.format_exc()
                 )
-                for remaining_job in jobs[index + 1:]:
-                    keep_retry(
-                        remaining_job,
-                        "Retrying after process startup failure",
-                        "The process pool could not accept the remaining jobs; they will run one at a time.",
-                    )
-                break
 
         pending = set(future_to_job)
         while pending:
-            done, pending = wait(pending, timeout=1.0, return_when=FIRST_COMPLETED)
+            done, pending = wait(
+                pending, timeout=1.0, return_when=FIRST_COMPLETED
+            )
             for future in done:
                 job = future_to_job[future]
                 try:
-                    item_result = future.result()
+                    results_by_id[key_for(job)] = future.result()
                 except Exception as exc:
-                    error_text = f"{exc}\n{traceback.format_exc()}"
-                    keep_retry(job, "Retrying after worker process failure", error_text)
-                else:
-                    save_result(job, item_result, allow_resource_retry=True)
+                    results_by_id[key_for(job)] = record_failure(
+                        job, "Worker process execution", exc, traceback.format_exc()
+                    )
     except Exception as exc:
-        error_text = f"Process-pool failure: {exc}\n{traceback.format_exc()}"
+        error_traceback = traceback.format_exc()
+        print(
+            "❌ [WORKER-POOL] Process pool failed. No project will be relaunched: "
+            f"{type(exc).__name__}: {exc}"
+        )
         for job in jobs:
-            if key_for(job) not in accounted:
-                keep_retry(job, "Retrying with one rendering process", error_text)
+            job_key = key_for(job)
+            if job_key not in results_by_id:
+                results_by_id[job_key] = record_failure(
+                    job, "Process pool failure — automatic retry disabled",
+                    exc, error_traceback,
+                )
     finally:
         if executor is not None:
             try:
                 executor.shutdown(wait=True, cancel_futures=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"⚠️ [WORKER-POOL] Shutdown warning: {exc}")
 
-    # Include anything the pool never returned a result for (for example, a
-    # worker process terminated while Windows was under memory pressure).
+    # Jobs missing from the executor result are terminal failures. Do not run
+    # them again in any other execution mode.
     for job in jobs:
         job_key = key_for(job)
-        if job_key not in accounted and not any(key_for(item) == job_key for item in retry_jobs):
-            keep_retry(
-                job,
-                "Retrying with one rendering process",
-                "The initial process pool did not return a result for this job.",
+        if job_key not in results_by_id:
+            missing_error = RuntimeError(
+                "The worker process returned no result. Automatic rerun is disabled."
+            )
+            results_by_id[job_key] = record_failure(
+                job, "Missing worker result — automatic retry disabled", missing_error
             )
 
-    # Second attempt: exactly one child process at a time. A fresh one-worker
-    # pool avoids inheriting a broken executor from the parallel attempt.
-    emergency_inline_jobs = []
-    single_executor = None
-    retry_index = 0
-    try:
-        if retry_jobs:
-            single_executor = ProcessPoolExecutor(max_workers=1, mp_context=context)
-            for retry_index, job in enumerate(retry_jobs):
-                _video_producer_write_parent_worker_error(
-                    job,
-                    "Retrying with one rendering process",
-                    "A single multiprocessing worker has been allocated for this project.",
-                )
-                try:
-                    item_result = single_executor.submit(
-                        _video_producer_process_worker, job
-                    ).result()
-                except Exception as exc:
-                    error_text = f"Single-worker process failed: {exc}\n{traceback.format_exc()}"
-                    _video_producer_write_parent_worker_error(
-                        job, "Falling back to in-process production", error_text
-                    )
-                    emergency_inline_jobs.extend(retry_jobs[retry_index:])
-                    break
-                if _video_producer_is_resource_failure(item_result):
-                    _video_producer_write_parent_worker_error(
-                        job,
-                        "Falling back to in-process production",
-                        "The one-worker process also reported a memory/resource failure.",
-                    )
-                    emergency_inline_jobs.append(job)
-                else:
-                    results_by_id[key_for(job)] = item_result
-                    accounted.add(key_for(job))
-    except Exception as exc:
-        error_text = f"Could not create a one-worker process pool: {exc}\n{traceback.format_exc()}"
-        for job in retry_jobs[retry_index:]:
-            _video_producer_write_parent_worker_error(
-                job, "Falling back to in-process production", error_text
-            )
-            emergency_inline_jobs.append(job)
-    finally:
-        if single_executor is not None:
-            try:
-                single_executor.shutdown(wait=True, cancel_futures=True)
-            except Exception:
-                pass
-
-    # Last-resort path: still use the same production worker and private-workspace
-    # protection, but execute it in the parent only when spawning is unavailable.
-    for job in emergency_inline_jobs:
-        try:
-            item_result = _video_producer_process_worker(job)
-        except Exception as exc:
-            error_text = f"Inline fallback failed: {exc}\n{traceback.format_exc()}"
-            _video_producer_write_parent_worker_error(job, "Final fallback failed", error_text)
-            item_result = {
-                "project_title": job.get("project_title"),
-                "status": "failed",
-                "error": str(exc),
-                "traceback": traceback.format_exc(),
-                "lane": job.get("lane"),
-                "worker_id": job.get("worker_id"),
-                "log_path": job.get("log_path"),
-            }
-        results_by_id[key_for(job)] = item_result
-        accounted.add(key_for(job))
-
-    return [results_by_id[key_for(job)] for job in jobs if key_for(job) in results_by_id]
+    return [results_by_id[key_for(job)] for job in jobs]
 
 
 def _video_producer_get_safe_worker_limit(cpu_total=None):
@@ -9397,11 +9915,11 @@ def _video_producer_get_safe_worker_limit(cpu_total=None):
     except Exception:
         return 1, None
 
-    if available_gb < 12:
+    if available_gb < 20:
         limit = 1
-    elif available_gb < 20:
+    elif available_gb < 32:
         limit = 2
-    elif available_gb < 30:
+    elif available_gb < 48:
         limit = 3
     else:
         limit = 4
@@ -9563,7 +10081,8 @@ def video_producer_main(cpu_workers=None, gpu_workers=None, max_projects=None):
     runs only inside the isolated producer-service child, updates the shared
     manifest, and starts rendering workers within the available RAM budget.
     A one-worker budget runs inline inside this isolated service process to avoid
-    a needless nested process. Multi-worker pool failures are retried serially.
+    a needless nested process. Every project is executed once per explicit run;
+    folder changes and worker failures never trigger automatic reruns.
     """
     import os
     import json
@@ -9647,8 +10166,12 @@ def video_producer_main(cpu_workers=None, gpu_workers=None, max_projects=None):
 
     if not project_titles:
         _video_producer_update_dashboard_session(
-            message="The dashboard is ready. No eligible video projects were found yet; it will keep checking for new projects.",
-            service_status="Waiting for video projects",
+            message=(
+                "No eligible video projects were found in this run. Automatic folder "
+                "monitoring is disabled, so file changes will not restart production. "
+                "Press Start Production when the required project files are ready."
+            ),
+            service_status="No projects found — awaiting explicit Start",
             jobs=[],
         )
         try:
@@ -9673,7 +10196,7 @@ def video_producer_main(cpu_workers=None, gpu_workers=None, max_projects=None):
     safe_total_workers, available_memory_gb = _video_producer_get_safe_worker_limit(cpu_total)
 
     # Stable defaults: no more than two render processes by default, and only
-    # one when available RAM is below 12 GiB. Explicit settings are still capped
+    # one when available RAM is below 20 GiB. Explicit settings are still capped
     # by the live memory budget so an environment variable cannot exhaust RAM.
     def read_worker_count(value, default, minimum):
         try:
@@ -9895,31 +10418,15 @@ def video_producer_main(cpu_workers=None, gpu_workers=None, max_projects=None):
         run_dir=run_dir,
     )
 
-    # Failed/stopped projects remain as individual cards. They are not retried
-    # forever in the background. A user can inspect the Issue report, fix the
-    # missing asset, then press Start on that card. New source files also release
-    # this wait so the service can re-read the queue.
+    # Failed/stopped projects remain on their individual cards. The service
+    # waits only for an explicit Start/Resume command from the user. Changes to
+    # READY_SCRIPT, Downloads, project folders, or generated output are ignored
+    # during this run and can never trigger an automatic queue reload.
     restartable_by_id = {
         str(item.get("worker_id")): item
         for item in results
         if str(item.get("status", "")).casefold() in {"stopped", "failed"}
     }
-    def current_project_input_signature():
-        try:
-            ready_stat = os.stat(ready_script_path)
-            ready_value = (ready_stat.st_mtime_ns, ready_stat.st_size)
-        except OSError:
-            ready_value = (None, None)
-        project_value = _video_producer_tree_signature(images_path)
-        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
-        try:
-            download_stat = os.stat(downloads)
-            download_value = (download_stat.st_mtime_ns, download_stat.st_size)
-        except OSError:
-            download_value = (None, None)
-        return ready_value, project_value, download_value
-
-    finished_input_signature = current_project_input_signature()
     while restartable_by_id:
         dashboard_closed = _video_producer_dashboard_session_closed(dashboard_session)
         if dashboard_closed:
@@ -9931,45 +10438,52 @@ def video_producer_main(cpu_workers=None, gpu_workers=None, max_projects=None):
             print("🛑 [DASHBOARD] Window closed or terminated. Remaining videos are stopping safely; saved checkpoints are retained.")
             break
 
-        # New ready-script projects, scene images, or narration files should be
-        # picked up by the outer service loop without requiring a GUI restart.
-        if current_project_input_signature() != finished_input_signature:
-            print("🔄 [VIDEO-SERVICE] New project input detected; returning to queue monitoring.")
-            break
-
-        restarted_jobs = []
+        explicitly_started_jobs = []
         for job in all_jobs:
             key = str(job.get("worker_id"))
             if key not in restartable_by_id:
                 continue
             control_data = _video_producer_read_control_json(job["control_path"])
-            if isinstance(control_data, dict) and str(control_data.get("command", "")).casefold() in {"start", "resume"}:
+            if (
+                isinstance(control_data, dict)
+                and str(control_data.get("command", "")).casefold() in {"start", "resume"}
+            ):
                 _video_producer_write_control(job["control_path"], "run")
-                previous_state = _video_producer_read_worker_status(job["status_path"], checkpoint_dir=job.get("checkpoint_dir"))
+                previous_state = _video_producer_read_worker_status(
+                    job["status_path"], checkpoint_dir=job.get("checkpoint_dir")
+                )
                 _video_producer_write_worker_status(job["status_path"], {
                     **previous_state,
                     "status": "queued",
-                    "stage": "Restarting from saved progress",
-                    "detail": "Restart requested for this video only. Saved narration timing, prepared project files and completed scene renders will be reused.",
+                    "stage": "Explicit user restart from saved progress",
+                    "detail": (
+                        "The user explicitly requested Start/Resume for this video. "
+                        "No filesystem change or automatic retry can start it."
+                    ),
                     "error": None,
                     "error_type": None,
                     "traceback": None,
                     "updated_at": time.time(),
                 })
-                restarted_jobs.append(job)
+                explicitly_started_jobs.append(job)
 
-        if restarted_jobs:
-            retry_results = _video_producer_execute_jobs_resilient(
-                restarted_jobs, worker_count=1, run_dir=run_dir
+        if explicitly_started_jobs:
+            # This is a direct user-requested action, not a filesystem-triggered
+            # restart. Each selected project gets one attempt in this call.
+            manual_start_results = _video_producer_execute_jobs_resilient(
+                explicitly_started_jobs, worker_count=1, run_dir=run_dir
             )
-            for retry_result in retry_results:
-                key = str(retry_result.get("worker_id"))
-                if str(retry_result.get("status", "")).casefold() in {"stopped", "failed"}:
-                    restartable_by_id[key] = retry_result
+            for manual_start_result in manual_start_results:
+                key = str(manual_start_result.get("worker_id"))
+                if str(manual_start_result.get("status", "")).casefold() in {"stopped", "failed"}:
+                    restartable_by_id[key] = manual_start_result
                 else:
                     restartable_by_id.pop(key, None)
-                    results = [item for item in results if str(item.get("worker_id")) != key]
-                    results.append(retry_result)
+                    results = [
+                        item for item in results
+                        if str(item.get("worker_id")) != key
+                    ]
+                    results.append(manual_start_result)
         else:
             time.sleep(0.5)
 
@@ -9986,8 +10500,12 @@ def video_producer_main(cpu_workers=None, gpu_workers=None, max_projects=None):
         )
     else:
         _video_producer_update_dashboard_session(
-            message="This batch has finished. The dashboard remains open and the service will continue watching for new projects or individual Start commands.",
-            service_status="Waiting for new projects or video controls",
+            message=(
+                "This production run has finished. Changes to READY_SCRIPT, Downloads, "
+                "or project folders will not start another run. Press Start Production "
+                "to begin a new run, or use an individual Start command for a failed video."
+            ),
+            service_status="Run finished — awaiting explicit Start",
         )
 
     completed = sum(str(item.get("status", "")).casefold() == "completed" for item in results)
@@ -10026,98 +10544,65 @@ def video_producer():
 
 
 def video_producer_service_loop(poll_interval=2.0, retry_interval=None):
-    """Continuously detect newly ready projects without rebuilding empty batches."""
-    poll_interval = max(1.0, float(poll_interval or 2.0))
-    retry_interval = (
-        None if retry_interval is None
-        else max(10.0, float(retry_interval))
+    """Run one production pass only; never restart because inputs changed.
+
+    READY_SCRIPT, Downloads, project-image folders, and generated output are
+    deliberately not watched for modification-time changes. The queue is read
+    once from a stable snapshot. When this pass ends, the service process exits.
+    A new pass can begin only after the user explicitly presses Start Production.
+    """
+    import traceback
+
+    print(
+        "🎞️ [VIDEO-SERVICE] Single-run mode active. Automatic restarts, "
+        "folder watchers, and timed retries are disabled.",
+        flush=True,
     )
-    last_input_signature = None
-    last_batch_at = 0.0
-    print("🎞️ [VIDEO-SERVICE] Independent video producer service started.")
     dashboard_session = globals().get("_VIDEO_PRODUCER_DASHBOARD_SESSION")
     if not isinstance(dashboard_session, dict):
         dashboard_session = _video_producer_start_dashboard_session()
 
-    def current_input_signature():
-        ready_path = os.path.abspath(os.fspath(READY_SCRIPT))
-        try:
-            ready_stat = os.stat(ready_path)
-            ready_signature = (ready_stat.st_mtime_ns, ready_stat.st_size)
-        except OSError:
-            ready_signature = (None, None)
-        downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
-        try:
-            downloads_stat = os.stat(downloads_path)
-            downloads_signature = (downloads_stat.st_mtime_ns, downloads_stat.st_size)
-        except OSError:
-            downloads_signature = (None, None)
-        # Detect late-arriving entry images inside category/project directories.
-        newest_project_directory_mtime = 0
-        try:
-            if os.path.isdir(IMAGES_PATH):
-                generated_directory_names = {
-                    "edited", "temp_captions", "video_producer_runs",
-                    "video_producer_checkpoints", "worker_workspaces", "__pycache__",
-                }
-                for directory, subdirectories, _ in os.walk(IMAGES_PATH):
-                    subdirectories[:] = [
-                        name for name in subdirectories
-                        if name.casefold() not in generated_directory_names
-                    ]
-                    try:
-                        newest_project_directory_mtime = max(
-                            newest_project_directory_mtime,
-                            os.stat(directory).st_mtime_ns,
-                        )
-                    except OSError:
-                        continue
-        except OSError:
-            pass
-        return ready_signature, downloads_signature, newest_project_directory_mtime
+    if _video_producer_dashboard_session_closed(dashboard_session):
+        print("🛑 [DASHBOARD] Dashboard is closed; production was not started.", flush=True)
+        return {
+            "total": 0, "completed": 0, "skipped": 0, "failed": 0,
+            "results": [], "dashboard_closed": True,
+        }
 
-    while True:
+    try:
+        result = video_producer_main()
+    except KeyboardInterrupt:
+        print("🛑 [VIDEO-SERVICE] User/system interrupt received. No automatic restart will be attempted.", flush=True)
+        raise
+    except Exception as video_error:
         try:
-            if _video_producer_dashboard_session_closed(dashboard_session):
-                print("🛑 [DASHBOARD] Window closed or its process was terminated. The service is exiting after safe worker checkpoints.")
-                return
-            signature = current_input_signature()
-            now = time.monotonic()
-            inputs_changed = signature != last_input_signature
-            retry_due = (
-                retry_interval is not None
-                and now - last_batch_at >= max(1.0, float(retry_interval))
+            _video_producer_update_dashboard_session(
+                message=(
+                    f"Production stopped because of an error: {video_error}. "
+                    "Automatic restarts are disabled. Review the issue, correct it, "
+                    "then explicitly press Start Production."
+                ),
+                service_status="Production stopped — automatic restart disabled",
             )
-            if inputs_changed or retry_due:
-                last_input_signature = signature
-                last_batch_at = now
-                result = video_producer_main()
-                if isinstance(result, dict):
-                    print(
-                        "🎞️ [VIDEO-SERVICE] Batch finished: "
-                        f"total={result.get('total', 0)}, completed={result.get('completed', 0)}, "
-                        f"skipped={result.get('skipped', 0)}, failed={result.get('failed', 0)}"
-                    )
-                    if result.get("dashboard_closed"):
-                        print("🛑 [VIDEO-SERVICE] Dashboard was closed. All active video workers have saved progress; the producer service is exiting.")
-                        return
-        except KeyboardInterrupt:
-            print("🛑 [VIDEO-SERVICE] KeyboardInterrupt received; video service is stopping.")
-            raise
-        except Exception as video_error:
-            # A production exception updates the already-running window; it never
-            # tears down or prevents the GUI from existing.
-            print(f"❌ [VIDEO-SERVICE] This video batch failed independently: {video_error}")
-            try:
-                _video_producer_update_dashboard_session(
-                    message=f"Video service encountered an issue: {video_error}. The window remains open; the service is waiting for corrected or changed project inputs.",
-                    service_status="Production issue — waiting for input changes",
-                )
-            except Exception:
-                pass
-            traceback.print_exc()
-            last_batch_at = time.monotonic()
-        time.sleep(poll_interval)
+        except Exception:
+            pass
+        print(
+            f"❌ [VIDEO-SERVICE] Production pass failed; it will not be restarted: "
+            f"{type(video_error).__name__}: {video_error}",
+            flush=True,
+        )
+        traceback.print_exc()
+        raise
+
+    if isinstance(result, dict):
+        print(
+            "🎞️ [VIDEO-SERVICE] Single production pass finished: "
+            f"total={result.get('total', 0)}, completed={result.get('completed', 0)}, "
+            f"skipped={result.get('skipped', 0)}, failed={result.get('failed', 0)}. "
+            "No automatic rerun will occur.",
+            flush=True,
+        )
+    return result
 
 
 
